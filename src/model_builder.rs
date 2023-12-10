@@ -1,0 +1,37 @@
+use std::{borrow::Cow, collections::HashMap};
+
+use crate::FieldBuilder;
+
+pub struct ModelBuilder<M> {
+    name: Cow<'static, str>,
+    description: Cow<'static, str>,
+    fields: HashMap<Cow<'static, str>, FieldBuilder<M>>,
+}
+
+impl<M> ModelBuilder<M> {
+    #[cfg(test)] // TODO: Use a special `yuku-test` feature
+    pub fn new() -> Self {
+        Self {
+            name: Cow::Borrowed(""),
+            description: Cow::Borrowed(""),
+            fields: HashMap::new(),
+        }
+    }
+
+    pub fn name(mut self, name: impl Into<Cow<'static, str>>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    pub fn description(mut self, description: impl Into<Cow<'static, str>>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    // TODO: Deprecated attributes???
+
+    pub fn field(mut self, name: impl Into<Cow<'static, str>>, field: FieldBuilder<M>) -> Self {
+        self.fields.insert(name.into(), field);
+        self
+    }
+}
