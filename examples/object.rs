@@ -1,4 +1,4 @@
-use yuku::{expose, FieldBuilder, Model, ModelBuilder, Schema};
+use gurafu::{expose, FieldBuilder, Model, ModelBuilder, Schema};
 
 #[derive(Debug)]
 pub struct Giraffe {
@@ -27,7 +27,7 @@ impl Model for Giraffe {
 }
 
 fn main() {
-    let schema = Schema::new().query_field("giraffe", || Giraffe {
+    let schema = <Schema>::new().query_field("giraffe", || Giraffe {
         name: "Tony".into(),
         birthday: 10.to_string(),
         height_in_meters: 5.2,

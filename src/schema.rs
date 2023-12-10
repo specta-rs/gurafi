@@ -1,14 +1,18 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, marker::PhantomData};
 
-pub struct Schema {}
+pub struct Schema<Ctx = ()> {
+    phantom: PhantomData<Ctx>,
+}
 
-impl Schema {
+impl<Ctx> Schema<Ctx> {
     pub fn new() -> Self {
-        Self {}
+        Self {
+            phantom: PhantomData,
+        }
     }
 
     // // Can only be called once and defines the whole root query type.
-    // pub fn query_type(self, name: impl Into<Cow<'static, str>>) -> Self {
+    // pub fn query_type(self, model: ()) -> Self {
     //     // TODO
     //     self
     // }
@@ -18,6 +22,8 @@ impl Schema {
     pub fn query_field<T>(
         self,
         name: impl Into<Cow<'static, str>>,
+        // TODO: Take in a `FieldBuilder` for extra configuration
+        // TODO: Prevent using `expose!` and similar on the `FieldBuilder`.
         resolver: impl Fn() -> T,
     ) -> Self {
         // TODO

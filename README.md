@@ -1,4 +1,4 @@
-# Yuku
+# Gurafu
 
 Intuitive GraphQL server for Rust
 
