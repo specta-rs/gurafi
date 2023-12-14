@@ -41,7 +41,12 @@ async fn main() {
         )
         .route(
             "/graphql",
-            post(|Json(body): Json<Request>| async move { Json(server.execute(body.query).await) }),
+            post(|Json(body): Json<Request>| async move {
+                Json(match server.execute(body.query).await {
+                    Ok(response) => response,
+                    Err(_) => todo!(),
+                })
+            }),
         );
 
     info!("Listening on http://[::1]:3000");
@@ -72,6 +77,41 @@ pub fn basic_schema() -> Schema {
                         args: None,
                         ty: OutputType::NonNullable(ScalarType::string().into()),
                         resolve: Some(|| "Hello World".to_string()),
+                    },
+                );
+
+                fields.insert(
+                    "nested".into(),
+                    FieldConfig {
+                        description: None,
+                        deprecation_reason: None,
+                        args: None,
+                        ty: OutputType::NonNullable(
+                            ObjectType {
+                                name: "Nested".into(),
+                                description: None,
+                                fields: {
+                                    let mut fields = HashMap::new();
+
+                                    fields.insert(
+                                        "suku".into(),
+                                        FieldConfig {
+                                            description: None,
+                                            deprecation_reason: None,
+                                            args: None,
+                                            ty: OutputType::NonNullable(
+                                                ScalarType::string().into(),
+                                            ),
+                                            resolve: Some(|| "Hello World Suku".to_string()),
+                                        },
+                                    );
+
+                                    fields.into()
+                                },
+                            }
+                            .into(),
+                        ),
+                        resolve: Some(|| "Broken".to_string()), // TODO: This is wrong
                     },
                 );
 

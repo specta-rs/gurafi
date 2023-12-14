@@ -706,6 +706,7 @@ dependencies = [
  "futures",
  "gql",
  "graphql-parser",
+ "serde",
  "tracing",
 ]
 

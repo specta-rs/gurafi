@@ -1,5 +1,7 @@
 use std::borrow::Cow;
 
+use crate::ObjectType;
+
 /// https://github.com/graphql/graphql-js/blob/688ee2f2a2f938e80bcf3808bc435d3d87a3ff3e/src/type/definition.ts#L225
 #[derive(Debug)]
 pub enum OutputType {
@@ -12,10 +14,22 @@ pub enum OutputType {
 #[derive(Debug)]
 pub enum NamedOutputType {
     Scalar(ScalarType),
-    // Object(),
+    Object(ObjectType),
     // Interface(),
     // Union(),
     // Enum(),
+}
+
+impl From<ScalarType> for NamedOutputType {
+    fn from(v: ScalarType) -> Self {
+        NamedOutputType::Scalar(v)
+    }
+}
+
+impl From<ObjectType> for NamedOutputType {
+    fn from(v: ObjectType) -> Self {
+        NamedOutputType::Object(v)
+    }
 }
 
 /// https://github.com/graphql/graphql-js/blob/688ee2f2a2f938e80bcf3808bc435d3d87a3ff3e/src/type/definition.ts#L545
@@ -40,11 +54,5 @@ impl ScalarType {
             name: "String".into(),
             description: None,
         }
-    }
-}
-
-impl From<ScalarType> for NamedOutputType {
-    fn from(v: ScalarType) -> Self {
-        NamedOutputType::Scalar(v)
     }
 }
