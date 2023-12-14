@@ -1,0 +1,2 @@
+[alias]
+e-axum = "run -p gurafu-example-axum"
