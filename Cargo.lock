@@ -12,3 +12,7 @@ dependencies = [
 [[package]]
 name = "gurafu-macros"
 version = "0.0.1"
+
+[[package]]
+name = "suku"
+version = "0.1.0"
