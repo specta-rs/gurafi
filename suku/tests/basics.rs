@@ -34,3 +34,14 @@ fn basic() {
 
     // TODO: Properly test the server works
 }
+
+#[test]
+fn alias() {
+    // TODO
+    // {
+    //     hello,
+    //     nested {
+    //         suku: suku2
+    //     }
+    // }
+}

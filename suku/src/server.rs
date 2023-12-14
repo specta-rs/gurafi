@@ -6,6 +6,7 @@ use graphql_parser::query::{Definition, Document, OperationDefinition, Selection
 
 use crate::Value;
 
+// TODO: Can the key of this map hold a lifetime??? -> It would require us to take care of serialize in `Server::execute` which seems likely.
 type Response = HashMap<String, Value>;
 
 pub struct Server {
@@ -75,17 +76,18 @@ pub fn resolve_selection_set<'a>(
     for item in selection.items {
         match item {
             Selection::Field(field) => {
-                debug_assert!(field.alias.is_none(), "todo: implement alias");
                 debug_assert!(field.arguments.is_empty(), "todo: implement arguments");
                 debug_assert!(field.directives.is_empty(), "todo: implement directives");
+
+                let field_name = field.alias.unwrap_or_else(|| field.name);
 
                 let field_def = match &object_ty.fields {
                     // TODO: Cache this between execute calls
                     Thunk::Lazy(func) => todo!(),
                     Thunk::Eager(fields) => fields,
                 }
-                .get(field.name)
-                .unwrap_or_else(|| panic!("field not found: {:?}", field.name)); // TODO: Error instead
+                .get(field_name)
+                .unwrap_or_else(|| panic!("field not found: {:?}", field_name)); // TODO: Error instead
 
                 let field_ty = match &field_def.ty {
                     OutputType::Nullable(ty) => ty,
@@ -96,11 +98,11 @@ pub fn resolve_selection_set<'a>(
                 match field_ty {
                     NamedOutputType::Scalar(scalar) => {
                         if let Some(resolve) = field_def.resolve {
-                            response.insert(field.name.to_string(), Value::String((resolve)()));
+                            response.insert(field.name.into(), Value::String((resolve)()));
                         } else {
                             // TODO: Error instead
                             response.insert(
-                                field.name.to_string(),
+                                field.name.into(),
                                 Value::String("Missing response".into()),
                             );
                         }
@@ -112,7 +114,7 @@ pub fn resolve_selection_set<'a>(
                             &mut nested_response,
                             field.selection_set,
                         );
-                        response.insert(field.name.to_string(), Value::Object(nested_response));
+                        response.insert(field.name.into(), Value::Object(nested_response));
                     }
                 }
             }
