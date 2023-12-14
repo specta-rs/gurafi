@@ -58,14 +58,14 @@
     <script>
       const root = ReactDOM.createRoot(document.getElementById("graphiql"));
       const fetcher = GraphiQL.createFetcher({
-        url: "https://swapi-graphql.netlify.app/.netlify/functions/index",
+        url: "/graphql",
         headers: { "X-Example-Header": "foo" },
       });
       const explorerPlugin = GraphiQLPluginExplorer.explorerPlugin();
       root.render(
         React.createElement(GraphiQL, {
           fetcher,
-          defaultEditorToolsVisibility: true,
+          defaultEditorToolsVisibility: false,
           plugins: [explorerPlugin],
         })
       );

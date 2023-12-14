@@ -1,12 +1,35 @@
-use std::net::Ipv6Addr;
+use std::{net::Ipv6Addr, sync::Arc};
 
-use axum::{response::Html, routing::get, Router};
+use axum::{
+    response::Html,
+    routing::{get, post},
+    Json, Router,
+};
+use serde::Deserialize;
+use suku::Server;
 use tokio::net::TcpListener;
 use tracing::info;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+use crate::tracing_timing::CustomLayer;
+
+mod tracing_timing;
+
+// TODO: Move this into Suku
+#[derive(Deserialize)]
+pub struct Request {
+    operation_name: Option<String>,
+    query: String,
+}
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::registry::Registry::default()
+        .with(CustomLayer)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    let server = Arc::new(Server::new());
 
     let app = Router::new()
         .route(
@@ -16,7 +39,10 @@ async fn main() {
                 Html(include_str!("../graphiql.html"))
             }),
         )
-        .route("/graphql", get(|| async { "Hello, World!" }));
+        .route(
+            "/graphql",
+            post(|Json(body): Json<Request>| async move { Json(server.execute(body.query).await) }),
+        );
 
     info!("Listening on http://[::1]:3000");
     axum::serve(
