@@ -18,11 +18,6 @@ impl<M> ModelBuilder<M> {
         }
     }
 
-    pub fn name(mut self, name: impl Into<Cow<'static, str>>) -> Self {
-        self.name = name.into();
-        self
-    }
-
     pub fn description(mut self, description: impl Into<Cow<'static, str>>) -> Self {
         self.description = description.into();
         self

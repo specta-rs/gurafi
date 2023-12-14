@@ -4,3 +4,7 @@ version = "0.0.1"
 edition = "2021"
 
 [dependencies]
+gurafu-macros = { path = "./macros" }
+
+[workspace]
+members = ["./macros"]

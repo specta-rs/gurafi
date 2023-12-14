@@ -1,4 +1,4 @@
-//! Yuku: GraphQL server for Rust
+//! Gurafu: GraphQL server for Rust
 
 mod expose;
 mod field_builder;

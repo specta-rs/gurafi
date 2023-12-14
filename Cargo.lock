@@ -5,3 +5,10 @@ version = 3
 [[package]]
 name = "gurafu"
 version = "0.0.1"
+dependencies = [
+ "gurafu-macros",
+]
+
+[[package]]
+name = "gurafu-macros"
+version = "0.0.1"
