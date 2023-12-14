@@ -1,6 +1,7 @@
 use std::{collections::HashMap, net::Ipv6Addr, sync::Arc};
 
 use axum::{
+    http::Method,
     response::Html,
     routing::{get, post},
     Json, Router,
@@ -8,6 +9,7 @@ use axum::{
 use serde::Deserialize;
 use suku::Server;
 use tokio::net::TcpListener;
+use tower_http::cors::CorsLayer;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -17,7 +19,7 @@ mod tracing_timing;
 
 // TODO: Move this into Suku
 #[derive(Deserialize)]
-pub struct Request {
+pub struct GQLRequest {
     operation_name: Option<String>,
     query: String,
 }
@@ -41,12 +43,18 @@ async fn main() {
         )
         .route(
             "/graphql",
-            post(|Json(body): Json<Request>| async move {
+            post(|Json(body): Json<GQLRequest>| async move {
                 Json(match server.execute(body.query).await {
                     Ok(response) => response,
                     Err(_) => todo!(),
                 })
             }),
+        )
+        .layer(
+            CorsLayer::new()
+                .allow_methods([Method::GET, Method::POST])
+                .allow_origin(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any),
         );
 
     info!("Listening on http://[::1]:3000");

@@ -1,5 +1,6 @@
 //! Suku: A universal GraphQL server.
 
+pub(crate) mod introspection;
 mod server;
 mod value;
 

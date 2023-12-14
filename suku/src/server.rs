@@ -4,13 +4,14 @@ use std::collections::HashMap;
 use gql::{NamedOutputType, ObjectType, OutputType, Schema, Thunk};
 use graphql_parser::query::{Definition, Document, OperationDefinition, Selection, SelectionSet};
 
-use crate::Value;
+use crate::{introspection, Value};
 
 // TODO: Can the key of this map hold a lifetime??? -> It would require us to take care of serialize in `Server::execute` which seems likely.
-type Response = HashMap<String, Value>;
+pub(crate) type Response = HashMap<String, Value>;
 
 pub struct Server {
     schema: Schema,
+    enabled_introspection: bool,
 }
 
 impl fmt::Debug for Server {
@@ -21,7 +22,10 @@ impl fmt::Debug for Server {
 
 impl Server {
     pub fn new(schema: Schema) -> Self {
-        Self { schema }
+        Self {
+            schema,
+            enabled_introspection: true, // TODO: User configurable
+        }
     }
 
     // TODO: Proper error handling + serializable error
@@ -31,7 +35,7 @@ impl Server {
         // println!("{:#?}", query);
 
         let mut response = Response::new();
-        resolve(&self.schema, &mut response, query);
+        resolve(self, &self.schema, &mut response, query);
         Ok(response)
     }
 }
@@ -46,22 +50,32 @@ pub fn parse_query(query: &str) -> graphql_parser::query::Document<&str> {
 // TODO: Catch panics
 // TODO: Deal with `__typename`
 #[cfg_attr(feature = "tracing", tracing::instrument)]
-pub fn resolve<'a>(schema: &Schema, response: &mut Response, document: Document<'a, &'a str>) {
+pub fn resolve<'a>(
+    server: &Server,
+    schema: &Schema,
+    response: &mut Response,
+    document: Document<'a, &'a str>,
+) {
     for def in document.definitions {
         match def {
-            Definition::Operation(op) => {
-                println!("{:#?}", op);
-
-                match op {
-                    OperationDefinition::SelectionSet(selection) => {
-                        // println!("{:#?}", selection);
-                        resolve_selection_set(&schema.query, response, selection);
-                    }
-                    OperationDefinition::Query(_) => todo!(),
-                    OperationDefinition::Mutation(_) => todo!(),
-                    OperationDefinition::Subscription(_) => todo!(),
+            Definition::Operation(op) => match op {
+                OperationDefinition::SelectionSet(selection) => {
+                    resolve_selection_set(server, &schema.query, response, selection);
                 }
-            }
+                OperationDefinition::Query(query) => {
+                    debug_assert!(
+                        query.variable_definitions.is_empty(),
+                        "todo: implement variable definitions"
+                    );
+                    debug_assert!(query.directives.is_empty(), "todo: implement directives");
+
+                    // TODO: `query.name` does it need to be handled???
+
+                    resolve_selection_set(server, &schema.query, response, query.selection_set);
+                }
+                OperationDefinition::Mutation(_) => todo!(),
+                OperationDefinition::Subscription(_) => todo!(),
+            },
             Definition::Fragment(_) => todo!(),
         }
     }
@@ -69,6 +83,7 @@ pub fn resolve<'a>(schema: &Schema, response: &mut Response, document: Document<
 
 #[cfg_attr(feature = "tracing", tracing::instrument)]
 pub fn resolve_selection_set<'a>(
+    server: &Server,
     object_ty: &ObjectType,
     response: &mut Response,
     selection: SelectionSet<'a, &'a str>,
@@ -81,13 +96,35 @@ pub fn resolve_selection_set<'a>(
 
                 let field_name = field.alias.unwrap_or_else(|| field.name);
 
-                let field_def = match &object_ty.fields {
+                let fields = match &object_ty.fields {
                     // TODO: Cache this between execute calls
                     Thunk::Lazy(func) => todo!(),
                     Thunk::Eager(fields) => fields,
-                }
-                .get(field_name)
-                .unwrap_or_else(|| panic!("field not found: {:?}", field_name)); // TODO: Error instead
+                };
+
+                let field_def = match fields.get(field_name) {
+                    Some(field_def) => field_def,
+                    None => {
+                        if server.enabled_introspection {
+                            if field_name == "__schema" {
+                                let schema = introspection::schema(); // TODO: Cache the output of this
+
+                                let mut inner_response = HashMap::new();
+                                resolve_selection_set(
+                                    server,
+                                    &schema,
+                                    &mut inner_response,
+                                    field.selection_set,
+                                );
+
+                                response.insert(field.name.into(), Value::Object(inner_response));
+                                continue;
+                            }
+                        }
+
+                        panic!("field not found: {:?}", field_name); // TODO: Error instead
+                    }
+                };
 
                 let field_ty = match &field_def.ty {
                     OutputType::Nullable(ty) => ty,
@@ -97,7 +134,13 @@ pub fn resolve_selection_set<'a>(
 
                 match field_ty {
                     NamedOutputType::Scalar(scalar) => {
+                        assert!(
+                            field.selection_set.items.is_empty(),
+                            "todo: error because scalar fields can't have selection sets"
+                        );
+
                         if let Some(resolve) = field_def.resolve {
+                            // TODO: Allow `ScalarType` to define how they are serialized
                             response.insert(field.name.into(), Value::String((resolve)()));
                         } else {
                             // TODO: Error instead
@@ -110,6 +153,7 @@ pub fn resolve_selection_set<'a>(
                     NamedOutputType::Object(inner_object_ty) => {
                         let mut nested_response = HashMap::new();
                         resolve_selection_set(
+                            server,
                             inner_object_ty,
                             &mut nested_response,
                             field.selection_set,
