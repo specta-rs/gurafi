@@ -12,3 +12,6 @@ tracing-subscriber = "0.3.18"
 suku = { path = "../../suku", features = ["tracing"] }
 serde = { version = "1.0.193", features = ["derive"] }
 serde_json = "1.0.108"
+
+# TODO: Remove this
+gql = { path = "../../gql" }

@@ -1,10 +1,11 @@
 use core::fmt;
 use std::collections::HashMap;
 
-use graphql_parser::query::{Definition, OperationDefinition, Selection};
+use gql::{Schema, Thunk};
+use graphql_parser::query::{Definition, Document, OperationDefinition, Selection, SelectionSet};
 
 pub struct Server {
-    // query: Resolver,
+    schema: Schema,
 }
 
 impl fmt::Debug for Server {
@@ -14,68 +15,18 @@ impl fmt::Debug for Server {
 }
 
 impl Server {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(schema: Schema) -> Self {
+        Self { schema }
     }
 
     // TODO: Proper error handling + serializable error
     #[cfg_attr(feature = "tracing", tracing::instrument)]
-    pub async fn execute(&self, document: String) -> Result<HashMap<String, &'static str>, ()> {
+    pub async fn execute(&self, document: String) -> Result<HashMap<String, String>, ()> {
         let query = parse_query(&document);
-        println!("{:#?}", query);
-
-        // TODO: Handle introspection
-        // TODO: Handle fragments
-        // TODO: Catch panics
-        // TODO: Deal with `__typename`
+        // println!("{:#?}", query);
 
         let mut response = HashMap::new();
-
-        for def in query.definitions {
-            match def {
-                Definition::Operation(op) => {
-                    println!("{:#?}", op);
-
-                    match op {
-                        OperationDefinition::SelectionSet(selection) => {
-                            println!("{:#?}", selection);
-
-                            for item in selection.items {
-                                match item {
-                                    Selection::Field(field) => {
-                                        debug_assert!(
-                                            field.alias.is_none(),
-                                            "todo: implement alias"
-                                        );
-                                        debug_assert!(
-                                            field.arguments.is_empty(),
-                                            "todo: implement arguments"
-                                        );
-                                        debug_assert!(
-                                            field.directives.is_empty(),
-                                            "todo: implement directives"
-                                        );
-                                        debug_assert!(
-                                            field.selection_set.items.is_empty(),
-                                            "todo: implement nested selection sets"
-                                        );
-
-                                        response.insert(field.name.to_string(), "Hello World");
-                                    }
-                                    Selection::FragmentSpread(_) => todo!(),
-                                    Selection::InlineFragment(_) => todo!(),
-                                }
-                            }
-                        }
-                        OperationDefinition::Query(_) => todo!(),
-                        OperationDefinition::Mutation(_) => todo!(),
-                        OperationDefinition::Subscription(_) => todo!(),
-                    }
-                }
-                Definition::Fragment(_) => todo!(),
-            }
-        }
-
+        resolve(&self.schema, &mut response, query);
         Ok(response)
     }
 }
@@ -83,4 +34,72 @@ impl Server {
 #[cfg_attr(feature = "tracing", tracing::instrument)]
 pub fn parse_query(query: &str) -> graphql_parser::query::Document<&str> {
     graphql_parser::parse_query::<&str>(query).unwrap()
+}
+
+// TODO: Handle introspection
+// TODO: Handle fragments
+// TODO: Catch panics
+// TODO: Deal with `__typename`
+#[cfg_attr(feature = "tracing", tracing::instrument)]
+pub fn resolve<'a>(
+    schema: &Schema,
+    response: &mut HashMap<String, String>,
+    document: Document<'a, &'a str>,
+) {
+    for def in document.definitions {
+        match def {
+            Definition::Operation(op) => {
+                println!("{:#?}", op);
+
+                match op {
+                    OperationDefinition::SelectionSet(selection) => {
+                        // println!("{:#?}", selection);
+                        resolve_selection_set(schema, response, selection);
+                    }
+                    OperationDefinition::Query(_) => todo!(),
+                    OperationDefinition::Mutation(_) => todo!(),
+                    OperationDefinition::Subscription(_) => todo!(),
+                }
+            }
+            Definition::Fragment(_) => todo!(),
+        }
+    }
+}
+
+#[cfg_attr(feature = "tracing", tracing::instrument)]
+pub fn resolve_selection_set<'a>(
+    schema: &Schema,
+    response: &mut HashMap<String, String>,
+    selection: SelectionSet<'a, &'a str>,
+) {
+    for item in selection.items {
+        match item {
+            Selection::Field(field) => {
+                debug_assert!(field.alias.is_none(), "todo: implement alias");
+                debug_assert!(field.arguments.is_empty(), "todo: implement arguments");
+                debug_assert!(field.directives.is_empty(), "todo: implement directives");
+                debug_assert!(
+                    field.selection_set.items.is_empty(),
+                    "todo: implement nested selection sets"
+                );
+
+                let field_def = match &schema.query.fields {
+                    // TODO: Cache this between execute calls
+                    Thunk::Lazy(func) => todo!(),
+                    Thunk::Eager(fields) => fields,
+                }
+                .get(field.name)
+                .unwrap(); // TODO: Error instead
+
+                if let Some(resolve) = field_def.resolve {
+                    response.insert(field.name.to_string(), (resolve)());
+                } else {
+                    // TODO: Error instead
+                    response.insert(field.name.to_string(), "Missing response".into());
+                }
+            }
+            Selection::FragmentSpread(_) => todo!(),
+            Selection::InlineFragment(_) => todo!(),
+        }
+    }
 }

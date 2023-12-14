@@ -3,19 +3,21 @@ use std::{borrow::Cow, collections::HashMap};
 use crate::{InputType, OutputType, Thunk};
 
 /// https://graphql.org/graphql-js/type/#graphqlobjecttype
+#[derive(Debug)]
 pub struct ObjectType {
-    name: Cow<'static, str>,
-    description: Option<Cow<'static, str>>,
+    pub name: Cow<'static, str>,
+    pub description: Option<Cow<'static, str>>,
     // interfaces?: GraphQLInterfacesThunk | Array<GraphQLInterfaceType>;
     // isTypeOf?: (value: any, info?: GraphQLResolveInfo) => boolean;
-    fields: Thunk<HashMap<Cow<'static, str>, FieldConfig>>,
+    pub fields: Thunk<HashMap<Cow<'static, str>, FieldConfig>>,
 }
 
+#[derive(Debug)]
 pub struct FieldConfig {
-    description: Option<Cow<'static, str>>,
-    deprecation_reason: Option<Cow<'static, str>>,
-    args: Option<HashMap<Cow<'static, str>, ArgumentConfig>>,
-    ty: OutputType,
+    pub description: Option<Cow<'static, str>>,
+    pub deprecation_reason: Option<Cow<'static, str>>,
+    pub args: Option<HashMap<Cow<'static, str>, ArgumentConfig>>,
+    pub ty: OutputType,
     // TODO:
     // type GraphQLFieldResolveFn = (
     //     source?: any,
@@ -23,11 +25,12 @@ pub struct FieldConfig {
     //     context?: any,
     //     info?: GraphQLResolveInfo
     //   ) => any
-    resolve: Option<fn() -> String>,
+    pub resolve: Option<fn() -> String>,
 }
 
+#[derive(Debug)]
 pub struct ArgumentConfig {
-    description: Option<Cow<'static, str>>,
-    ty: InputType,
+    pub description: Option<Cow<'static, str>>,
+    pub ty: InputType,
     // defaultValue?: any;
 }

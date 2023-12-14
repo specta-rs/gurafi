@@ -296,6 +296,7 @@ name = "gurafu-example-axum"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "gql",
  "serde",
  "serde_json",
  "suku",

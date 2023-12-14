@@ -8,6 +8,6 @@ mod thunk;
 
 pub use input_type::InputType;
 pub use object_type::{ArgumentConfig, FieldConfig, ObjectType};
-pub use output_type::{NamedOutputType, OutputType};
+pub use output_type::{NamedOutputType, OutputType, ScalarType};
 pub use schema::Schema;
 pub use thunk::Thunk;

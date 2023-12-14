@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 /// https://github.com/graphql/graphql-js/blob/688ee2f2a2f938e80bcf3808bc435d3d87a3ff3e/src/type/definition.ts#L225
+#[derive(Debug)]
 pub enum OutputType {
     Nullable(NamedOutputType),
     NonNullable(NamedOutputType),
@@ -8,6 +9,7 @@ pub enum OutputType {
 }
 
 /// https://github.com/graphql/graphql-js/blob/688ee2f2a2f938e80bcf3808bc435d3d87a3ff3e/src/type/definition.ts#L440
+#[derive(Debug)]
 pub enum NamedOutputType {
     Scalar(ScalarType),
     // Object(),
@@ -17,9 +19,10 @@ pub enum NamedOutputType {
 }
 
 /// https://github.com/graphql/graphql-js/blob/688ee2f2a2f938e80bcf3808bc435d3d87a3ff3e/src/type/definition.ts#L545
+#[derive(Debug)]
 pub struct ScalarType {
-    name: Cow<'static, str>,
-    description: Option<Cow<'static, str>>,
+    pub name: Cow<'static, str>,
+    pub description: Option<Cow<'static, str>>,
     // specifiedByURL: Maybe<string>;
     // serialize: GraphQLScalarSerializer<TExternal>;
     // parseValue: GraphQLScalarValueParser<TInternal>;
@@ -27,4 +30,21 @@ pub struct ScalarType {
     // extensions: Readonly<GraphQLScalarTypeExtensions>;
     // astNode: Maybe<ScalarTypeDefinitionNode>;
     // extensionASTNodes: ReadonlyArray<ScalarTypeExtensionNode>;
+}
+
+impl ScalarType {
+    // TODO: Is this a good idea or too high level???
+
+    pub fn string() -> Self {
+        Self {
+            name: "String".into(),
+            description: None,
+        }
+    }
+}
+
+impl From<ScalarType> for NamedOutputType {
+    fn from(v: ScalarType) -> Self {
+        NamedOutputType::Scalar(v)
+    }
 }

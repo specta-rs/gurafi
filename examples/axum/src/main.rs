@@ -1,4 +1,4 @@
-use std::{net::Ipv6Addr, sync::Arc};
+use std::{collections::HashMap, net::Ipv6Addr, sync::Arc};
 
 use axum::{
     response::Html,
@@ -29,7 +29,7 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let server = Arc::new(Server::new());
+    let server = Arc::new(Server::new(basic_schema()));
 
     let app = Router::new()
         .route(
@@ -53,4 +53,31 @@ async fn main() {
     )
     .await
     .unwrap();
+}
+
+use gql::*;
+pub fn basic_schema() -> Schema {
+    Schema {
+        query: ObjectType {
+            name: "Query".into(),
+            description: None,
+            fields: {
+                let mut fields = HashMap::new();
+
+                fields.insert(
+                    "hello".into(),
+                    FieldConfig {
+                        description: None,
+                        deprecation_reason: None,
+                        args: None,
+                        ty: OutputType::NonNullable(ScalarType::string().into()),
+                        resolve: Some(|| "Hello World".to_string()),
+                    },
+                );
+
+                fields.into()
+            },
+        },
+        mutation: None,
+    }
 }

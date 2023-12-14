@@ -1,7 +1,8 @@
 use crate::ObjectType;
 
 /// https://graphql.org/graphql-js/type/#graphqlschema
+#[derive(Debug)]
 pub struct Schema {
-    query: ObjectType,
-    mutation: Option<ObjectType>,
+    pub query: ObjectType,
+    pub mutation: Option<ObjectType>,
 }
