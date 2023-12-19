@@ -1,2 +1,2 @@
 [alias]
-e-axum = "run -p gurafu-example-axum"
+e-axum = "run -p gurafi-example-axum"

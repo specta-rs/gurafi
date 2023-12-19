@@ -1,4 +1,4 @@
-# Gurafu
+# Gurafi
 
 Intuitive GraphQL server for Rust
 

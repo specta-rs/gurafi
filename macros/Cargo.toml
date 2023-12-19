@@ -1,7 +1,9 @@
 [package]
-name = "gurafu"
+name = "gurafi-macros"
 version = "0.0.1"
 edition = "2021"
 
+[lib]
+proc-macro = true
+
 [dependencies]
-gurafu-macros = { path = "./macros" }

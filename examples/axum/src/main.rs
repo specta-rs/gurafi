@@ -31,7 +31,7 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let server = Arc::new(Server::new(basic_schema()));
+    let server = Arc::new(Server::new(basic_schema()).introspection(true));
 
     let app = Router::new()
         .route(
@@ -44,10 +44,11 @@ async fn main() {
         .route(
             "/graphql",
             post(|Json(body): Json<GQLRequest>| async move {
-                Json(match server.execute(body.query).await {
-                    Ok(response) => response,
-                    Err(_) => todo!(),
-                })
+                // match server.execute(body.query).await {
+                //     Ok(response) => Json(response),
+                //     Err(_) => todo!(),
+                // }
+                todo!();
             }),
         )
         .layer(
@@ -84,7 +85,7 @@ pub fn basic_schema() -> Schema {
                         deprecation_reason: None,
                         args: None,
                         ty: OutputType::NonNullable(ScalarType::string().into()),
-                        resolve: Some(|| "Hello World".to_string()),
+                        resolve: Some(|_| "Hello World".to_string()),
                     },
                 );
 
@@ -110,7 +111,7 @@ pub fn basic_schema() -> Schema {
                                             ty: OutputType::NonNullable(
                                                 ScalarType::string().into(),
                                             ),
-                                            resolve: Some(|| "Hello World Suku".to_string()),
+                                            resolve: Some(|_| "Hello World Suku".to_string()),
                                         },
                                     );
 
@@ -119,7 +120,7 @@ pub fn basic_schema() -> Schema {
                             }
                             .into(),
                         ),
-                        resolve: Some(|| "Broken".to_string()), // TODO: This is wrong
+                        resolve: Some(|_| "Broken".to_string()), // TODO: This is wrong
                     },
                 );
 

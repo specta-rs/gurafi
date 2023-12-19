@@ -1,4 +1,4 @@
-use gurafu::{expose, FieldBuilder, Schema};
+use gurafi::{expose, FieldBuilder, Schema};
 
 #[derive(Debug)]
 pub struct Giraffe {

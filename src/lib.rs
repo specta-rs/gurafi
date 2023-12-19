@@ -1,4 +1,4 @@
-//! Gurafu: GraphQL server for Rust
+//! gurafi: GraphQL server for Rust
 
 mod expose;
 mod field_builder;

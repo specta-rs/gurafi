@@ -1,4 +1,4 @@
-use gurafu::Schema;
+use gurafi::Schema;
 
 // We assume this is an external crate, hence we can't do impl's on it.
 mod external {

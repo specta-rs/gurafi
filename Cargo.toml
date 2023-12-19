@@ -1,3 +1,10 @@
+[package]
+name = "gurafi"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+gurafi-macros = { path = "./macros" }
+
 [workspace]
-resolver = "2"
-members = ["./gurafu", "./gurafu/macros", "./suku", "./gql", "./examples/*"]
+members = ["./macros", "./examples/*"]
