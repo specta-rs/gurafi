@@ -4,7 +4,13 @@ version = "0.0.1"
 edition = "2021"
 
 [dependencies]
+gql = { path = "../gql" }
 gurafi-macros = { path = "./macros" }
 
 [workspace]
 members = ["./macros", "./examples/*"]
+
+# For Axum 0.7 Support
+[patch.crates-io]
+async-graphql = { git = "https://github.com/async-graphql/async-graphql", rev = "44ae98335413a11e1acbc6c48135f452996e8a0b" }
+async-graphql-axum = { git = "https://github.com/async-graphql/async-graphql", rev = "44ae98335413a11e1acbc6c48135f452996e8a0b" }

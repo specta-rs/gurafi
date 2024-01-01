@@ -1,7 +1,7 @@
 use std::future::{Future, Ready};
 
 pub trait ResolverFn<M> {
-    type Function: Fn(M) -> Self::Result;
+    type Function: Fn(&M) -> Self::Result;
     type Future: Future<Output = Self::Result>;
     type Result;
 }
@@ -19,7 +19,7 @@ pub trait ResolverFn<M> {
 
 impl<M, F, T> ResolverFn<M> for F
 where
-    F: Fn(M) -> T,
+    F: Fn(&M) -> T,
 {
     type Function = F;
     type Future = Ready<T>;

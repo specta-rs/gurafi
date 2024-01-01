@@ -1,13 +1,13 @@
 use std::{collections::HashMap, net::Ipv6Addr, sync::Arc};
 
 use axum::{
-    http::Method,
+    http::{HeaderMap, HeaderValue, Method},
     response::Html,
     routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
-use suku::Server;
+use suku::{OwnedSerializer, Server};
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 use tracing::info;
@@ -43,12 +43,19 @@ async fn main() {
         )
         .route(
             "/graphql",
-            post(|Json(body): Json<GQLRequest>| async move {
-                // match server.execute(body.query).await {
-                //     Ok(response) => Json(response),
-                //     Err(_) => todo!(),
-                // }
-                todo!();
+            post(|Json(req): Json<GQLRequest>| async move {
+                let mut body = Vec::new();
+                let mut json = serde_json::Serializer::new(&mut body);
+                let serializer = OwnedSerializer::new(&mut json);
+
+                match server.execute(serializer, req.query).await {
+                    Ok(()) => {}
+                    Err(_) => todo!(),
+                };
+
+                let mut headers = HeaderMap::new();
+                headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+                (headers, body)
             }),
         )
         .layer(
@@ -85,7 +92,9 @@ pub fn basic_schema() -> Schema {
                         deprecation_reason: None,
                         args: None,
                         ty: OutputType::NonNullable(ScalarType::string().into()),
-                        resolve: Some(|_| "Hello World".to_string()),
+                        resolve: Some(ResolveFn::Ptr(|_, result| {
+                            result.serialize_str("Hello World")
+                        })),
                     },
                 );
 
@@ -111,22 +120,29 @@ pub fn basic_schema() -> Schema {
                                             ty: OutputType::NonNullable(
                                                 ScalarType::string().into(),
                                             ),
-                                            resolve: Some(|_| "Hello World Suku".to_string()),
+                                            resolve: Some(ResolveFn::Ptr(|_, result| {
+                                                result.serialize_str("Hello World Suku")
+                                            })),
                                         },
                                     );
 
                                     fields.into()
                                 },
+                                interfaces: None,
+                                is_type_of: None,
                             }
                             .into(),
                         ),
-                        resolve: Some(|_| "Broken".to_string()), // TODO: This is wrong
+                        resolve: Some(ResolveFn::Ptr(|_, result| result.serialize_str("Broken"))), // TODO: This is wrong
                     },
                 );
 
                 fields.into()
             },
+            is_type_of: None,
+            interfaces: None,
         },
         mutation: None,
+        subscription: None,
     }
 }

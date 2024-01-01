@@ -9,10 +9,9 @@ pub struct ModelBuilder<M> {
 }
 
 impl<M> ModelBuilder<M> {
-    #[cfg(test)] // TODO: Use a special `yuku-test` feature
-    pub fn new() -> Self {
+    pub(crate) fn new(name: Cow<'static, str>) -> Self {
         Self {
-            name: Cow::Borrowed(""),
+            name,
             description: Cow::Borrowed(""),
             fields: HashMap::new(),
         }
