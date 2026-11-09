@@ -140,7 +140,7 @@ impl TypeRegistry {
             input = input.description(description);
         }
         for field in fields {
-            input.fields.insert(field.name.clone(), field);
+            input.insert_field(field);
         }
         self.type_ids.insert(name.to_owned(), TypeId::of::<T>());
         self.types.insert(

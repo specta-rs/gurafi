@@ -732,10 +732,7 @@ impl Definitions {
                     input.description = description;
                     input.one_of = one_of;
                     for field in fields {
-                        if input.fields.contains_key(&field.name) {
-                            input.duplicates.push(field.name.clone());
-                        }
-                        input.fields.insert(field.name.clone(), field);
+                        input.insert_field(field);
                     }
                     Type::InputObject(Arc::new(input))
                 }

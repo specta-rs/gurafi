@@ -625,6 +625,15 @@ impl InputObjectType {
         self
     }
 
+    /// Insert a field into an existing input object definition, reporting duplicates through
+    /// schema validation.
+    pub fn insert_field(&mut self, field: InputValue) {
+        if self.fields.contains_key(&field.name) {
+            self.duplicates.push(field.name.clone());
+        }
+        self.fields.insert(field.name.clone(), field);
+    }
+
     /// Mark the input object as `@oneOf`.
     #[must_use]
     pub fn one_of(mut self) -> Self {
