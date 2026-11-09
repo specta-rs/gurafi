@@ -92,18 +92,19 @@ fn complexity_undercounts_merged_cross_scope_field() {
             max_depth: 0,
         },
     );
-    println!("analyzer (max_complexity=10): {reported:?}");
+    assert!(
+        reported.is_err(),
+        "complexity must reject the merged wide selection, got {reported:?}"
+    );
 
     let response = block_on(gql::execute(
         &schema,
         Request::new(&query),
         &ExecutionOptions::default().max_complexity(10).max_depth(0),
     ));
-    println!(
-        "executed: data_present={} errors={} item_resolvers={} wide_resolvers={}",
-        response.data.is_some(),
-        response.errors.len(),
-        item_calls.load(Ordering::Relaxed),
-        wide_calls.load(Ordering::Relaxed),
+    assert!(
+        response.data.is_none(),
+        "the operation must be rejected first"
     );
+    assert_eq!(wide_calls.load(Ordering::Relaxed), 0);
 }

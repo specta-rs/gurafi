@@ -26,7 +26,8 @@ fn timeout_outside_a_tokio_runtime() {
     let server = Server::new(schema()).timeout(Duration::from_secs(5));
     let request = GraphQLRequest::new("{ ping }");
     let response = futures::executor::block_on(server.execute(&request, Context::empty()));
-    println!("data={:?} errors={:?}", response.data, response.errors);
+    assert!(!response.has_errors(), "{:?}", response.errors);
+    assert!(response.data.is_some());
 }
 
 /// PROBE S2: with `timeout` unset, `Server::execute` works on any executor.
@@ -35,7 +36,8 @@ fn no_timeout_outside_a_tokio_runtime() {
     let server = Server::new(schema());
     let request = GraphQLRequest::new("{ ping }");
     let response = futures::executor::block_on(server.execute(&request, Context::empty()));
-    println!("data={:?} errors={:?}", response.data, response.errors);
+    assert!(!response.has_errors(), "{:?}", response.errors);
+    assert!(response.data.is_some());
 }
 
 /// PROBE S3: GET has no query-string size limit, unlike POST's body limit.

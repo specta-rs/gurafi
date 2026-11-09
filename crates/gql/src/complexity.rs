@@ -380,11 +380,43 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
 /// fragments. `item` selected on `Node` and again on `User` must be analysed with `User`'s fields,
 /// otherwise fields only present on `User` are invisible to the cost estimate.
 fn refine_scope(schema: &Schema, current: &mut String, candidate: &str) {
-    if schema.object_type(current).is_some() {
+    if current == candidate || schema.object_type(current).is_some() {
         return;
     }
     if schema.object_type(candidate).is_some() {
         *current = candidate.to_owned();
+        return;
+    }
+
+    let current_possible = schema.possible_types(current);
+    let candidate_possible = schema.possible_types(candidate);
+    if current_possible.is_empty() || candidate_possible.is_empty() {
+        return;
+    }
+    let intersection: Vec<_> = current_possible
+        .iter()
+        .filter(|name| candidate_possible.contains(name))
+        .cloned()
+        .collect();
+    match intersection.len() {
+        0 => {}
+        // A single possible runtime object is the most precise scope available.
+        1 => *current = intersection[0].to_string(),
+        _ => {
+            // Otherwise prefer the narrower abstract scope when one set of possible types is a
+            // subset of the other.
+            if current_possible
+                .iter()
+                .all(|name| candidate_possible.contains(name))
+            {
+                // `current` is narrower; keep it.
+            } else if candidate_possible
+                .iter()
+                .all(|name| current_possible.contains(name))
+            {
+                *current = candidate.to_owned();
+            }
+        }
     }
 }
 

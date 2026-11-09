@@ -231,7 +231,7 @@ fn variables_to_object(
 ) -> Result<Object, RequestError> {
     let mut object = Object::with_capacity(variables.len());
     for (key, value) in variables {
-        object.insert(
+        object.push_unchecked(
             key.as_str(),
             json_to_graphql(value, &format!("{path}.{key}"))?,
         );
