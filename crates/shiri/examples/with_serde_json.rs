@@ -1,4 +1,4 @@
-use shiri::{serde::SerdeInterop, Serializer};
+use shiri::{Serializer, serde::SerdeInterop};
 
 fn main() {
     let mut buf = Vec::new();

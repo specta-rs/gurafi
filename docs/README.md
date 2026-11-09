@@ -4,76 +4,80 @@ Rust crates for building GraphQL servers.
 
 ## Contents
 
-- [Schema](schema/object.md)
-- [Server](server/hidoki.md)
-- [Persisted queries](server/persisted-queries.md)
+- [Architecture](architecture.md) — how `gql`, `gurafi` and `suku` fit together
+- [Defining a schema](schema/object.md) — objects, inputs, enums, interfaces, unions, auth
+- [Serving over HTTP](server/suku.md) — requests, batches, subscriptions, limits, auth
+- [Schema evolution](schema/evolution.md) — compatibility diffing and SDL snapshots
 
 ## Define a schema
 
 ```rust
-use gurafi::{expose, FieldBuilder, Schema};
+use gurafi::{expose, NoArgs, Object, Schema};
 
-#[derive(Debug)]
-pub struct Giraffe {
+#[derive(Object)]
+struct Giraffe {
     name: String,
-    birthday: String,
-    height_in_meters: f32,
+    height_meters: f64,
 }
 
-// The equivalent of using Pothos classes.
-// https://pothos-graphql.dev/docs/guide/objects#using-classes
-fn giraffe_schema(s: &mut Schema) {
-    s.object_type::<Giraffe>("Giraffe")
-        .description("Long necks, cool patterns, taller than you.")
-        .field("name", expose!(Giraffe:name))
-        .field(
-            "age",
-            // TODO: Rust can't infer the model type to the resolver closure. Can we trick it?
-            FieldBuilder::new(|m: &Giraffe| m.birthday.parse::<u16>().unwrap()),
-        )
-        .field("height", expose!(Giraffe:height_in_meters));
-}
+let mut schema = Schema::<()>::new();
 
-fn schema() -> gql::Schema {
-    let mut schema = <Schema>::new().with(giraffe_schema);
+schema.object::<Giraffe>(|o| {
+    o.description("Long necks, cool patterns, taller than you.");
+    o.expose(expose!(Giraffe::name));
+    o.expose(expose!(Giraffe::height_meters as "heightMeters"));
+});
 
-    schema.query_field("giraffe", || Giraffe {
-        name: "Tony".into(),
-        birthday: 10.to_string(),
-        height_in_meters: 5.2,
+schema.query(|q| {
+    q.field("giraffe", |_: NoArgs, _: &()| Giraffe {
+        name: "Melman".into(),
+        height_meters: 5.2,
     });
+});
 
-    schema.build().unwrap()
-}
+let schema = schema.build().unwrap();
 ```
 
-## Serve via HTTP
-
-You can use the [`hidoki`](https://docs.rs/hidoki) crate to hook up your schema with an [`async-graphql`](https://github.com/async-graphql/async-graphql) server.
+`gurafi` only adds developer experience. The resulting `gql::Schema` is a normal
+GraphQL schema and can be executed directly:
 
 ```rust
-use async_graphql::http::GraphiQLSource;
-use async_graphql_axum::GraphQL;
-use axum::{response::Html, routing::get, Router};
-use tokio::net::TcpListener;
-
-fn main() {
-    let schema = schema(); // Defined in the last example.
-    let schema = hidoki::build_schema(schema).unwrap();
-    let app = Router::new().route(
-        "/",
-        get(|| async move { Html(GraphiQLSource::build().endpoint("/").finish()) })
-            .post_service(GraphQL::new(schema)),
-    );
-
-    println!("GraphiQL IDE: http://localhost:8000");
-    axum::serve(TcpListener::bind("[::]:8000").await.unwrap(), app)
-        .await
-        .unwrap();
-}
+let response = gql::execute(
+    &schema,
+    gql::Request::new("{ giraffe { name heightMeters } }"),
+    &gql::ExecutionOptions::default(),
+).await;
 ```
-<!--
-## Get Access
 
-TODO: Sponsor the GitHub org
--->
+## Serve over HTTP
+
+```rust
+use suku::{Context, Server};
+
+let server = Server::new(schema)
+    .introspection(true)
+    .max_depth(15)
+    .max_complexity(1_000);
+
+let app = suku::axum::GraphQL::new(server)
+    .path("/graphql")
+    .graphiql(true)
+    .with_context(|request: suku::ContextRequest| async move {
+        Ok(Context::empty())
+    })
+    .into_router();
+```
+
+See [`examples/axum`](../examples/axum) for a runnable server with a Bearer-token
+authentication extractor and CORS.
+
+## Layers
+
+| Layer | Crate | Knows about |
+| --- | --- | --- |
+| Specification | `gql` | GraphQL documents, types, validation, execution, introspection |
+| DX | `gurafi` | `gql` and Rust types |
+| Transport | `suku` | `gql` and HTTP |
+
+The layers are independent: another high-level API can build on `gql`, and another
+HTTP framework can serve a `gql::Schema` without `suku`.

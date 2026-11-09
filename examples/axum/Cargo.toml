@@ -1,22 +1,17 @@
 [package]
-name = "gurafi-example-axum"
+name = "example-axum"
+description = "suku + gurafi Axum example"
 version = "0.0.0"
-publish = false
 edition.workspace = true
-rust-version.workspace = true
-authors.workspace = true
-license.workspace = true
-repository.workspace = true
+publish = false
 
 [dependencies]
-axum = { workspace = true, features = ["json"] }
+gql.workspace = true
+gurafi.workspace = true
+suku.workspace = true
+
+axum.workspace = true
 tokio.workspace = true
+tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-suku = { workspace = true, features = ["tracing"] }
-serde = { version = "1.0.193", features = ["derive"] }
-serde_json.workspace = true
-tower-http.workspace = true
-
-# TODO: Remove this
-gql.workspace = true

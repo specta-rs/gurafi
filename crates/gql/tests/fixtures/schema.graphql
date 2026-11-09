@@ -1,0 +1,65 @@
+schema {
+  query: Query
+  mutation: Mutation
+  subscription: Subscription
+}
+
+"""A custom date scalar."""
+scalar Date @specifiedBy(url: "https://example.com/date")
+
+"""A role."""
+enum Role {
+  """A normal user."""
+  USER
+  ADMIN @deprecated(reason: "Use USER")
+}
+
+"""Filter input."""
+input Filter {
+  """Search term."""
+  term: String
+  limit: Int = 10
+  role: Role = USER
+  tags: [String!]
+}
+
+interface Node {
+  id: ID!
+}
+
+"""A user."""
+type User implements Node {
+  id: ID!
+  name: String!
+  age: Int
+  role: Role!
+  friends(first: Int = 5): [User!]!
+  old: String @deprecated(reason: "gone")
+}
+
+type Post implements Node {
+  id: ID!
+  author: User!
+  createdAt: Date!
+}
+
+union SearchResult = User | Post
+
+"""Root queries."""
+type Query {
+  """Find a node."""
+  node(id: ID!): Node
+  users(filter: Filter): [User!]!
+  search(text: String!): [SearchResult!]!
+  date: Date!
+}
+
+type Mutation {
+  createUser(name: String!, role: Role = USER): User!
+}
+
+type Subscription {
+  userCreated: User!
+}
+
+directive @auth(requires: Role = USER) repeatable on FIELD_DEFINITION | OBJECT

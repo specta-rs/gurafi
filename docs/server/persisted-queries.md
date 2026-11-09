@@ -1,3 +1,0 @@
-# Persisted Queries
-
-<!-- TODO -->

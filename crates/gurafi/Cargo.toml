@@ -11,3 +11,5 @@ repository.workspace = true
 [dependencies]
 gql.workspace = true
 gurafi-macros.workspace = true
+futures.workspace = true
+indexmap.workspace = true
