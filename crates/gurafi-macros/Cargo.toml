@@ -1,5 +1,6 @@
 [package]
 name = "gurafi-macros"
+description = "Procedural macros for gurafi"
 version = "0.0.1"
 edition.workspace = true
 rust-version.workspace = true
