@@ -1,14 +1,31 @@
-[package]
-name = "gurafi"
-version = "0.0.1"
-edition = "2021"
-
-[dependencies]
-gql = { path = "../gql" }
-gurafi-macros = { path = "./macros" }
-
 [workspace]
-members = ["./macros", "./examples/*"]
+resolver = "3"
+members = ["crates/*", "examples/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+authors = ["Oscar Beaumont <oscar@otbeaumont.me>"]
+license = "MIT"
+repository = "https://github.com/gurafi/gurafi"
+
+[workspace.dependencies]
+# First-party crates, these always resolve to the local implementation.
+gql = { path = "crates/gql", version = "0.2.0" }
+gurafi = { path = "crates/gurafi", version = "0.0.1" }
+gurafi-macros = { path = "crates/gurafi-macros", version = "0.0.1" }
+hidoki = { path = "crates/hidoki", version = "0.0.1" }
+shiri = { path = "crates/shiri", version = "0.0.0" }
+suku = { path = "crates/suku", version = "0.0.1" }
+
+# External dependencies
+axum = "0.7.3"
+graphql-parser = "0.4.0"
+serde_json = "1.0.108"
+tokio = { version = "1.35.1", features = ["macros", "rt-multi-thread"] }
+tower-http = { version = "0.5.0", features = ["cors"] }
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
 
 # For Axum 0.7 Support
 [patch.crates-io]

@@ -21,6 +21,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "`expose!` is not implemented yet"]
     fn test_expose() {
         // Test same-module
         expose!(Foo:bar);

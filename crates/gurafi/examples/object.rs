@@ -16,7 +16,7 @@ fn giraffe_schema(s: &mut Schema) {
         .field(
             "age",
             // TODO: Rust can't infer the model type to the resolver closure. Can we trick it?
-            FieldBuilder::new(|m: Giraffe| m.birthday.parse::<u16>().unwrap()),
+            FieldBuilder::new(|m: &Giraffe| m.birthday.parse::<u16>().unwrap()),
         )
         .field("height", expose!(Giraffe:height_in_meters));
 }

@@ -1,2 +1,5 @@
+# Build output
 /target
+
+# OS files
 .DS_Store

@@ -1,0 +1,13 @@
+[package]
+name = "gurafi"
+description = "Intuitive GraphQL server for Rust"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gql.workspace = true
+gurafi-macros.workspace = true

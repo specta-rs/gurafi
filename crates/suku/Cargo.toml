@@ -1,0 +1,21 @@
+[package]
+name = "suku"
+description = "Simple GraphQL server"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+tracing = ["dep:tracing"]
+
+[dependencies]
+gql.workspace = true
+serde = { version = "1.0.193", default-features = false }
+
+# futures = "0.3.29"                                # TODO: `futures_core`???
+graphql-parser.workspace = true
+tracing = { workspace = true, optional = true }

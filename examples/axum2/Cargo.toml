@@ -1,13 +1,17 @@
 [package]
 name = "gurafi-example-axum2"
 version = "0.0.0"
-edition = "2021"
 publish = false
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
-gurafi = { path = "../../" }
-hidoki = { path = "../../../hidoki" }
+gurafi.workspace = true
+hidoki.workspace = true
 async-graphql = "6.0.11"
 async-graphql-axum = "6.0.11"
-axum = "0.7.3"
-tokio = { version = "1.35.1", features = ["macros", "rt-multi-thread"] }
+axum.workspace = true
+tokio.workspace = true
