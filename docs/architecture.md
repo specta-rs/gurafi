@@ -67,7 +67,8 @@ only reached by a valid operation with valid variables.
 - Names are interned once per schema (`Arc<str>`).
 - Object values use an inline `SmallVec`, avoiding a heap allocation for the
   common small-object case.
-- Field collection groups by response key once per selection set.
+- Field collection groups by response key once per selection set and deduplicates fragments.
+- Sibling fields on queries resolve concurrently with a bounded limit; mutations stay serial.
 - Introspection results are descriptors, not copies of the whole schema.
 - Complexity analysis runs before execution, so expensive operations are
   rejected before any resolver or database call.
