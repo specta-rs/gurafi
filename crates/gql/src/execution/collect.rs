@@ -4,16 +4,21 @@
 //! fragment spreads and inline fragments, and group selections by response key so that fields
 //! selected more than once are resolved once and their sub-selections merged.
 
-use std::collections::HashMap;
-
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 use crate::{Object, Value, ast, error::GraphQLError, schema::Schema};
 
-use super::selection::type_condition_matches;
+use super::{executor::FragmentMap, selection::type_condition_matches};
+
+/// One response key's field nodes, in document order.
+pub(crate) type FieldGroup<'a> = (&'a str, SmallVec<[&'a ast::Field<'a>; 1]>);
 
 /// Fields grouped by response key, preserving first-seen order.
-pub(crate) type CollectedFields<'a> = Vec<(&'a str, Vec<&'a ast::Field<'a>>)>;
+///
+/// Selection sets are usually tiny, so the outer list lives inline. Only pathological documents
+/// spill to the heap.
+pub(crate) type CollectedFields<'a> = SmallVec<[FieldGroup<'a>; 8]>;
 
 /// Maximum number of selections collection may visit. A document can stay tiny while fragment
 /// expansion makes it enormous; validation and complexity analysis bound this earlier, but
@@ -23,10 +28,17 @@ const MAX_COLLECT_WORK: u64 = 500_000;
 /// Maximum fragment nesting during field collection.
 const MAX_COLLECT_FRAGMENT_DEPTH: usize = 128;
 
+/// Above this many distinct response keys a hash index beats a linear scan.
+const LINEAR_INDEX_LIMIT: usize = 16;
+
+/// The response-key index for one collection. Small selection sets are scanned linearly, which
+/// avoids a hash map allocation for the common case; larger ones build the map on demand.
+type FieldIndex<'a> = Option<FxHashMap<&'a str, usize>>;
+
 /// Collect fields for one runtime type from a single selection set.
 pub(crate) fn collect_fields<'a>(
     schema: &Schema,
-    fragments: &HashMap<&'a str, &'a ast::FragmentDefinition<'a>>,
+    fragments: &FragmentMap<'a>,
     variables: &Object,
     runtime_type: &str,
     selection_set: &'a ast::SelectionSet<'a>,
@@ -47,14 +59,14 @@ pub(crate) fn collect_fields<'a>(
 /// syntax tree.
 pub(crate) fn collect_fields_multi<'a>(
     schema: &Schema,
-    fragments: &HashMap<&'a str, &'a ast::FragmentDefinition<'a>>,
+    fragments: &FragmentMap<'a>,
     variables: &Object,
     runtime_type: &str,
     selection_sets: &[&'a ast::SelectionSet<'a>],
 ) -> Result<CollectedFields<'a>, GraphQLError> {
-    let mut fields = Vec::new();
-    let mut index = FxHashMap::default();
-    let mut visited = FxHashSet::default();
+    let mut fields = CollectedFields::new();
+    let mut index: FieldIndex<'a> = None;
+    let mut visited = VisitedFragments::new();
     let mut work = 0u64;
     for selection_set in selection_sets {
         collect_into(
@@ -76,13 +88,13 @@ pub(crate) fn collect_fields_multi<'a>(
 #[allow(clippy::too_many_arguments)]
 fn collect_into<'a>(
     schema: &Schema,
-    fragments: &HashMap<&'a str, &'a ast::FragmentDefinition<'a>>,
+    fragments: &FragmentMap<'a>,
     variables: &Object,
     runtime_type: &str,
     selection_set: &'a ast::SelectionSet<'a>,
     fields: &mut CollectedFields<'a>,
-    index: &mut FxHashMap<&'a str, usize>,
-    visited: &mut FxHashSet<&'a str>,
+    index: &mut FieldIndex<'a>,
+    visited: &mut VisitedFragments<'a>,
     depth: usize,
     work: &mut u64,
 ) -> Result<(), GraphQLError> {
@@ -98,15 +110,7 @@ fn collect_into<'a>(
         }
         match selection {
             ast::Selection::Field(field) => {
-                let response_key = field.response_key();
-                if let Some(existing) = index.get(response_key) {
-                    if let Some(group) = fields.get_mut(*existing) {
-                        group.1.push(field);
-                    }
-                } else {
-                    index.insert(response_key, fields.len());
-                    fields.push((response_key, vec![field]));
-                }
+                add_field(fields, index, field.response_key(), field);
             }
             ast::Selection::FragmentSpread(spread) => {
                 let Some(fragment) = fragments.get(spread.name) else {
@@ -167,6 +171,80 @@ fn collect_into<'a>(
     Ok(())
 }
 
+/// Append a field node to its response key's group, creating the group if needed.
+fn add_field<'a>(
+    fields: &mut CollectedFields<'a>,
+    index: &mut FieldIndex<'a>,
+    response_key: &'a str,
+    field: &'a ast::Field<'a>,
+) {
+    if let Some(existing) = find_group(fields, index, response_key) {
+        fields[existing].1.push(field);
+        return;
+    }
+    let position = fields.len();
+    fields.push((response_key, smallvec::smallvec![field]));
+    match index {
+        Some(index) => {
+            index.insert(response_key, position);
+        }
+        None if fields.len() > LINEAR_INDEX_LIMIT => {
+            *index = Some(
+                fields
+                    .iter()
+                    .enumerate()
+                    .map(|(position, (key, _))| (*key, position))
+                    .collect(),
+            );
+        }
+        None => {}
+    }
+}
+
+fn find_group<'a>(
+    fields: &CollectedFields<'a>,
+    index: &FieldIndex<'a>,
+    response_key: &str,
+) -> Option<usize> {
+    match index {
+        Some(index) => index.get(response_key).copied(),
+        None => fields.iter().position(|(key, _)| *key == response_key),
+    }
+}
+
+/// The set of fragment names expanded so far.
+///
+/// Documents expand only a handful of fragments, so the names live inline; a pathological
+/// document with many spreads falls back to a hash set to keep `CollectFields` linear.
+struct VisitedFragments<'a> {
+    small: SmallVec<[&'a str; 8]>,
+    large: Option<FxHashSet<&'a str>>,
+}
+
+impl<'a> VisitedFragments<'a> {
+    fn new() -> Self {
+        Self {
+            small: SmallVec::new(),
+            large: None,
+        }
+    }
+
+    /// Insert a fragment name, returning whether it was not already present.
+    fn insert(&mut self, name: &'a str) -> bool {
+        if let Some(large) = &mut self.large {
+            return large.insert(name);
+        }
+        if self.small.contains(&name) {
+            return false;
+        }
+        self.small.push(name);
+        if self.small.len() > LINEAR_INDEX_LIMIT {
+            self.large = Some(self.small.iter().copied().collect());
+        }
+        true
+    }
+}
+
 /// Evaluate `@skip` and `@include` for a selection.
 pub(crate) fn should_include(
     directives: &[ast::Directive<'_>],
@@ -200,7 +278,7 @@ pub(crate) fn should_include(
     Ok(true)
 }
 
-fn boolean_value(value: &ast::Value<'_>, variables: &Object) -> Result<bool, String> {
+fn boolean_value(value: &ast::Value<'_>, variables: &crate::Object) -> Result<bool, String> {
     match value {
         ast::Value::Boolean(value) => Ok(*value),
         ast::Value::Variable(name) => match variables.get(name) {

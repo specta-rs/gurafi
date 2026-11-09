@@ -113,7 +113,7 @@ pub(crate) async fn subscribe(
         extensions: std::sync::Mutex::new(None),
     };
 
-    let fragments = executor::fragment_map(&document);
+    let fragments = executor::FragmentMap::new(&document);
     let collected = collect::collect_fields(
         schema,
         &fragments,

@@ -5,7 +5,10 @@
 //! single resolver. It is meant to be called before execution so an oversized query is rejected
 //! instead of tying up a worker.
 
+use std::{borrow::Cow, sync::Arc};
+
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 
 use crate::{
     Object, Value,
@@ -100,34 +103,34 @@ fn select_operation<'document, 'source>(
     document: &'document ast::Document<'source>,
     operation_name: Option<&str>,
 ) -> Result<&'document ast::OperationDefinition<'source>, GraphQLError> {
-    let operations: Vec<&ast::OperationDefinition<'source>> = document.operations().collect();
-
     if let Some(name) = operation_name {
-        return operations
-            .into_iter()
+        return document
+            .operations()
             .find(|operation| operation.name == Some(name))
             .ok_or_else(|| GraphQLError::new(format!("Unknown operation named \"{name}\".")));
     }
 
-    match operations.len() {
-        0 => Err(GraphQLError::new("Must provide an operation.")),
-        1 => Ok(operations[0]),
-        _ => Err(GraphQLError::new(
+    let mut operations = document.operations();
+    match operations.next() {
+        None => Err(GraphQLError::new("Must provide an operation.")),
+        Some(first) if operations.next().is_none() => Ok(first),
+        Some(_) => Err(GraphQLError::new(
             "Must provide an operation name if the document contains multiple operations.",
         )),
     }
 }
 
-fn root_type_name(schema: &Schema, kind: OperationKind) -> Result<String, GraphQLError> {
+fn root_type_name(schema: &Schema, kind: OperationKind) -> Result<Arc<str>, GraphQLError> {
     match kind {
-        OperationKind::Query => Ok(schema.query_name().to_string()),
+        // The schema already interns its root names, so the common case shares that allocation.
+        OperationKind::Query => Ok(Arc::clone(schema.query_name())),
         OperationKind::Mutation => schema
             .mutation_name()
-            .map(ToString::to_string)
+            .map(Arc::clone)
             .ok_or_else(|| GraphQLError::new("Schema is not configured for mutations.")),
         OperationKind::Subscription => schema
             .subscription_name()
-            .map(ToString::to_string)
+            .map(Arc::clone)
             .ok_or_else(|| GraphQLError::new("Schema is not configured for subscriptions.")),
     }
 }
@@ -143,10 +146,10 @@ struct CollectedField<'source, 'document> {
     response_key: &'source str,
     /// The type the field is selected on, which may be narrower than the enclosing type after a
     /// fragment with a type condition.
-    scope: String,
+    scope: Arc<str>,
     node: &'document ast::Field<'source>,
     /// Sub-selections of every field merged under this response key.
-    selections: Vec<&'document ast::Selection<'source>>,
+    selections: SmallVec<[&'document ast::Selection<'source>; 2]>,
 }
 
 struct Analyzer<'a, 'document, 'source> {
@@ -154,7 +157,7 @@ struct Analyzer<'a, 'document, 'source> {
     document: &'document ast::Document<'source>,
     variables: &'a Object,
     options: &'a ComplexityOptions,
-    fragment_cache: FxHashMap<(&'source str, String), Vec<CollectedField<'source, 'document>>>,
+    fragment_cache: FxHashMap<(&'source str, Arc<str>), Vec<CollectedField<'source, 'document>>>,
     work: u64,
 }
 
@@ -163,15 +166,15 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
     fn analyze_selection<I>(
         &mut self,
         items: I,
-        scope: &str,
+        scope: &Arc<str>,
         depth: usize,
         active_fragments: &mut Vec<&'source str>,
     ) -> Result<(u32, usize), GraphQLError>
     where
         I: IntoIterator<Item = &'document ast::Selection<'source>>,
     {
-        let mut collected = Vec::new();
-        let mut index = FxHashMap::default();
+        let mut collected: SmallVec<[CollectedField<'source, 'document>; 4]> = SmallVec::new();
+        let mut index: FxHashMap<&'source str, SmallVec<[usize; 1]>> = FxHashMap::default();
         self.collect_fields(items, scope, active_fragments, &mut collected, &mut index)?;
 
         let mut cost = 0u32;
@@ -194,10 +197,10 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
     fn collect_fields<I>(
         &mut self,
         items: I,
-        scope: &str,
+        scope: &Arc<str>,
         active_fragments: &mut Vec<&'source str>,
-        output: &mut Vec<CollectedField<'source, 'document>>,
-        index: &mut FxHashMap<&'source str, Vec<usize>>,
+        output: &mut SmallVec<[CollectedField<'source, 'document>; 4]>,
+        index: &mut FxHashMap<&'source str, SmallVec<[usize; 1]>>,
     ) -> Result<(), GraphQLError>
     where
         I: IntoIterator<Item = &'document ast::Selection<'source>>,
@@ -240,14 +243,13 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
                         )));
                     }
 
-                    let key = (spread.name, effective_scope.clone());
-                    let cached = self.fragment_cache.get(&key).cloned();
-                    if let Some(fields) = cached {
-                        merge_all(output, index, &fields);
+                    let key = (spread.name, Arc::clone(&effective_scope));
+                    if let Some(fields) = self.fragment_cache.get(&key) {
+                        merge_all(output, index, fields);
                         continue;
                     }
 
-                    let mut fields = Vec::new();
+                    let mut fields = SmallVec::new();
                     let mut fragment_index = FxHashMap::default();
                     active_fragments.push(spread.name);
                     let result = self.collect_fields(
@@ -259,8 +261,8 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
                     );
                     active_fragments.pop();
                     result?;
-                    self.fragment_cache.insert(key, fields.clone());
                     merge_all(output, index, &fields);
+                    self.fragment_cache.insert(key, fields.into_vec());
                 }
                 ast::Selection::InlineFragment(fragment) => {
                     let effective_scope = match fragment.type_condition {
@@ -268,7 +270,7 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
                             Some(scope) => scope,
                             None => continue,
                         },
-                        None => scope.to_owned(),
+                        None => Arc::clone(scope),
                     };
                     self.collect_fields(
                         fragment.selection_set.items.iter(),
@@ -301,7 +303,8 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
             return Ok((base, depth));
         };
 
-        let named_type = return_type.named_type().to_string();
+        let multiplier = list_multiplier(&return_type, self.options.list_factor);
+        let named_type = return_type.named_type().clone();
         let (selection_cost, selection_depth) = self.analyze_selection(
             field.selections.iter().copied(),
             &named_type,
@@ -309,7 +312,6 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
             active_fragments,
         )?;
 
-        let multiplier = list_multiplier(&return_type, self.options.list_factor);
         let total = base.saturating_add(selection_cost.saturating_mul(multiplier));
         Ok((total, selection_depth))
     }
@@ -341,14 +343,14 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
         }
     }
 
-    fn field_type(&self, scope: &str, name: &str) -> Option<TypeRef> {
+    fn field_type<'b>(&'b self, scope: &str, name: &str) -> Option<Cow<'b, TypeRef>> {
         match name {
             "__typename" => None,
-            "__schema" => Some(TypeRef::named("__Schema").non_null()),
-            "__type" => Some(TypeRef::named("__Type")),
+            "__schema" => Some(Cow::Owned(TypeRef::named("__Schema").non_null())),
+            "__type" => Some(Cow::Owned(TypeRef::named("__Type"))),
             _ => self
                 .field_definition(scope, name)
-                .map(|field| field.ty.clone()),
+                .map(|field| Cow::Borrowed(&field.ty)),
         }
     }
 
@@ -377,16 +379,16 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
 }
 
 fn merge_field<'source, 'document>(
-    output: &mut Vec<CollectedField<'source, 'document>>,
-    index: &mut FxHashMap<&'source str, Vec<usize>>,
+    output: &mut SmallVec<[CollectedField<'source, 'document>; 4]>,
+    index: &mut FxHashMap<&'source str, SmallVec<[usize; 1]>>,
     field: &'document ast::Field<'source>,
-    scope: &str,
+    scope: &Arc<str>,
 ) {
     let response_key = field.response_key();
     let entries = index.entry(response_key).or_default();
     for existing in entries.iter().copied() {
         let collected = &mut output[existing];
-        if collected.scope == scope {
+        if collected.scope.as_ref() == scope.as_ref() {
             // The specification merges field nodes with the same response key and the same
             // parent scope; their sub-selections are collected once.
             if let Some(selection_set) = &field.selection_set {
@@ -403,7 +405,7 @@ fn merge_field<'source, 'document>(
     entries.push(position);
     output.push(CollectedField {
         response_key,
-        scope: scope.to_owned(),
+        scope: Arc::clone(scope),
         node: field,
         selections: field
             .selection_set
@@ -414,8 +416,8 @@ fn merge_field<'source, 'document>(
 }
 
 fn merge_all<'source, 'document>(
-    output: &mut Vec<CollectedField<'source, 'document>>,
-    index: &mut FxHashMap<&'source str, Vec<usize>>,
+    output: &mut SmallVec<[CollectedField<'source, 'document>; 4]>,
+    index: &mut FxHashMap<&'source str, SmallVec<[usize; 1]>>,
     fields: &[CollectedField<'source, 'document>],
 ) {
     for field in fields {
@@ -424,7 +426,7 @@ fn merge_all<'source, 'document>(
         let mut merged = false;
         for existing in entries.iter().copied() {
             let collected = &mut output[existing];
-            if collected.scope == field.scope {
+            if collected.scope.as_ref() == field.scope.as_ref() {
                 collected
                     .selections
                     .extend(field.selections.iter().copied());
@@ -449,14 +451,14 @@ fn directive_if(directive: &ast::Directive<'_>, variables: &Object) -> Option<bo
 }
 
 /// The type a fragment's selections apply to, or `None` when it can never apply.
-fn fragment_scope(schema: &Schema, condition: &str, parent: &str) -> Option<String> {
-    if condition == parent {
-        return Some(parent.to_owned());
+fn fragment_scope(schema: &Schema, condition: &str, parent: &Arc<str>) -> Option<Arc<str>> {
+    if condition == parent.as_ref() {
+        return Some(Arc::clone(parent));
     }
 
     let Some(condition_type) = schema.get_type(condition) else {
         // An unknown condition is a validation error; keep the enclosing scope.
-        return Some(parent.to_owned());
+        return Some(Arc::clone(parent));
     };
     let parent_type = schema.get_type(parent);
 
@@ -466,7 +468,7 @@ fn fragment_scope(schema: &Schema, condition: &str, parent: &str) -> Option<Stri
                 // Two distinct object types never overlap.
                 None
             } else if schema.is_possible_type(parent, condition) {
-                Some(condition.to_owned())
+                Some(Arc::from(condition))
             } else {
                 None
             }
@@ -474,12 +476,12 @@ fn fragment_scope(schema: &Schema, condition: &str, parent: &str) -> Option<Stri
         Type::Interface(_) | Type::Union(_) => {
             if parent_type.is_some_and(|ty| ty.kind() == TypeKind::Object) {
                 if schema.is_possible_type(condition, parent) {
-                    Some(parent.to_owned())
+                    Some(Arc::clone(parent))
                 } else {
                     None
                 }
             } else {
-                Some(condition.to_owned())
+                Some(Arc::from(condition))
             }
         }
         _ => None,

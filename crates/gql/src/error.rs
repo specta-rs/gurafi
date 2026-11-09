@@ -36,6 +36,12 @@ impl fmt::Display for Location {
     }
 }
 
+/// A response path used inside the executor.
+///
+/// Shallow paths are the norm, so keeping them inline avoids an allocation per field. Only when
+/// an error is reported is the path copied into the owned [`Vec`] a [`GraphQLError`] carries.
+pub(crate) type Path = SmallVec<[PathSegment; 8]>;
+
 /// One segment of a response path.
 ///
 /// Response paths point at the exact field or list index that produced an error, which is why
