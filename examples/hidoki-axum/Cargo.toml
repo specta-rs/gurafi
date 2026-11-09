@@ -1,0 +1,17 @@
+[package]
+name = "hidoki-example-axum"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gql.workspace = true
+hidoki.workspace = true
+async-graphql = { version = "6.0.11", features = ["dynamic-schema"] }
+async-graphql-axum = "6.0.11"
+axum.workspace = true
+tokio.workspace = true

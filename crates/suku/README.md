@@ -1,0 +1,2 @@
+# suku
+Simple GraphQL server

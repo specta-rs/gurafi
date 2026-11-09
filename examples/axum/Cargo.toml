@@ -1,18 +1,22 @@
 [package]
 name = "gurafi-example-axum"
 version = "0.0.0"
-edition = "2021"
 publish = false
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
-axum = { version = "0.7.2", features = ["json"] }
-tokio = { version = "1.35.0", features = ["macros", "rt-multi-thread"] }
-tracing = "0.1.40"
-tracing-subscriber = "0.3.18"
-suku = { path = "../../../suku", features = ["tracing"] }
+axum = { workspace = true, features = ["json"] }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+suku = { workspace = true, features = ["tracing"] }
 serde = { version = "1.0.193", features = ["derive"] }
-serde_json = "1.0.108"
-tower-http = { version = "0.5.0", features = ["cors"] }
+serde_json.workspace = true
+tower-http.workspace = true
 
 # TODO: Remove this
-gql = { path = "../../../gql" }
+gql.workspace = true

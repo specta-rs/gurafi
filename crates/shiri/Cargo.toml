@@ -1,0 +1,20 @@
+[package]
+name = "shiri"
+description = "Rust Serialization (w/ Serde compatibility)"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# TODO: Make serde optional
+serde = { version = "1.0.193", default-features = false }
+
+# TODO: Remove this
+# TODO: Migrate back to the release once the required changes land upstream.
+serde-value = { git = "https://github.com/gurafi/serde-value", rev = "a3c7d1e70bd3feb5c2eb62527748524dcbb358ec" }
+
+# TODO: Dev depedency
+serde_json.workspace = true

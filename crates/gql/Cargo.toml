@@ -1,0 +1,31 @@
+[package]
+name = "gql"
+description = "A GraphQL reference implementation for Rust."
+version = "0.2.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/gql/latest/gql"
+keywords = ["async", "graphql", "gurafi", "typesafe"]
+categories = ["web-programming", "asynchronous"]
+
+# /bin/sh RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --all-features
+[package.metadata."docs.rs"]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+# Public dependencies
+serde = { version = "1.0.193", default-features = false }
+
+# Private dependencies - MUST NEVER be in public API!!!!
+# TODO: Migrate back to the releases once the required changes land upstream.
+# https://github.com/dtolnay/erased-serde/pull/102
+erased-serde = { git = "https://github.com/gurafi/erased-serde", rev = "29c475a1e1e425d1a850579d4a34eab0a27ea3b5" }
+# TODO: I hate that this is required.
+#       It's due to the Serde's low-level API not being able to express 2D types.
+serde-value = { git = "https://github.com/gurafi/serde-value", rev = "a3c7d1e70bd3feb5c2eb62527748524dcbb358ec" }
+
+# graphql-parser = "0.4.0"
