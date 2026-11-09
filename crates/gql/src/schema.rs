@@ -4,6 +4,7 @@ use core::fmt;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
+use rustc_hash::FxBuildHasher;
 
 use crate::{
     error::GraphQLError,
@@ -74,13 +75,26 @@ impl From<GraphQLError> for SchemaError {
     }
 }
 
+/// A name-keyed map that preserves insertion order and hashes cheaply.
+///
+/// GraphQL schemas look up a definition by name far more often than they resize, so the
+/// cryptographic-quality default hasher is pure overhead here. `FxHash` is a well-distributed
+/// multiply-xor hash; it is not collision resistant, which is fine for a schema built from
+/// trusted definitions (and for documents, which `collect` already hashes with `FxHash`).
+pub(crate) type TypeMap<V> = IndexMap<Name, V, FxBuildHasher>;
+
 #[derive(Debug)]
 pub(crate) struct SchemaInner {
-    pub(crate) types: IndexMap<Name, Type>,
+    /// Types in definition order, hashed with `FxHash`.
+    ///
+    /// Execution looks up a type for nearly every completed field, so the schema-wide map must
+    /// not pay for a cryptographic hash. Insertion order is what `Schema::types` and the
+    /// introspection response rely on, and it is unchanged.
+    pub(crate) types: TypeMap<Type>,
     pub(crate) query: Name,
     pub(crate) mutation: Option<Name>,
     pub(crate) subscription: Option<Name>,
-    pub(crate) directives: IndexMap<Name, DirectiveDefinition>,
+    pub(crate) directives: TypeMap<DirectiveDefinition>,
     pub(crate) description: Option<Arc<str>>,
 }
 
@@ -226,13 +240,18 @@ impl Schema {
     /// Whether a concrete object type implements an interface, directly or transitively.
     #[must_use]
     pub fn object_implements(&self, object: &ObjectType, interface: &str) -> bool {
-        let mut stack = object.interfaces.clone();
+        // Most objects implement their interfaces directly, and most interfaces implement
+        // nothing, so the common questions are answered without building a work list.
+        if object.interfaces.iter().any(|name| &**name == interface) {
+            return true;
+        }
+        let mut stack: smallvec::SmallVec<[&Name; 4]> = object.interfaces.iter().collect();
         while let Some(name) = stack.pop() {
-            if &*name == interface {
+            if &**name == interface {
                 return true;
             }
-            if let Some(ty) = self.interface_type(&name) {
-                stack.extend(ty.interfaces.iter().cloned());
+            if let Some(ty) = self.interface_type(name) {
+                stack.extend(ty.interfaces.iter());
             }
         }
         false
@@ -295,11 +314,11 @@ impl Schema {
 /// ergonomic API on top; this one only cares about the specification.
 #[derive(Debug)]
 pub struct SchemaBuilder {
-    types: IndexMap<Name, Type>,
+    types: TypeMap<Type>,
     query: Option<Name>,
     mutation: Option<Name>,
     subscription: Option<Name>,
-    directives: IndexMap<Name, DirectiveDefinition>,
+    directives: TypeMap<DirectiveDefinition>,
     description: Option<Arc<str>>,
     errors: SchemaError,
 }
@@ -314,7 +333,7 @@ impl SchemaBuilder {
     /// Create a builder pre-populated with the built-in scalars and directives.
     #[must_use]
     pub fn new() -> Self {
-        let mut types = IndexMap::new();
+        let mut types = TypeMap::default();
         for scalar in [
             ScalarType::string(),
             ScalarType::int(),
@@ -326,7 +345,7 @@ impl SchemaBuilder {
             types.insert(name, Type::Scalar(Arc::new(scalar)));
         }
 
-        let mut directives = IndexMap::new();
+        let mut directives = TypeMap::default();
         for directive in [
             DirectiveDefinition::skip(),
             DirectiveDefinition::include(),

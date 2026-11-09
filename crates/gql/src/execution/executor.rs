@@ -7,13 +7,14 @@
 //! and it keeps each error reported once, with the path where it originated.
 
 use std::{
+    borrow::Cow,
     fmt,
     sync::{Arc, Mutex},
     time::Instant,
 };
 
 use futures::{
-    StreamExt,
+    Future, StreamExt,
     future::{BoxFuture, Either, FutureExt, ready},
     stream,
 };
@@ -353,7 +354,7 @@ pub(crate) async fn execute_subscription_event(
     };
     let outcome = executor
         .complete_value(
-            event,
+            &event,
             &field_ty,
             label,
             &selection_sets,
@@ -492,10 +493,7 @@ impl<'doc> Executor<'doc> {
                 let outcomes: Vec<_> = if max_concurrency == 0 || futures.len() <= max_concurrency {
                     futures::future::join_all(futures).await
                 } else {
-                    stream::iter(futures)
-                        .buffered(max_concurrency.max(1))
-                        .collect()
-                        .await
+                    buffered(futures, max_concurrency).await
                 };
                 let mut bubble = None;
                 for (response_key, outcome, field_errors) in outcomes {
@@ -514,49 +512,50 @@ impl<'doc> Executor<'doc> {
                 if let Some(error) = bubble {
                     return Err(error);
                 }
-            } else {
-                for (response_key, nodes) in collected {
-                    // Mutations must keep document order, and a single field has no concurrency
-                    // to gain.
-                    if self.expired() {
-                        return Err(GraphQLError::new(
-                            "The operation timed out before it could finish.",
+                return Ok(result);
+            }
+            for (response_key, nodes) in collected {
+                // Mutations must keep document order, and a single field has no concurrency to
+                // gain.
+                if self.expired() {
+                    return Err(GraphQLError::new(
+                        "The operation timed out before it could finish.",
+                    )
+                    .with_path(path.to_vec()));
+                }
+                let (response_key, outcome) = match self.try_execute_leaf(
+                    &object_type,
+                    parent,
+                    response_key,
+                    &nodes,
+                    path,
+                    errors,
+                ) {
+                    Some(done) => done,
+                    None => {
+                        self.execute_field(
+                            object_type.clone(),
+                            parent,
+                            response_key,
+                            &nodes,
+                            path,
+                            errors,
                         )
-                        .with_path(path.to_vec()));
+                        .await
                     }
-                    let (response_key, outcome) = match self.try_execute_leaf(
-                        &object_type,
-                        parent,
-                        response_key,
-                        &nodes,
-                        path,
-                        errors,
-                    ) {
-                        Some(done) => done,
-                        None => {
-                            self.execute_field(
-                                object_type.clone(),
-                                parent,
-                                response_key,
-                                &nodes,
-                                path,
-                                errors,
-                            )
-                            .await
-                        }
-                    };
-                    match outcome {
-                        Ok(value) => {
-                            result.push_unchecked(response_key, value);
-                        }
-                        Err(error) => return Err(error),
+                };
+                match outcome {
+                    Ok(value) => {
+                        result.push_unchecked(response_key, value);
                     }
+                    Err(error) => return Err(error),
                 }
             }
             Ok(result)
         }
         .boxed()
     }
+
     /// Complete a selection set made only of object properties.
     ///
     /// This runs before the asynchronous batch is built so such sets never allocate or poll a
@@ -665,14 +664,17 @@ impl<'doc> Executor<'doc> {
             parent: object_type.name.as_ref(),
             name: field.name.as_ref(),
         };
-        let outcome = match default_resolve(label, field.name.as_ref(), parent) {
-            Ok(value) => match self.complete_leaf(&value, &field.ty, label, location, path) {
-                Some(outcome) => outcome,
-                None => {
-                    path.pop();
-                    return None;
+        let outcome = match default_property(label, field.name.as_ref(), parent) {
+            Ok(value) => {
+                let value = property_value(value);
+                match self.complete_leaf(&value, &field.ty, label, location, path) {
+                    Some(outcome) => outcome,
+                    None => {
+                        path.pop();
+                        return None;
+                    }
                 }
-            },
+            }
             Err(error) => Err(error),
         };
         let outcome = finish_field(
@@ -786,7 +788,7 @@ impl<'doc> Executor<'doc> {
                         Some(completed) => completed,
                         None => {
                             self.complete_field_value(
-                                value,
+                                &value,
                                 &ty,
                                 label,
                                 &selection_sets,
@@ -851,6 +853,10 @@ impl<'doc> Executor<'doc> {
 
         // The authorizer and the resolver both see the same `ResolveInfo`; the borrow of
         // `path` ends before completion needs it mutably again.
+        //
+        // A resolver produces an owned value, but a field without one just reads the parent
+        // object's property. Borrowing that property instead of cloning it is what keeps
+        // composite fields free of a full copy of the parent's list or object.
         let resolved = {
             let info = ResolveInfo {
                 field_name: field.name.as_ref(),
@@ -881,8 +887,10 @@ impl<'doc> Executor<'doc> {
                     info: &info,
                 };
                 match &field.resolve {
-                    Some(resolve) => resolve(resolver_context).await,
-                    None => default_resolve(label, field.name.as_ref(), parent),
+                    Some(resolve) => resolve(resolver_context).await.map(Cow::Owned),
+                    None => {
+                        default_property(label, field.name.as_ref(), parent).map(property_value)
+                    }
                 }
             }
         };
@@ -892,7 +900,7 @@ impl<'doc> Executor<'doc> {
                 Some(completed) => completed,
                 None => {
                     self.complete_field_value(
-                        value,
+                        &value,
                         &field.ty,
                         label,
                         &selection_sets,
@@ -1037,7 +1045,7 @@ impl<'doc> Executor<'doc> {
     #[allow(clippy::too_many_arguments)]
     async fn complete_field_value(
         &self,
-        value: Value,
+        value: &Value,
         ty: &TypeRef,
         label: FieldLabel<'_>,
         selection_sets: &[&'doc ast::SelectionSet<'doc>],
@@ -1051,14 +1059,131 @@ impl<'doc> Executor<'doc> {
                     .complete_object(object, value, label, selection_sets, location, path, errors)
                     .await;
             }
+            if let Some((object, items_non_null)) = self.object_list(ty) {
+                return self
+                    .complete_object_list(
+                        object,
+                        items_non_null,
+                        value,
+                        label,
+                        selection_sets,
+                        location,
+                        path,
+                        errors,
+                    )
+                    .await;
+            }
         }
         self.complete_value(value, ty, label, selection_sets, location, path, errors)
             .await
     }
 
+    /// The object type a list's items complete as, when every item is a plain object.
+    ///
+    /// Returns the item type's non-null-ness too, because it decides whether a failed item nulls
+    /// the whole list.
+    fn object_list(&self, ty: &TypeRef) -> Option<(Arc<ObjectType>, bool)> {
+        let mut current = ty;
+        while let TypeRef::NonNull(inner) = current {
+            current = inner;
+        }
+        let TypeRef::List(inner) = current else {
+            return None;
+        };
+        let (inner, non_null) = match &**inner {
+            TypeRef::NonNull(inner) => (&**inner, true),
+            inner => (inner, false),
+        };
+        let TypeRef::Named(name) = inner else {
+            return None;
+        };
+        match self.context.schema.get_type(name) {
+            Some(Type::Object(object)) => Some((object.clone(), non_null)),
+            _ => None,
+        }
+    }
+
+    /// Complete a list of plain objects without a completion future.
+    ///
+    /// A list of records is the common shape in a response, and every item completes through
+    /// [`Self::complete_object`]. Handling it here means the field allocates no completion future
+    /// at all — only the response list itself.
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_object_list(
+        &self,
+        object: Arc<ObjectType>,
+        items_non_null: bool,
+        value: &Value,
+        label: FieldLabel<'_>,
+        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        location: Location,
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+    ) -> Result<Value, GraphQLError> {
+        let Value::List(items) = value else {
+            return Err(located(
+                format!(
+                    "Expected a list for field {label}, but the resolved value is a {}.",
+                    value.kind()
+                ),
+                path,
+                location,
+            ));
+        };
+        let mut completed = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            path.push(PathSegment::index(index));
+            let outcome = if item.is_null() {
+                if items_non_null {
+                    Err(located(
+                        format!("Cannot return null for non-nullable field {label}."),
+                        path,
+                        location,
+                    ))
+                } else {
+                    Ok(Value::Null)
+                }
+            } else {
+                self.complete_object(
+                    object.clone(),
+                    item,
+                    label,
+                    selection_sets,
+                    location,
+                    path,
+                    errors,
+                )
+                .await
+            };
+            path.pop();
+            match outcome {
+                Ok(value) => completed.push(value),
+                Err(error) => {
+                    if items_non_null {
+                        return Err(error);
+                    }
+                    record_error(errors, error, self.context.max_errors);
+                    completed.push(Value::Null);
+                }
+            }
+        }
+        Ok(Value::List(completed))
+    }
+
+    /// The `CompleteValue` algorithm for one field.
+    ///
+    /// The value is borrowed for the whole completion: a resolver hands over an owned value that
+    /// the caller keeps alive, and a field without one points straight at the parent's property.
+    ///
+    /// Completion is boxed because that is what bounds the recursive poll stack: an inlined
+    /// completion chain makes each nesting level's frame large enough that a document at the
+    /// parser's depth limit would exhaust a Tokio worker's 2 MiB stack. List *items* still
+    /// complete inline (see [`Self::complete_item`]), which is where the allocation per item
+    /// used to go.
+    #[allow(clippy::too_many_arguments)]
     fn complete_value<'s>(
         &'s self,
-        value: Value,
+        value: &'s Value,
         ty: &'s TypeRef,
         label: FieldLabel<'s>,
         selection_sets: &'s [&'doc ast::SelectionSet<'doc>],
@@ -1069,58 +1194,132 @@ impl<'doc> Executor<'doc> {
     where
         'doc: 's,
     {
-        async move {
-            // Strip non-null wrappers up front instead of recursing through one future per
-            // wrapper.
-            let mut current = ty;
-            let mut non_null = false;
-            while let TypeRef::NonNull(inner) = current {
-                non_null = true;
-                current = inner;
-            }
-            if value.is_null() {
-                return if non_null {
-                    Err(located(
-                        format!("Cannot return null for non-nullable field {label}."),
-                        path,
-                        location,
-                    ))
-                } else {
-                    Ok(Value::Null)
-                };
-            }
-            let completed = match current {
-                TypeRef::List(inner) => {
-                    self.complete_list(value, inner, label, selection_sets, location, path, errors)
-                        .await?
-                }
-                TypeRef::Named(name) => {
-                    self.complete_named(value, name, label, selection_sets, location, path, errors)
-                        .await?
-                }
-                TypeRef::NonNull(_) => {
-                    return Err(located(
-                        "Internal execution error: non-null type was not unwrapped.",
-                        path,
-                        location,
-                    ));
-                }
-            };
-            if non_null && completed.is_null() {
-                return Err(located(
+        self.complete_value_inner(value, ty, label, selection_sets, location, path, errors)
+            .boxed()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_value_inner(
+        &self,
+        value: &Value,
+        ty: &TypeRef,
+        label: FieldLabel<'_>,
+        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        location: Location,
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+    ) -> Result<Value, GraphQLError> {
+        // Strip non-null wrappers up front instead of recursing through one future per wrapper.
+        let mut current = ty;
+        let mut non_null = false;
+        while let TypeRef::NonNull(inner) = current {
+            non_null = true;
+            current = inner;
+        }
+        if value.is_null() {
+            return if non_null {
+                Err(located(
                     format!("Cannot return null for non-nullable field {label}."),
+                    path,
+                    location,
+                ))
+            } else {
+                Ok(Value::Null)
+            };
+        }
+        let completed = match current {
+            TypeRef::List(inner) => {
+                self.complete_list(value, inner, label, selection_sets, location, path, errors)
+                    .await?
+            }
+            TypeRef::Named(name) => {
+                self.complete_named(value, name, label, selection_sets, location, path, errors)
+                    .await?
+            }
+            TypeRef::NonNull(_) => {
+                return Err(located(
+                    "Internal execution error: non-null type was not unwrapped.",
                     path,
                     location,
                 ));
             }
-            Ok(completed)
+        };
+        if non_null && completed.is_null() {
+            return Err(located(
+                format!("Cannot return null for non-nullable field {label}."),
+                path,
+                location,
+            ));
         }
-        .boxed()
+        Ok(completed)
     }
 
+    /// Complete one item of a list.
+    ///
+    /// A named item completes through [`Self::complete_named`] without a completion future of its
+    /// own, so a list of objects allocates only the response list and its objects.
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_item(
+        &self,
+        item: &Value,
+        inner: &TypeRef,
+        label: FieldLabel<'_>,
+        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        location: Location,
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+    ) -> Result<Value, GraphQLError> {
+        let mut current = inner;
+        let mut non_null = false;
+        while let TypeRef::NonNull(wrapped) = current {
+            non_null = true;
+            current = wrapped;
+        }
+        if item.is_null() {
+            return if non_null {
+                Err(located(
+                    format!("Cannot return null for non-nullable field {label}."),
+                    path,
+                    location,
+                ))
+            } else {
+                Ok(Value::Null)
+            };
+        }
+        let completed = match current {
+            // A list inside a list goes back through the boxed algorithm, which is what keeps
+            // the completion future's size finite.
+            TypeRef::List(_) => {
+                return self
+                    .complete_value(item, inner, label, selection_sets, location, path, errors)
+                    .await;
+            }
+            TypeRef::Named(name) => {
+                self.complete_named(item, name, label, selection_sets, location, path, errors)
+                    .await?
+            }
+            TypeRef::NonNull(_) => {
+                return Err(located(
+                    "Internal execution error: non-null type was not unwrapped.",
+                    path,
+                    location,
+                ));
+            }
+        };
+        if non_null && completed.is_null() {
+            return Err(located(
+                format!("Cannot return null for non-nullable field {label}."),
+                path,
+                location,
+            ));
+        }
+        Ok(completed)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn complete_list(
         &self,
-        value: Value,
+        value: &Value,
         inner: &TypeRef,
         label: FieldLabel<'_>,
         selection_sets: &[&'doc ast::SelectionSet<'doc>],
@@ -1139,18 +1338,27 @@ impl<'doc> Executor<'doc> {
             ));
         };
 
+        let object = self.plain_object(inner);
         let mut completed = Vec::with_capacity(items.len());
-        for (index, item) in items.into_iter().enumerate() {
+        for (index, item) in items.iter().enumerate() {
             path.push(PathSegment::index(index));
-            let outcome = if item.is_null() {
-                self.complete_value(item, inner, label, selection_sets, location, path, errors)
+            let outcome = match &object {
+                Some(object) if !item.is_null() => {
+                    self.complete_object(
+                        object.clone(),
+                        item,
+                        label,
+                        selection_sets,
+                        location,
+                        path,
+                        errors,
+                    )
                     .await
-            } else if let Some(object) = self.plain_object(inner) {
-                self.complete_object(object, item, label, selection_sets, location, path, errors)
-                    .await
-            } else {
-                self.complete_value(item, inner, label, selection_sets, location, path, errors)
-                    .await
+                }
+                _ => {
+                    self.complete_item(item, inner, label, selection_sets, location, path, errors)
+                        .await
+                }
             };
             path.pop();
             match outcome {
@@ -1167,9 +1375,10 @@ impl<'doc> Executor<'doc> {
         Ok(Value::List(completed))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn complete_named(
         &self,
-        value: Value,
+        value: &Value,
         name: &crate::types::Name,
         label: FieldLabel<'_>,
         selection_sets: &[&'doc ast::SelectionSet<'doc>],
@@ -1187,7 +1396,7 @@ impl<'doc> Executor<'doc> {
         match definition {
             Type::Scalar(scalar) => {
                 let serialized = if let Some(serialize) = scalar.serialize_fn() {
-                    serialize(&value).map_err(|message| {
+                    serialize(value).map_err(|message| {
                         located(
                             format!("Field {label} could not be serialized: {message}"),
                             path,
@@ -1195,7 +1404,7 @@ impl<'doc> Executor<'doc> {
                         )
                     })?
                 } else {
-                    value
+                    value.clone()
                 };
                 if is_legal_scalar_value(&serialized) {
                     Ok(serialized)
@@ -1250,7 +1459,7 @@ impl<'doc> Executor<'doc> {
                     ));
                 }
                 let object = self
-                    .resolve_abstract_type(name.as_ref(), &value)
+                    .resolve_abstract_type(name.as_ref(), value)
                     .map_err(|error| locate(error, path, location))?;
                 self.complete_object(object, value, label, selection_sets, location, path, errors)
                     .await
@@ -1263,10 +1472,11 @@ impl<'doc> Executor<'doc> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn complete_object(
         &self,
         object: Arc<ObjectType>,
-        value: Value,
+        value: &Value,
         label: FieldLabel<'_>,
         selection_sets: &[&'doc ast::SelectionSet<'doc>],
         location: Location,
@@ -1295,7 +1505,7 @@ impl<'doc> Executor<'doc> {
             ));
         }
         let completed = self
-            .execute_fields(object, &value, selection_sets, path, errors)
+            .execute_fields(object, value, selection_sets, path, errors)
             .await?;
         Ok(Value::Object(Arc::new(completed)))
     }
@@ -1431,6 +1641,24 @@ impl<'doc> Executor<'doc> {
     }
 }
 
+/// Run sibling field futures with bounded concurrency.
+///
+/// This lives in its own boxed future because the ordered-stream bookkeeping is otherwise part of
+/// every recursive [`Executor::execute_fields`] frame, and execution must fit a small stack.
+fn buffered<'s, F>(futures: Vec<F>, max_concurrency: usize) -> BoxFuture<'s, Vec<F::Output>>
+where
+    F: Future + Send + 's,
+    F::Output: Send + 's,
+{
+    async move {
+        stream::iter(futures)
+            .buffered(max_concurrency.max(1))
+            .collect()
+            .await
+    }
+    .boxed()
+}
+
 fn unknown_meta_field(node: &ast::Field<'_>, object_type: &ObjectType) -> GraphQLError {
     GraphQLError::new(format!(
         "Cannot query field \"{}\" on type \"{}\".",
@@ -1448,14 +1676,19 @@ fn meta_return_type(name: &str) -> Option<TypeRef> {
     }
 }
 
-fn default_resolve(
+/// Read a field's value from its parent object without cloning it.
+///
+/// `None` means "this field is null": either the parent is explicit null, or the object has no
+/// such property. Both cases complete as `Value::Null`, exactly as the default resolver's
+/// `unwrap_or(Value::Null)` did, without allocating a copy of a composite value first.
+fn default_property<'v>(
     label: FieldLabel<'_>,
     field_name: &str,
-    parent: &Value,
-) -> Result<Value, GraphQLError> {
+    parent: &'v Value,
+) -> Result<Option<&'v Value>, GraphQLError> {
     match parent {
-        Value::Object(object) => Ok(object.get(field_name).cloned().unwrap_or(Value::Null)),
-        Value::Null => Ok(Value::Null),
+        Value::Object(object) => Ok(object.get(field_name)),
+        Value::Null => Ok(None),
         Value::External(_) => Err(GraphQLError::new(format!(
             "No resolver is defined for field \"{label}\"; the parent is an opaque model value, so the default property resolver cannot read it."
         ))),
@@ -1464,6 +1697,14 @@ fn default_resolve(
             other.kind()
         ))),
     }
+}
+
+/// Turn a borrowed property into a value the caller can complete.
+///
+/// A missing property becomes an owned `null`, which allocates nothing; a present one stays
+/// borrowed so completion reads the parent's value in place.
+fn property_value<'v>(value: Option<&'v Value>) -> Cow<'v, Value> {
+    value.map_or(Cow::Owned(Value::Null), Cow::Borrowed)
 }
 
 fn finish_field(

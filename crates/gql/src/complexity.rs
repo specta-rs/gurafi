@@ -337,8 +337,8 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
 
     fn field_definition(&self, scope: &str, name: &str) -> Option<&Field> {
         match self.schema.get_type(scope)? {
-            Type::Object(object) => object.fields.get(name),
-            Type::Interface(interface) => interface.fields.get(name),
+            Type::Object(object) => object.get_field(name),
+            Type::Interface(interface) => interface.get_field(name),
             _ => None,
         }
     }

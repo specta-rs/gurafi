@@ -157,13 +157,33 @@ impl<'a> Lexer<'a> {
     }
 
     /// Skip whitespace, line terminators, commas, comments and a leading byte order mark.
+    ///
+    /// Ignored characters are all ASCII except the byte order mark, so this walks bytes and only
+    /// falls back to the character-wise path for the BOM. Documents are mostly whitespace, and
+    /// this runs before every token.
     fn skip_ignored(&mut self) {
         loop {
-            match self.peek() {
-                Some('\u{feff}' | '\t' | ' ' | '\n' | '\r' | ',') => {
-                    self.bump();
+            match self.source.as_bytes().get(self.pos).copied() {
+                Some(b'\t' | b' ' | b',') => {
+                    self.pos = self.pos.saturating_add(1);
+                    self.column = self.column.saturating_add(1);
                 }
-                Some('#') => {
+                Some(b'\n') => {
+                    self.pos = self.pos.saturating_add(1);
+                    self.line = self.line.saturating_add(1);
+                    self.column = 1;
+                }
+                Some(b'\r') => {
+                    self.pos = self.pos.saturating_add(1);
+                    if self.source.as_bytes().get(self.pos) == Some(&b'\n') {
+                        self.pos = self.pos.saturating_add(1);
+                    }
+                    self.line = self.line.saturating_add(1);
+                    self.column = 1;
+                }
+                Some(b'#') => {
+                    // Comments may contain any character, so they keep the character-wise walk
+                    // that maintains line and column counters.
                     while let Some(ch) = self.peek() {
                         if ch == '\n' || ch == '\r' {
                             break;
@@ -171,7 +191,15 @@ impl<'a> Lexer<'a> {
                         self.bump();
                     }
                 }
-                _ => break,
+                Some(_) => {
+                    // A byte order mark is the only non-ASCII character ignored here.
+                    if self.peek() == Some('\u{feff}') {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+                None => break,
             }
         }
     }
@@ -248,13 +276,16 @@ impl<'a> Lexer<'a> {
     }
 
     /// Consume a name.
+    ///
+    /// Names are ASCII, so scanning bytes avoids decoding a `char` per character.
     fn name(&mut self) -> TokenKind<'a> {
         let start = self.pos;
-        while let Some(ch) = self.peek() {
-            if !is_name_continue(ch) {
+        while let Some(&byte) = self.source.as_bytes().get(self.pos) {
+            if !is_name_continue_byte(byte) {
                 break;
             }
-            self.bump();
+            self.pos = self.pos.saturating_add(1);
+            self.column = self.column.saturating_add(1);
         }
         TokenKind::Name(self.source.get(start..self.pos).unwrap_or(""))
     }
@@ -352,8 +383,9 @@ impl<'a> Lexer<'a> {
 
     /// Consume a run of ASCII digits.
     fn digits(&mut self) {
-        while matches!(self.peek(), Some(ch) if ch.is_ascii_digit()) {
-            self.bump();
+        while matches!(self.source.as_bytes().get(self.pos), Some(b'0'..=b'9')) {
+            self.pos = self.pos.saturating_add(1);
+            self.column = self.column.saturating_add(1);
         }
     }
 
@@ -648,9 +680,9 @@ fn is_name_start(ch: char) -> bool {
     ch == '_' || ch.is_ascii_alphabetic()
 }
 
-/// Whether a character may continue a name.
-fn is_name_continue(ch: char) -> bool {
-    ch == '_' || ch.is_ascii_alphanumeric()
+/// Whether a byte may continue a name.
+fn is_name_continue_byte(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric()
 }
 
 /// Render a code point the way the reference implementation does in messages.

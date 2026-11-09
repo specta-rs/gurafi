@@ -113,8 +113,8 @@ pub(crate) fn field_context<'a>(
         None
     } else {
         parent.and_then(|parent| match parent {
-            Type::Object(object) => object.fields.get(field.name),
-            Type::Interface(interface) => interface.fields.get(field.name),
+            Type::Object(object) => object.get_field(field.name),
+            Type::Interface(interface) => interface.get_field(field.name),
             _ => None,
         })
     };
@@ -137,7 +137,7 @@ pub(crate) fn field_argument_info<'a>(
     name: &str,
 ) -> Option<ArgumentInfo<'a>> {
     if let Some(definition) = context.definition {
-        return definition.args.get(name).map(ArgumentInfo::from_input);
+        return crate::types::map_get(&definition.args, name).map(ArgumentInfo::from_input);
     }
     match context.meta {
         Some(MetaField::Type) if name == "name" => Some(ArgumentInfo {
@@ -153,7 +153,7 @@ pub(crate) fn directive_argument_info<'a>(
     definition: &'a crate::types::DirectiveDefinition,
     name: &str,
 ) -> Option<ArgumentInfo<'a>> {
-    definition.args.get(name).map(ArgumentInfo::from_input)
+    crate::types::map_get(&definition.args, name).map(ArgumentInfo::from_input)
 }
 
 /// Callbacks invoked while walking a selection set.

@@ -109,7 +109,7 @@ fn validate_named(
             };
 
             for field in fields {
-                match input.fields.get(field.name) {
+                match crate::types::map_get(&input.fields, field.name) {
                     Some(definition) => validate_value(
                         schema,
                         &field.value,

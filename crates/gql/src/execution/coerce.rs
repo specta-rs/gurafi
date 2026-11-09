@@ -133,7 +133,7 @@ pub fn coerce_argument_values(
     variables: &Object,
 ) -> Result<Object, GraphQLError> {
     for argument in &node.arguments {
-        if !field.args.contains_key(argument.name) {
+        if crate::types::map_get(&field.args, argument.name).is_none() {
             return Err(GraphQLError::new(format!(
                 "Unknown argument \"{}\" on field \"{}\".",
                 argument.name, field.name

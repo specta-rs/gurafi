@@ -25,6 +25,26 @@ use crate::{
 /// An interned GraphQL name.
 pub type Name = Arc<str>;
 
+/// Above this many entries, a name-keyed definition map hashes instead of scanning.
+///
+/// Every lookup hashes otherwise, and almost every GraphQL type declares fewer fields, enum
+/// values or arguments than this.
+pub(crate) const SMALL_MAP_LIMIT: usize = 12;
+
+/// Look up a name in a definition map, scanning instead of hashing while the map is small.
+///
+/// Execution performs these lookups for every field it completes and every argument it coerces,
+/// and schema definitions overwhelmingly hold fewer entries than [`SMALL_MAP_LIMIT`].
+pub(crate) fn map_get<'m, V>(map: &'m IndexMap<Name, V>, name: &str) -> Option<&'m V> {
+    if map.len() <= SMALL_MAP_LIMIT {
+        return map
+            .iter()
+            .find(|(key, _)| &***key == name)
+            .map(|(_, value)| value);
+    }
+    map.get(name)
+}
+
 /// The result of resolving a field.
 pub type FieldResult = Result<Value, GraphQLError>;
 
@@ -526,7 +546,7 @@ impl EnumType {
     /// Whether a value name is defined.
     #[must_use]
     pub fn has_value(&self, name: &str) -> bool {
-        self.values.contains_key(name)
+        map_get(&self.values, name).is_some()
     }
 }
 
@@ -900,9 +920,13 @@ impl ObjectType {
     }
 
     /// Look up a field by name.
+    ///
+    /// Most object types declare a handful of fields, where comparing interned names in order
+    /// beats computing a hash for every lookup — and execution looks up a field's definition for
+    /// every field it completes. Larger types keep the hash map's constant lookup.
     #[must_use]
     pub fn get_field(&self, name: &str) -> Option<&Field> {
-        self.fields.get(name)
+        map_get(&self.fields, name)
     }
 }
 
@@ -992,6 +1016,11 @@ impl InterfaceType {
     ) -> Self {
         self.resolve_type = Some(Arc::new(resolve));
         self
+    }
+    /// Look up a field by name.
+    #[must_use]
+    pub fn get_field(&self, name: &str) -> Option<&Field> {
+        map_get(&self.fields, name)
     }
 }
 

@@ -75,7 +75,7 @@ fn check_arguments(
     errors: &mut Vec<GraphQLError>,
 ) {
     for argument in provided {
-        match definitions.get(argument.name) {
+        match crate::types::map_get(definitions, argument.name) {
             Some(definition) => validate_value(
                 schema,
                 &argument.value,

@@ -73,7 +73,7 @@ fn collect_value_usages<'a>(
                 _ => None,
             });
             for field in fields {
-                match input.and_then(|input| input.fields.get(field.name)) {
+                match input.and_then(|input| crate::types::map_get(&input.fields, field.name)) {
                     Some(definition) => collect_value_usages(
                         schema,
                         &field.value,
