@@ -35,13 +35,8 @@ cargo check --workspace --all-targets
 cargo test --workspace
 ```
 
-The documentation website is in [`docs/`](docs):
-
-```bash
-cd docs
-pnpm install
-pnpm dev
-```
+Documentation lives in [`docs/`](docs) as plain Markdown, starting at
+[`docs/README.md`](docs/README.md).
 
 ## License
 
