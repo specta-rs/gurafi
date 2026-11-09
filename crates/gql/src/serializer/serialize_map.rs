@@ -1,19 +1,8 @@
 use std::fmt;
 
-use super::{serializer::SerializeImpl, Serializer};
+use super::{MapImpl, Serializer, serializer::SerializeImpl};
 
-pub struct SerializeMap<'a>(pub(crate) SerializeMapImpl<'a>);
-
-pub enum SerializeMapImpl<'a> {
-    Map(&'a mut dyn erased_serde::SerializeMap),
-    // TODO: This variant is inherently inefficient because we collect up in memory, then serialize instead of doing both at once.
-    // However Serde doesn't provide a better way to do this.
-    SerdeValue {
-        value: serde_value::Serializer,
-        // `value` will be written to `parent` when done
-        parent: &'a mut dyn erased_serde::SerializeMap,
-    },
-}
+pub struct SerializeMap<'a>(pub(crate) &'a mut dyn MapImpl);
 
 impl<'a> fmt::Debug for SerializeMap<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -24,30 +13,11 @@ impl<'a> fmt::Debug for SerializeMap<'a> {
 // TODO: Error type
 impl<'a> SerializeMap<'a> {
     pub fn serialize_key<T: serde::Serialize>(&mut self, key: &T) -> Result<(), ()> {
-        match &mut self.0 {
-            SerializeMapImpl::Map(serializer) => {
-                serializer.erased_serialize_key(key).map_err(|_| ())
-            }
-            SerializeMapImpl::SerdeValue { value, parent } => {
-                // value.serialize(key).map_err(|_| ())?;
-                // parent.erased_serialize_value(&value).map_err(|_| ())
-                todo!();
-            }
-        }
+        self.0.serialize_key(key)
     }
 
     pub fn serialize_value<T: serde::Serialize>(&mut self, value: &T) -> Result<(), ()> {
-        // self.0.erased_serialize_value(value).map_err(|_| ())
-        match &mut self.0 {
-            SerializeMapImpl::Map(serializer) => {
-                serializer.erased_serialize_value(value).map_err(|_| ())
-            }
-            SerializeMapImpl::SerdeValue { value, parent } => {
-                // value.serialize(value).map_err(|_| ())?;
-                // parent.erased_serialize_value(&value).map_err(|_| ())
-                todo!();
-            }
-        }
+        self.0.serialize_value(value)
     }
 
     pub fn serialize_entry<K: serde::Serialize, V: serde::Serialize>(
@@ -65,31 +35,12 @@ impl<'a> SerializeMap<'a> {
     pub fn serialize_entry_serializer<K: serde::Serialize>(
         &mut self,
         key: &K,
-    ) -> Result<Serializer, ()> {
-        match &mut self.0 {
-            SerializeMapImpl::Map(serializer) => {
-                serializer.erased_serialize_key(key).map_err(|_| ())?;
-                Ok(Serializer(SerializeImpl::MapValue(&mut **serializer)))
-            }
-            SerializeMapImpl::SerdeValue { value, parent } => {
-                // Ok(Serializer(SerializeImpl::M {
-                //     value: serde_value::Serializer,
-                //     parent: &mut **serializer,
-                // }))
-                todo!();
-
-                // serializer.erased_serialize_key(key).map_err(|_| ())?;
-                // Ok(Serializer(SerializeImpl::MapValue(&mut **serializer)))
-            }
-        }
+    ) -> Result<Serializer<'_>, ()> {
+        self.0.serialize_key(key)?;
+        Ok(Serializer(SerializeImpl::MapValue(&mut *self.0)))
     }
 
     pub fn end(self) {
-        match self.0 {
-            SerializeMapImpl::Map(serializer) => serializer.erased_end(),
-            SerializeMapImpl::SerdeValue { value, parent } => {
-                todo!();
-            }
-        }
+        self.0.end();
     }
 }

@@ -1,8 +1,8 @@
 use core::fmt;
 
 use gql::{
-    serializer::{OwnedSerializer, Serializer},
     GraphQLResolveInfo, NamedOutputType, ObjectType, OutputType, ResolveFnArgs, Schema, Thunk,
+    serializer::{OwnedSerializer, Serializer},
 };
 use graphql_parser::query::{Definition, Document, OperationDefinition, Selection, SelectionSet};
 
@@ -36,7 +36,7 @@ impl Server {
 
     // TODO: Proper error handling + serializable error
     #[cfg_attr(feature = "tracing", tracing::instrument)]
-    pub async fn execute<S: gql::serializer::AnyOwnedSerializer>(
+    pub async fn execute<S: serde::Serializer>(
         &self,
         mut serializer: OwnedSerializer<S>,
         document: String,

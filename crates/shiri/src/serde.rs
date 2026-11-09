@@ -58,8 +58,7 @@ where
             Repr::Map(_) => unreachable!(),
             Repr::MapValue(mut s) => {
                 use serde::ser::SerializeMap;
-                s.serialize_value(&serde_value::Value::String(value.to_owned()))
-                    .unwrap();
+                s.serialize_value(value).unwrap();
                 *self = Self(Repr::Map(s));
             }
             Repr::Taken => todo!(),
@@ -131,16 +130,16 @@ impl<S> serde::Serializer for SerdeInterop<S>
 where
     S: serde::Serializer,
 {
-    type Ok = serde_value::Value;
-    // TODO: Stop using `serde_value` and use internal stuff
-    type Error = serde_value::SerializerError;
-    type SerializeSeq = serde_value::SerializeSeq;
-    type SerializeTuple = serde_value::SerializeTuple;
-    type SerializeTupleStruct = serde_value::SerializeTupleStruct;
-    type SerializeTupleVariant = serde_value::SerializeTupleVariant;
-    type SerializeMap = serde_value::SerializeMap;
-    type SerializeStruct = serde_value::SerializeStruct;
-    type SerializeStructVariant = serde_value::SerializeStructVariant;
+    type Ok = ();
+    // TODO: Proper error type
+    type Error = Error;
+    type SerializeSeq = serde::ser::Impossible<(), Error>;
+    type SerializeTuple = serde::ser::Impossible<(), Error>;
+    type SerializeTupleStruct = serde::ser::Impossible<(), Error>;
+    type SerializeTupleVariant = serde::ser::Impossible<(), Error>;
+    type SerializeMap = serde::ser::Impossible<(), Error>;
+    type SerializeStruct = serde::ser::Impossible<(), Error>;
+    type SerializeStructVariant = serde::ser::Impossible<(), Error>;
 
     fn serialize_bool(self, v: bool) -> Result<Self::Ok, Self::Error> {
         todo!()
@@ -309,16 +308,16 @@ where
 pub(crate) struct SerdeInterop2<'a>(pub Serializer2<'a>);
 
 impl<'a> serde::Serializer for SerdeInterop2<'a> {
-    type Ok = serde_value::Value;
-    // TODO: Stop using `serde_value` and use internal stuff
-    type Error = serde_value::SerializerError;
-    type SerializeSeq = serde_value::SerializeSeq;
-    type SerializeTuple = serde_value::SerializeTuple;
-    type SerializeTupleStruct = serde_value::SerializeTupleStruct;
-    type SerializeTupleVariant = serde_value::SerializeTupleVariant;
-    type SerializeMap = serde_value::SerializeMap;
-    type SerializeStruct = serde_value::SerializeStruct;
-    type SerializeStructVariant = serde_value::SerializeStructVariant;
+    type Ok = ();
+    // TODO: Proper error type
+    type Error = Error;
+    type SerializeSeq = serde::ser::Impossible<(), Error>;
+    type SerializeTuple = serde::ser::Impossible<(), Error>;
+    type SerializeTupleStruct = serde::ser::Impossible<(), Error>;
+    type SerializeTupleVariant = serde::ser::Impossible<(), Error>;
+    type SerializeMap = serde::ser::Impossible<(), Error>;
+    type SerializeStruct = serde::ser::Impossible<(), Error>;
+    type SerializeStructVariant = serde::ser::Impossible<(), Error>;
 
     fn serialize_bool(self, v: bool) -> Result<Self::Ok, Self::Error> {
         todo!()
@@ -370,7 +369,7 @@ impl<'a> serde::Serializer for SerdeInterop2<'a> {
 
     fn serialize_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
         self.0.serialize_str(v).unwrap();
-        Ok(serde_value::Value::Unit)
+        Ok(())
     }
 
     fn serialize_bytes(self, v: &[u8]) -> Result<Self::Ok, Self::Error> {
