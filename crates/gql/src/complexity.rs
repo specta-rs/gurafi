@@ -197,7 +197,7 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
         scope: &str,
         active_fragments: &mut Vec<&'source str>,
         output: &mut Vec<CollectedField<'source, 'document>>,
-        index: &mut FxHashMap<&'source str, usize>,
+        index: &mut FxHashMap<&'source str, Vec<usize>>,
     ) -> Result<(), GraphQLError>
     where
         I: IntoIterator<Item = &'document ast::Selection<'source>>,
@@ -215,7 +215,7 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
 
             match selection {
                 ast::Selection::Field(field) => {
-                    merge_field(self.schema, output, index, field, scope);
+                    merge_field(output, index, field, scope);
                 }
                 ast::Selection::FragmentSpread(spread) => {
                     if active_fragments.contains(&spread.name) {
@@ -243,7 +243,7 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
                     let key = (spread.name, effective_scope.clone());
                     let cached = self.fragment_cache.get(&key).cloned();
                     if let Some(fields) = cached {
-                        merge_all(self.schema, output, index, &fields);
+                        merge_all(output, index, &fields);
                         continue;
                     }
 
@@ -260,7 +260,7 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
                     active_fragments.pop();
                     result?;
                     self.fragment_cache.insert(key, fields.clone());
-                    merge_all(self.schema, output, index, &fields);
+                    merge_all(output, index, &fields);
                 }
                 ast::Selection::InlineFragment(fragment) => {
                     let effective_scope = match fragment.type_condition {
@@ -376,68 +376,31 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
     }
 }
 
-/// Prefer the most concrete scope when the same response key is selected through several
-/// fragments. `item` selected on `Node` and again on `User` must be analysed with `User`'s fields,
-/// otherwise fields only present on `User` are invisible to the cost estimate.
-fn refine_scope(schema: &Schema, current: &mut String, candidate: &str) {
-    if current == candidate || schema.object_type(current).is_some() {
-        return;
-    }
-    if schema.object_type(candidate).is_some() {
-        *current = candidate.to_owned();
-        return;
-    }
-
-    let current_possible = schema.possible_types(current);
-    let candidate_possible = schema.possible_types(candidate);
-    if current_possible.is_empty() || candidate_possible.is_empty() {
-        return;
-    }
-    let intersection: Vec<_> = current_possible
-        .iter()
-        .filter(|name| candidate_possible.contains(name))
-        .cloned()
-        .collect();
-    match intersection.len() {
-        0 => {}
-        // A single possible runtime object is the most precise scope available.
-        1 => *current = intersection[0].to_string(),
-        _ => {
-            // Otherwise prefer the narrower abstract scope when one set of possible types is a
-            // subset of the other.
-            if current_possible
-                .iter()
-                .all(|name| candidate_possible.contains(name))
-            {
-                // `current` is narrower; keep it.
-            } else if candidate_possible
-                .iter()
-                .all(|name| current_possible.contains(name))
-            {
-                *current = candidate.to_owned();
-            }
-        }
-    }
-}
-
 fn merge_field<'source, 'document>(
-    schema: &Schema,
     output: &mut Vec<CollectedField<'source, 'document>>,
-    index: &mut FxHashMap<&'source str, usize>,
+    index: &mut FxHashMap<&'source str, Vec<usize>>,
     field: &'document ast::Field<'source>,
     scope: &str,
 ) {
     let response_key = field.response_key();
-    if let Some(existing) = index.get(response_key).copied() {
+    let entries = index.entry(response_key).or_default();
+    for existing in entries.iter().copied() {
         let collected = &mut output[existing];
-        // Validation guarantees that fields merged under one response key have the same name.
-        refine_scope(schema, &mut collected.scope, scope);
-        if let Some(selection_set) = &field.selection_set {
-            collected.selections.extend(selection_set.items.iter());
+        if collected.scope == scope {
+            // The specification merges field nodes with the same response key and the same
+            // parent scope; their sub-selections are collected once.
+            if let Some(selection_set) = &field.selection_set {
+                collected.selections.extend(selection_set.items.iter());
+            }
+            return;
         }
-        return;
     }
-    index.insert(response_key, output.len());
+    // The same response key selected through a different, overlapping fragment scope is kept as a
+    // separate accounting entry. The executor still resolves it once; charging both scopes is
+    // deliberately conservative and prevents a narrow scope from hiding expensive fields that
+    // only the other scope can see.
+    let position = output.len();
+    entries.push(position);
     output.push(CollectedField {
         response_key,
         scope: scope.to_owned(),
@@ -451,20 +414,27 @@ fn merge_field<'source, 'document>(
 }
 
 fn merge_all<'source, 'document>(
-    schema: &Schema,
     output: &mut Vec<CollectedField<'source, 'document>>,
-    index: &mut FxHashMap<&'source str, usize>,
+    index: &mut FxHashMap<&'source str, Vec<usize>>,
     fields: &[CollectedField<'source, 'document>],
 ) {
     for field in fields {
-        if let Some(existing) = index.get(field.response_key).copied() {
+        // Re-run the scope-aware merge for the cached fragment's fields.
+        let entries = index.entry(field.response_key).or_default();
+        let mut merged = false;
+        for existing in entries.iter().copied() {
             let collected = &mut output[existing];
-            refine_scope(schema, &mut collected.scope, &field.scope);
-            collected
-                .selections
-                .extend(field.selections.iter().copied());
-        } else {
-            index.insert(field.response_key, output.len());
+            if collected.scope == field.scope {
+                collected
+                    .selections
+                    .extend(field.selections.iter().copied());
+                merged = true;
+                break;
+            }
+        }
+        if !merged {
+            let position = output.len();
+            entries.push(position);
             output.push(field.clone());
         }
     }

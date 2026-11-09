@@ -403,6 +403,7 @@ impl Object {
     /// This is for callers that already guarantee uniqueness, such as a JSON object converted into
     /// a variable map or the executor building a response. Skipping the linear duplicate scan
     /// keeps large objects linear instead of quadratic.
+    #[doc(hidden)]
     pub fn push_unchecked(&mut self, key: impl Into<Arc<str>>, value: Value) {
         self.fields.push((key.into(), value));
     }

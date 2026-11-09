@@ -40,11 +40,11 @@ let server = Server::new(schema)
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `introspection` | `true` | Allow `__schema` and `__type`. |
-| `max_depth` | `0` (off) | Maximum selection-set depth. |
-| `max_complexity` | `0` (off) | Maximum estimated operation cost. |
+| `max_depth` | `32` | Maximum selection-set depth (parser hard cap is 96). |
+| `max_complexity` | `100_000` | Maximum estimated operation cost. |
 | `max_errors` | `100` | Errors reported before execution stops adding them. |
 | `max_body_bytes` | 1 MiB | HTTP body limit; `0` disables it. |
-| `timeout` | none | Wall-clock timeout for one operation or subscription setup. |
+| `timeout` | `30s` | Wall-clock timeout for one operation or subscription setup. |
 | `max_concurrency` | `16` | Sibling fields resolved concurrently per operation; `0` is unlimited. Mutations stay serial. |
 | `max_batch_size` | `16` | Maximum operations in a batch; `0` disables it. |
 | `batch_concurrency` | `16` | Operations executed concurrently in a batch. |

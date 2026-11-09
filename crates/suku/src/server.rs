@@ -149,21 +149,22 @@ impl fmt::Debug for Server {
 impl Server {
     /// Create a server for a schema.
     ///
-    /// Defaults: introspection enabled, no depth or complexity limit, at most 100 reported errors,
-    /// a 1 MiB body limit, batches of 16 operations with 16-way concurrency, and no timeout.
+    /// Defaults are deliberately safe for an internet-facing endpoint: introspection enabled, a
+    /// depth limit of 32, a complexity limit of 100,000, a 30 second timeout, at most 100 reported
+    /// errors, 16-way field and batch concurrency, and a 1 MiB body limit.
     #[must_use]
     pub fn new(schema: Schema) -> Self {
         Self {
             inner: Arc::new(ServerInner {
                 schema,
                 introspection: true,
-                max_depth: 0,
-                max_complexity: 0,
+                max_depth: 32,
+                max_complexity: 100_000,
                 list_complexity: 10,
                 max_errors: 100,
                 max_concurrency: 16,
                 max_body_bytes: DEFAULT_MAX_BODY_BYTES,
-                timeout: None,
+                timeout: Some(Duration::from_secs(30)),
                 max_batch_size: DEFAULT_MAX_BATCH_SIZE,
                 batch_concurrency: DEFAULT_BATCH_CONCURRENCY,
                 authorizer: None,

@@ -1,6 +1,6 @@
 //! Adversarial review probes for `suku`.
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use gql::{Field, ObjectType, Schema, TypeRef, Value};
 use suku::{Context, GraphQLRequest, Server};
@@ -40,9 +40,47 @@ fn no_timeout_outside_a_tokio_runtime() {
     assert!(response.data.is_some());
 }
 
-/// PROBE S3: GET has no query-string size limit, unlike POST's body limit.
-#[test]
-fn get_query_string_is_not_size_limited() {
-    let _ = Arc::new(0);
-    println!("see http::handle: handle_get never consults max_body_bytes");
+/// GET query strings are bounded by the same body-size setting as POST.
+#[tokio::test]
+async fn get_query_string_obeys_max_body_bytes() {
+    use suku::{HttpConfig, HttpResult, http::handle};
+
+    let query = "a".repeat(256);
+    let uri = format!(
+        "/graphql?{}",
+        serde_urlencoded::to_string([("query", query.as_str())]).expect("query string")
+    );
+    let parts = ::http::Request::builder()
+        .method(::http::Method::GET)
+        .uri(uri)
+        .header(::http::header::ACCEPT, "application/json")
+        .body(())
+        .expect("request")
+        .into_parts()
+        .0;
+    let config = HttpConfig::default().max_body_bytes(64);
+    let result = handle(&Server::new(schema()), &config, &parts, b"", |_| async {
+        Ok(suku::Context::empty())
+    })
+    .await;
+    let HttpResult::Response(response) = result else {
+        panic!("expected a buffered response");
+    };
+    assert_eq!(response.status, ::http::StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// The default server limits still allow the standard GraphiQL introspection query.
+#[tokio::test]
+async fn default_limits_allow_standard_introspection() {
+    use suku::{Context, GraphQLRequest};
+
+    let schema = gql::Schema::from_sdl(include_str!("../../gql/tests/fixtures/schema.graphql"))
+        .expect("fixture schema");
+    let server = Server::new(schema);
+    let request = GraphQLRequest::new(include_str!(
+        "../../gql/tests/fixtures/introspection.graphql"
+    ));
+    let response = server.execute(&request, Context::empty()).await;
+    assert!(!response.has_errors(), "{:?}", response.errors);
+    assert!(response.data.is_some());
 }
