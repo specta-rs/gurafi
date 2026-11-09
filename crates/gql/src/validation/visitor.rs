@@ -4,6 +4,8 @@
 //! module. The walker resolves field definitions (including the specification's meta-fields) and
 //! keeps track of the parent type of each selection set.
 
+use std::sync::OnceLock;
+
 use crate::{
     ast::{self, Field, InlineFragment, Selection, SelectionSet},
     schema::Schema,
@@ -32,24 +34,36 @@ pub(crate) struct FieldContext<'a> {
     /// The meta-field this selection refers to, when it is one.
     pub(crate) meta: Option<MetaField>,
     /// The field's declared return type. `None` when the field is unknown.
-    pub(crate) return_type: Option<TypeRef>,
+    pub(crate) return_type: Option<&'a TypeRef>,
 }
 
 /// One argument's input type and whether it has a default value.
-#[derive(Clone, Debug)]
-pub(crate) struct ArgumentInfo {
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ArgumentInfo<'a> {
     /// The expected input type.
-    pub(crate) ty: TypeRef,
+    pub(crate) ty: &'a TypeRef,
     /// Whether the argument defines a default value.
     pub(crate) has_default: bool,
 }
 
-impl ArgumentInfo {
-    fn from_input(input: &crate::types::InputValue) -> Self {
+impl<'a> ArgumentInfo<'a> {
+    fn from_input(input: &'a crate::types::InputValue) -> Self {
         Self {
-            ty: input.ty.clone(),
+            ty: &input.ty,
             has_default: input.default_value.is_some(),
         }
+    }
+}
+
+/// The return type of a specification meta-field.
+fn meta_type(meta: MetaField) -> &'static TypeRef {
+    static TYPENAME: OnceLock<TypeRef> = OnceLock::new();
+    static SCHEMA: OnceLock<TypeRef> = OnceLock::new();
+    static TYPE: OnceLock<TypeRef> = OnceLock::new();
+    match meta {
+        MetaField::Typename => TYPENAME.get_or_init(|| TypeRef::string().non_null()),
+        MetaField::Schema => SCHEMA.get_or_init(|| TypeRef::named("__Schema").non_null()),
+        MetaField::Type => TYPE.get_or_init(|| TypeRef::named("__Type")),
     }
 }
 
@@ -105,10 +119,8 @@ pub(crate) fn field_context<'a>(
         })
     };
     let return_type = match meta {
-        Some(MetaField::Typename) => Some(TypeRef::string().non_null()),
-        Some(MetaField::Schema) => Some(TypeRef::named("__Schema").non_null()),
-        Some(MetaField::Type) => Some(TypeRef::named("__Type")),
-        None => definition.map(|definition| definition.ty.clone()),
+        Some(meta) => Some(meta_type(meta)),
+        None => definition.map(|definition| &definition.ty),
     };
 
     FieldContext {
@@ -120,13 +132,16 @@ pub(crate) fn field_context<'a>(
 }
 
 /// The input type of a field argument, including the synthetic `__type(name:)` argument.
-pub(crate) fn field_argument_info(context: &FieldContext<'_>, name: &str) -> Option<ArgumentInfo> {
+pub(crate) fn field_argument_info<'a>(
+    context: &FieldContext<'a>,
+    name: &str,
+) -> Option<ArgumentInfo<'a>> {
     if let Some(definition) = context.definition {
         return definition.args.get(name).map(ArgumentInfo::from_input);
     }
     match context.meta {
         Some(MetaField::Type) if name == "name" => Some(ArgumentInfo {
-            ty: TypeRef::string().non_null(),
+            ty: meta_type(MetaField::Typename),
             has_default: false,
         }),
         _ => None,
@@ -134,10 +149,10 @@ pub(crate) fn field_argument_info(context: &FieldContext<'_>, name: &str) -> Opt
 }
 
 /// The input type of a directive argument.
-pub(crate) fn directive_argument_info(
-    definition: &crate::types::DirectiveDefinition,
+pub(crate) fn directive_argument_info<'a>(
+    definition: &'a crate::types::DirectiveDefinition,
     name: &str,
-) -> Option<ArgumentInfo> {
+) -> Option<ArgumentInfo<'a>> {
     definition.args.get(name).map(ArgumentInfo::from_input)
 }
 

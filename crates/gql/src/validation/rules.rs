@@ -3,7 +3,7 @@
 //! These are the rules that need to know a selection's parent type. Membership rules (fragment
 //! names, reachability, cycles) live in [`super`]; value shape rules live in [`super::values`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use indexmap::IndexMap;
 
@@ -51,7 +51,7 @@ enum ArgumentOwner<'a> {
 }
 
 fn unique_argument_names(provided: &[Argument<'_>], errors: &mut Vec<GraphQLError>) {
-    let mut seen = HashSet::new();
+    let mut seen = crate::validation::NameSet::new();
     for argument in provided {
         if !seen.insert(argument.name) {
             errors.push(
@@ -129,7 +129,7 @@ pub(crate) fn check_directives(
     location: DirectiveLocation,
     errors: &mut Vec<GraphQLError>,
 ) {
-    let mut seen: HashSet<&str> = HashSet::new();
+    let mut seen = crate::validation::NameSet::new();
     for directive in directives {
         let Some(definition) = schema.get_directive(directive.name) else {
             errors.push(
@@ -266,7 +266,7 @@ impl<'a> Visitor<'a> for FieldRules<'a, '_> {
             }
         }
 
-        if let Some(return_type) = &context.return_type {
+        if let Some(return_type) = context.return_type {
             let named = self.schema.get_type(return_type.named_type());
             let is_leaf = named.is_some_and(|ty| ty.is_leaf());
             let is_composite = named.is_some_and(|ty| ty.is_composite())

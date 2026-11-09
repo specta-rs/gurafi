@@ -15,6 +15,8 @@ mod visitor;
 
 use std::collections::{HashMap, HashSet};
 
+use smallvec::SmallVec;
+
 use crate::{
     ast::{
         Definition, DirectiveLocation, Document, Field, FragmentDefinition, OperationDefinition,
@@ -52,15 +54,22 @@ pub fn validate<'a>(
     // A very long fragment chain is shallow in the document but deep once expanded. Stop before
     // any of the recursive validation passes can exhaust the stack; the document is invalid
     // regardless of its other contents.
-    let fragments: HashMap<&str, &FragmentDefinition<'_>> = document
-        .fragments()
-        .map(|fragment| (fragment.name, fragment))
-        .collect();
-    if let Some(error) = check_fragment_chain(&fragments) {
-        return vec![error];
+    let mut fragments: HashMap<&str, &FragmentDefinition<'_>> = HashMap::new();
+    let mut fragment_count = 0;
+    for fragment in document.fragments() {
+        // First definition wins; UniqueFragmentNames reports the duplicates.
+        if !fragments.contains_key(fragment.name) {
+            fragments.insert(fragment.name, fragment);
+            fragment_count += 1;
+        }
     }
-
-    let mut validator = Validator::new(schema, document, options);
+    // A single fragment cannot form a chain, so the chain walk is unnecessary.
+    if fragment_count > 1 {
+        if let Some(error) = check_fragment_chain(&fragments) {
+            return vec![error];
+        }
+    }
+    let mut validator = Validator::with_fragments(schema, document, options, fragments);
     validator.run();
     if options.max_errors != 0 {
         validator.errors.truncate(options.max_errors);
@@ -95,7 +104,7 @@ fn check_fragment_chain<'a>(
         seen.insert(name, depth);
         let fragment = fragments.get(name)?;
         path.push(name);
-        let mut spreads = Vec::new();
+        let mut spreads = SmallVec::new();
         collect_spreads(&fragment.selection_set, &mut spreads);
         for spread in spreads {
             if let Some(error) = visit(fragments, spread, depth + 1, path, seen) {
@@ -113,6 +122,44 @@ fn check_fragment_chain<'a>(
         }
     }
     None
+}
+
+/// A set of borrowed names that stays inline for the handful of names most documents use and
+/// falls back to hashing so a pathological document cannot make membership quadratic.
+pub(crate) struct NameSet<'a> {
+    small: SmallVec<[&'a str; 8]>,
+    large: Option<HashSet<&'a str>>,
+}
+
+impl<'a> NameSet<'a> {
+    pub(crate) fn new() -> Self {
+        Self {
+            small: SmallVec::new(),
+            large: None,
+        }
+    }
+
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        match &self.large {
+            Some(large) => large.contains(name),
+            None => self.small.contains(&name),
+        }
+    }
+
+    /// Insert a name, returning whether it was not already present.
+    pub(crate) fn insert(&mut self, name: &'a str) -> bool {
+        if let Some(large) = &mut self.large {
+            return large.insert(name);
+        }
+        if self.small.contains(&name) {
+            return false;
+        }
+        self.small.push(name);
+        if self.small.len() > 8 {
+            self.large = Some(self.small.iter().copied().collect());
+        }
+        true
+    }
 }
 
 /// The root type an operation selects from, when the schema defines it.
@@ -140,7 +187,7 @@ fn is_introspection_field(name: &str) -> bool {
     name.starts_with("__")
 }
 
-fn collect_spreads<'a>(selection_set: &'a SelectionSet<'a>, out: &mut Vec<&'a str>) {
+fn collect_spreads<'a>(selection_set: &'a SelectionSet<'a>, out: &mut SmallVec<[&'a str; 8]>) {
     for selection in &selection_set.items {
         match selection {
             Selection::Field(field) => {
@@ -183,7 +230,7 @@ fn collect_top_level_fields<'a>(
 
 fn collect_spread_locations<'a>(
     selection_set: &'a SelectionSet<'a>,
-    out: &mut Vec<(&'a str, Location)>,
+    out: &mut SmallVec<[(&'a str, Location); 8]>,
 ) {
     for selection in &selection_set.items {
         match selection {
@@ -255,7 +302,7 @@ fn detect_cycle<'a>(
     };
 
     path.push(name);
-    let mut spreads = Vec::new();
+    let mut spreads = SmallVec::new();
     collect_spread_locations(&fragment.selection_set, &mut spreads);
     for (spread, location) in spreads {
         if let Some(index) = path.iter().position(|item| *item == spread) {
@@ -322,12 +369,12 @@ struct Validator<'a> {
 }
 
 impl<'a> Validator<'a> {
-    fn new(schema: &'a Schema, document: &'a Document<'a>, options: &'a ValidationOptions) -> Self {
-        let mut fragments = HashMap::new();
-        for fragment in document.fragments() {
-            // First definition wins; UniqueFragmentNames reports the duplicates.
-            fragments.entry(fragment.name).or_insert(fragment);
-        }
+    fn with_fragments(
+        schema: &'a Schema,
+        document: &'a Document<'a>,
+        options: &'a ValidationOptions,
+        fragments: HashMap<&'a str, &'a FragmentDefinition<'a>>,
+    ) -> Self {
         Self {
             schema,
             document,
@@ -403,9 +450,10 @@ impl<'a> Validator<'a> {
 
     fn check_operation_names(&mut self) {
         let document = self.document;
-        let operations: Vec<&'a OperationDefinition<'a>> = document.operations().collect();
+        let operations: SmallVec<[&'a OperationDefinition<'a>; 4]> =
+            document.operations().collect();
 
-        let mut seen = HashSet::new();
+        let mut seen = NameSet::new();
         for operation in &operations {
             if let Some(name) = operation.name {
                 if !seen.insert(name) {
@@ -430,7 +478,7 @@ impl<'a> Validator<'a> {
         }
 
         for operation in &operations {
-            let mut variable_names = HashSet::new();
+            let mut variable_names = NameSet::new();
             for variable in &operation.variables {
                 if !variable_names.insert(variable.name) {
                     self.push(
@@ -495,7 +543,7 @@ impl<'a> Validator<'a> {
 
     fn check_fragment_names(&mut self) {
         let document = self.document;
-        let mut seen = HashSet::new();
+        let mut seen = NameSet::new();
         for fragment in document.fragments() {
             if !seen.insert(fragment.name) {
                 self.push(
@@ -671,8 +719,8 @@ impl<'a> Validator<'a> {
     fn check_fragment_reachability(&mut self) {
         let document = self.document;
         let fragments = &self.fragments;
-        let mut reachable: HashSet<&'a str> = HashSet::new();
-        let mut stack: Vec<&'a str> = Vec::new();
+        let mut reachable = NameSet::new();
+        let mut stack: SmallVec<[&'a str; 8]> = SmallVec::new();
         for operation in document.operations() {
             collect_spreads(&operation.selection_set, &mut stack);
         }

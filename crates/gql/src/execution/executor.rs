@@ -14,7 +14,7 @@ use std::{
 
 use futures::{
     StreamExt,
-    future::{BoxFuture, FutureExt},
+    future::{BoxFuture, Either, FutureExt, ready},
     stream,
 };
 use rustc_hash::FxHashMap;
@@ -417,7 +417,7 @@ impl<'doc> Executor<'doc> {
         'doc: 's,
     {
         async move {
-            let collected = collect::collect_fields_multi(
+            let mut collected = collect::collect_fields_multi(
                 &self.context.schema,
                 &self.fragments,
                 &self.context.variables,
@@ -426,9 +426,22 @@ impl<'doc> Executor<'doc> {
             )?;
 
             let mut result = Object::with_capacity(collected.len());
+            if self.parallel
+                && collected.len() > 1
+                && self.try_execute_all_leaves(
+                    &object_type,
+                    parent,
+                    &mut collected,
+                    path,
+                    errors,
+                    &mut result,
+                )?
+            {
+                return Ok(result);
+            }
             if self.parallel && collected.len() > 1 {
-                // Futures are heterogeneous only by lifetime here, but the vector lives on the
-                // heap so the boxed future below stays small enough to recurse safely.
+                // The batch lives on the heap so the boxed future below stays small enough to
+                // recurse safely.
                 let mut futures = Vec::with_capacity(collected.len());
                 for (response_key, nodes) in collected {
                     if self.expired() {
@@ -437,24 +450,42 @@ impl<'doc> Executor<'doc> {
                         )
                         .with_path(path.to_vec()));
                     }
-                    let mut field_path = path.clone();
-                    let object_type = object_type.clone();
-                    futures.push(async move {
-                        let mut field_errors = Vec::new();
-                        let (response_key, outcome) = self
-                            .execute_field(
-                                object_type,
-                                parent,
-                                response_key,
-                                &nodes,
-                                &mut field_path,
-                                &mut field_errors,
-                            )
-                            .await;
-                        (response_key, outcome, field_errors)
-                    });
+                    // Leaf fields that need no resolver complete synchronously; `ready` keeps
+                    // them in the same ordered batch as the asynchronous fields without boxing
+                    // a future or cloning the path for each one.
+                    let mut field_errors = Vec::new();
+                    let inline = self.try_execute_leaf(
+                        &object_type,
+                        parent,
+                        response_key,
+                        &nodes,
+                        path,
+                        &mut field_errors,
+                    );
+                    let future = match inline {
+                        Some((response_key, outcome)) => {
+                            Either::Left(ready((response_key, outcome, field_errors)))
+                        }
+                        None => {
+                            let mut field_path = path.clone();
+                            let object_type = object_type.clone();
+                            Either::Right(async move {
+                                let (response_key, outcome) = self
+                                    .execute_field(
+                                        object_type,
+                                        parent,
+                                        response_key,
+                                        &nodes,
+                                        &mut field_path,
+                                        &mut field_errors,
+                                    )
+                                    .await;
+                                (response_key, outcome, field_errors)
+                            })
+                        }
+                    };
+                    futures.push(future);
                 }
-
                 // `join_all` reaches the same concurrency as `buffered` whenever every sibling
                 // fits under the limit, and does not allocate the ordered-stream bookkeeping.
                 let max_concurrency = self.context.max_concurrency;
@@ -466,7 +497,6 @@ impl<'doc> Executor<'doc> {
                         .collect()
                         .await
                 };
-
                 let mut bubble = None;
                 for (response_key, outcome, field_errors) in outcomes {
                     append_errors(errors, field_errors, self.context.max_errors);
@@ -494,16 +524,27 @@ impl<'doc> Executor<'doc> {
                         )
                         .with_path(path.to_vec()));
                     }
-                    let (response_key, outcome) = self
-                        .execute_field(
-                            object_type.clone(),
-                            parent,
-                            response_key,
-                            &nodes,
-                            path,
-                            errors,
-                        )
-                        .await;
+                    let (response_key, outcome) = match self.try_execute_leaf(
+                        &object_type,
+                        parent,
+                        response_key,
+                        &nodes,
+                        path,
+                        errors,
+                    ) {
+                        Some(done) => done,
+                        None => {
+                            self.execute_field(
+                                object_type.clone(),
+                                parent,
+                                response_key,
+                                &nodes,
+                                path,
+                                errors,
+                            )
+                            .await
+                        }
+                    };
                     match outcome {
                         Ok(value) => {
                             result.push_unchecked(response_key, value);
@@ -516,6 +557,136 @@ impl<'doc> Executor<'doc> {
         }
         .boxed()
     }
+    /// Complete a selection set made only of object properties.
+    ///
+    /// This runs before the asynchronous batch is built so such sets never allocate or poll a
+    /// future, and it is a separate function so its locals do not enlarge the recursive
+    /// [`Self::execute_fields`] frame.
+    fn try_execute_all_leaves(
+        &self,
+        object_type: &ObjectType,
+        parent: &Value,
+        collected: &mut collect::CollectedFields<'doc>,
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+        result: &mut Object,
+    ) -> Result<bool, GraphQLError> {
+        if !collected
+            .iter()
+            .all(|(_, nodes)| self.can_execute_leaf_inline(object_type, nodes))
+        {
+            return Ok(false);
+        }
+        for (response_key, nodes) in collected.drain(..) {
+            if self.expired() {
+                return Err(
+                    GraphQLError::new("The operation timed out before it could finish.")
+                        .with_path(path.to_vec()),
+                );
+            }
+            let (response_key, outcome) = self
+                .try_execute_leaf(object_type, parent, response_key, &nodes, path, errors)
+                .expect("the inline predicate and the fast path agree");
+            result.push_unchecked(response_key, outcome?);
+        }
+        Ok(true)
+    }
+
+    /// Whether a field can be completed by [`Self::try_execute_leaf`].
+    fn can_execute_leaf_inline(
+        &self,
+        object_type: &ObjectType,
+        nodes: &[&'doc ast::Field<'doc>],
+    ) -> bool {
+        nodes
+            .first()
+            .is_some_and(|first| self.leaf_field(object_type, first).is_some())
+    }
+
+    /// The schema field for a selection that the synchronous leaf path can complete.
+    ///
+    /// The field must exist, have no resolver and no arguments (so argument coercion cannot
+    /// fail or be observed), and return a scalar or enum.
+    fn leaf_field<'f>(
+        &self,
+        object_type: &'f ObjectType,
+        first: &ast::Field<'_>,
+    ) -> Option<&'f crate::types::Field> {
+        if !first.arguments.is_empty() || meta_return_type(first.name).is_some() {
+            return None;
+        }
+        let field = object_type.get_field(first.name)?;
+        if field.resolve.is_some() || !field.args.is_empty() || self.context.authorizer.is_some() {
+            return None;
+        }
+        match self.context.schema.get_type(field.ty.named_type())? {
+            Type::Scalar(_) | Type::Enum(_) => Some(field),
+            _ => None,
+        }
+    }
+
+    /// Complete a leaf field that needs no asynchronous work in place.
+    ///
+    /// A field with no resolver, no arguments and a scalar or enum type resolves through the
+    /// default property resolver and completes synchronously. Doing it here avoids boxing a
+    /// future and cloning the path for every such field, which is the common case for object
+    /// properties. Returning `None` hands the field to the general path unchanged.
+    fn try_execute_leaf<'s>(
+        &'s self,
+        object_type: &ObjectType,
+        parent: &Value,
+        response_key: &'doc str,
+        nodes: &'s [&'doc ast::Field<'doc>],
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+    ) -> Option<(Arc<str>, Result<Value, GraphQLError>)>
+    where
+        'doc: 's,
+    {
+        let first = nodes.first().copied()?;
+        let field = self.leaf_field(object_type, first)?;
+
+        // An unaliased field's response key is the schema field's interned name, so the
+        // response object and the error path can share that `Arc`.
+        let response_key: Arc<str> = match first.alias {
+            Some(_) => Arc::from(response_key),
+            None => field.name.clone(),
+        };
+        let location = first.location;
+        path.push(PathSegment::Field(response_key.clone()));
+        if self.expired() {
+            let error = GraphQLError::new("The operation timed out before it could finish.")
+                .with_path(path.to_vec());
+            path.pop();
+            return Some((response_key, Err(error)));
+        }
+
+        let label = FieldLabel {
+            parent: object_type.name.as_ref(),
+            name: field.name.as_ref(),
+        };
+        let outcome = match default_resolve(label, field.name.as_ref(), parent) {
+            Ok(value) => match self.complete_leaf(&value, &field.ty, label, location, path) {
+                Some(outcome) => outcome,
+                None => {
+                    path.pop();
+                    return None;
+                }
+            },
+            Err(error) => Err(error),
+        };
+        let outcome = finish_field(
+            outcome,
+            Some(&field.ty),
+            path,
+            location,
+            errors,
+            self.context.max_errors,
+        );
+        path.pop();
+        Some((response_key, outcome))
+    }
+
     fn execute_field<'s>(
         &'s self,
         object_type: Arc<ObjectType>,
@@ -614,7 +785,7 @@ impl<'doc> Executor<'doc> {
                     Ok(value) => match self.complete_leaf(&value, &ty, label, location, path) {
                         Some(completed) => completed,
                         None => {
-                            self.complete_value(
+                            self.complete_field_value(
                                 value,
                                 &ty,
                                 label,
@@ -720,7 +891,7 @@ impl<'doc> Executor<'doc> {
             Ok(value) => match self.complete_leaf(&value, &field.ty, label, location, path) {
                 Some(completed) => completed,
                 None => {
-                    self.complete_value(
+                    self.complete_field_value(
                         value,
                         &field.ty,
                         label,
@@ -844,6 +1015,47 @@ impl<'doc> Executor<'doc> {
         Some(Ok(completed))
     }
 
+    /// The concrete object type a value of `ty` completes as, when it is a plain object.
+    ///
+    /// Lists, interfaces and unions need the general path; a bare named object is by far the
+    /// most common composite field and completing it here avoids boxing a future.
+    fn plain_object(&self, ty: &TypeRef) -> Option<Arc<ObjectType>> {
+        let mut current = ty;
+        while let TypeRef::NonNull(inner) = current {
+            current = inner;
+        }
+        let TypeRef::Named(name) = current else {
+            return None;
+        };
+        match self.context.schema.get_type(name) {
+            Some(Type::Object(object)) => Some(object.clone()),
+            _ => None,
+        }
+    }
+
+    /// Complete a field whose type may be a plain object, without the boxed general path.
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_field_value(
+        &self,
+        value: Value,
+        ty: &TypeRef,
+        label: FieldLabel<'_>,
+        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        location: Location,
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+    ) -> Result<Value, GraphQLError> {
+        if !value.is_null() {
+            if let Some(object) = self.plain_object(ty) {
+                return self
+                    .complete_object(object, value, label, selection_sets, location, path, errors)
+                    .await;
+            }
+        }
+        self.complete_value(value, ty, label, selection_sets, location, path, errors)
+            .await
+    }
+
     fn complete_value<'s>(
         &'s self,
         value: Value,
@@ -930,9 +1142,16 @@ impl<'doc> Executor<'doc> {
         let mut completed = Vec::with_capacity(items.len());
         for (index, item) in items.into_iter().enumerate() {
             path.push(PathSegment::index(index));
-            let outcome = self
-                .complete_value(item, inner, label, selection_sets, location, path, errors)
-                .await;
+            let outcome = if item.is_null() {
+                self.complete_value(item, inner, label, selection_sets, location, path, errors)
+                    .await
+            } else if let Some(object) = self.plain_object(inner) {
+                self.complete_object(object, item, label, selection_sets, location, path, errors)
+                    .await
+            } else {
+                self.complete_value(item, inner, label, selection_sets, location, path, errors)
+                    .await
+            };
             path.pop();
             match outcome {
                 Ok(value) => completed.push(value),

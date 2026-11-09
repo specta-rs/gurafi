@@ -3,7 +3,9 @@
 //! Variable usages are collected per operation, expanding fragment spreads, because a variable
 //! used inside a fragment belongs to every operation that reaches that fragment.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
+use smallvec::SmallVec;
 
 use crate::{
     ast::{
@@ -15,14 +17,14 @@ use crate::{
     types::{Type, TypeRef},
     validation::{
         ValidationOptions, root_type,
-        visitor::{directive_argument_info, field_argument_info, field_context, type_ref_from_ast},
+        visitor::{directive_argument_info, field_argument_info, field_context},
     },
 };
 
 /// One place a variable is used, with the type expected there.
 struct VariableUsage<'a> {
     name: &'a str,
-    ty: Option<TypeRef>,
+    ty: Option<&'a TypeRef>,
     location: Location,
     has_location_default: bool,
 }
@@ -45,15 +47,15 @@ fn list_item(ty: &TypeRef) -> Option<&TypeRef> {
 fn collect_value_usages<'a>(
     schema: &'a Schema,
     value: &'a Value<'a>,
-    expected: Option<&TypeRef>,
+    expected: Option<&'a TypeRef>,
     has_default: bool,
     location: Location,
-    out: &mut Vec<VariableUsage<'a>>,
+    out: &mut Usages<'a>,
 ) {
     match value {
         Value::Variable(name) => out.push(VariableUsage {
             name,
-            ty: expected.cloned(),
+            ty: expected,
             location,
             has_location_default: has_default,
         }),
@@ -95,10 +97,74 @@ fn collect_value_usages<'a>(
     }
 }
 
+/// Variable usages found in one operation. Documents reference only a handful of variables, so
+/// the list lives inline and only unusual documents spill to the heap.
+type Usages<'a> = SmallVec<[VariableUsage<'a>; 16]>;
+
+/// Variable definitions in document order.
+///
+/// Operations declare few variables, so a linear scan beats a map for the common case. A
+/// document with many definitions keeps the same order but gains a hash index so lookups stay
+/// linear.
+struct Definitions<'a> {
+    list: SmallVec<[&'a VariableDefinition<'a>; 8]>,
+    index: Option<HashMap<&'a str, usize>>,
+}
+
+impl<'a> Definitions<'a> {
+    fn new() -> Self {
+        Self {
+            list: SmallVec::new(),
+            index: None,
+        }
+    }
+
+    fn insert(&mut self, variable: &'a VariableDefinition<'a>) {
+        if let Some(index) = &mut self.index {
+            if index.contains_key(variable.name) {
+                return;
+            }
+            index.insert(variable.name, self.list.len());
+            self.list.push(variable);
+            return;
+        }
+        if self.list.iter().any(|known| known.name == variable.name) {
+            return;
+        }
+        self.list.push(variable);
+        if self.list.len() > 8 {
+            self.index = Some(
+                self.list
+                    .iter()
+                    .enumerate()
+                    .map(|(position, variable)| (variable.name, position))
+                    .collect(),
+            );
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<&'a VariableDefinition<'a>> {
+        match &self.index {
+            Some(index) => index.get(name).map(|position| self.list[*position]),
+            None => self
+                .list
+                .iter()
+                .find(|variable| variable.name == name)
+                .copied(),
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &'a VariableDefinition<'a>> {
+        self.list.iter().copied()
+    }
+}
+
+type Names<'a> = crate::validation::NameSet<'a>;
+
 fn collect_directive_usages<'a>(
     schema: &'a Schema,
     directives: &'a [crate::ast::Directive<'a>],
-    out: &mut Vec<VariableUsage<'a>>,
+    out: &mut Usages<'a>,
 ) {
     for directive in directives {
         let Some(definition) = schema.get_directive(directive.name) else {
@@ -112,7 +178,7 @@ fn collect_directive_usages<'a>(
                 Some(info) => collect_value_usages(
                     schema,
                     &argument.value,
-                    Some(&info.ty),
+                    Some(info.ty),
                     info.has_default,
                     argument.location,
                     out,
@@ -136,8 +202,8 @@ fn collect_selection_usages<'a>(
     fragments: &HashMap<&'a str, &'a FragmentDefinition<'a>>,
     parent: Option<&'a Type>,
     selection_set: &'a SelectionSet<'a>,
-    visited: &mut HashSet<&'a str>,
-    out: &mut Vec<VariableUsage<'a>>,
+    visited: &mut Names<'a>,
+    out: &mut Usages<'a>,
 ) {
     for selection in &selection_set.items {
         match selection {
@@ -190,8 +256,8 @@ fn collect_inline_usages<'a>(
     fragments: &HashMap<&'a str, &'a FragmentDefinition<'a>>,
     parent: Option<&'a Type>,
     fragment: &'a InlineFragment<'a>,
-    visited: &mut HashSet<&'a str>,
-    out: &mut Vec<VariableUsage<'a>>,
+    visited: &mut Names<'a>,
+    out: &mut Usages<'a>,
 ) {
     collect_directive_usages(schema, &fragment.directives, out);
     let condition = fragment
@@ -215,7 +281,7 @@ fn collect_field_usages<'a>(
     options: &ValidationOptions,
     parent: Option<&'a Type>,
     field: &'a Field<'a>,
-    out: &mut Vec<VariableUsage<'a>>,
+    out: &mut Usages<'a>,
 ) {
     let context = field_context(schema, options, parent, field);
     for argument in &field.arguments {
@@ -223,7 +289,7 @@ fn collect_field_usages<'a>(
             Some(info) => collect_value_usages(
                 schema,
                 &argument.value,
-                Some(&info.ty),
+                Some(info.ty),
                 info.has_default,
                 argument.location,
                 out,
@@ -238,12 +304,11 @@ fn collect_field_usages<'a>(
 
 /// Whether a variable declared as `variable` may be used where `location` is expected.
 fn allowed_position(variable: &VariableDefinition<'_>, usage: &VariableUsage<'_>) -> bool {
-    let Some(location_type) = usage.ty.as_ref() else {
+    let Some(location_type) = usage.ty else {
         return true;
     };
-    let variable_type = type_ref_from_ast(&variable.ty);
 
-    if location_type.is_non_null() && !variable_type.is_non_null() {
+    if location_type.is_non_null() && !matches!(variable.ty, crate::ast::Type::NonNull(_)) {
         let has_non_null_default = variable
             .default_value
             .as_ref()
@@ -251,24 +316,29 @@ fn allowed_position(variable: &VariableDefinition<'_>, usage: &VariableUsage<'_>
         if !has_non_null_default && !usage.has_location_default {
             return false;
         }
-        return types_compatible(&variable_type, nullable(location_type));
+        return types_compatible(&variable.ty, nullable(location_type));
     }
 
-    types_compatible(&variable_type, location_type)
+    types_compatible(&variable.ty, location_type)
 }
 
-fn types_compatible(variable: &TypeRef, location: &TypeRef) -> bool {
+/// Whether an AST variable type may be used where a schema type is expected.
+///
+/// Comparing against the AST directly avoids allocating a [`TypeRef`] just to ask this question.
+fn types_compatible(variable: &crate::ast::Type<'_>, location: &TypeRef) -> bool {
     match (variable, location) {
-        (TypeRef::NonNull(variable), TypeRef::NonNull(location)) => {
+        (crate::ast::Type::NonNull(variable), TypeRef::NonNull(location)) => {
             types_compatible(variable, location)
         }
         // A non-null variable may be used in a nullable position: `[Int!]!` is compatible with
         // `[Int!]`, and `Int!` is compatible with `Int`.
-        (TypeRef::NonNull(variable), location) => types_compatible(variable, location),
+        (crate::ast::Type::NonNull(variable), location) => types_compatible(variable, location),
         (_, TypeRef::NonNull(_)) => false,
-        (TypeRef::List(variable), TypeRef::List(location)) => types_compatible(variable, location),
-        (TypeRef::List(_), _) | (_, TypeRef::List(_)) => false,
-        (TypeRef::Named(variable), TypeRef::Named(location)) => variable == location,
+        (crate::ast::Type::List(variable), TypeRef::List(location)) => {
+            types_compatible(variable, location)
+        }
+        (crate::ast::Type::List(_), _) | (_, TypeRef::List(_)) => false,
+        (crate::ast::Type::Named(variable), TypeRef::Named(location)) => *variable == &**location,
     }
 }
 
@@ -281,12 +351,13 @@ pub(crate) fn check_variables<'a>(
     errors: &mut Vec<GraphQLError>,
 ) {
     for operation in document.operations() {
-        let mut definitions: HashMap<&'a str, &'a VariableDefinition<'a>> = HashMap::new();
+        let mut definitions = Definitions::new();
         for variable in &operation.variables {
-            definitions.entry(variable.name).or_insert(variable);
+            // First definition wins; UniqueVariableNames reports the duplicates.
+            definitions.insert(variable);
         }
 
-        let mut usages = Vec::new();
+        let mut usages = Usages::new();
         collect_directive_usages(schema, &operation.directives, &mut usages);
         collect_selection_usages(
             schema,
@@ -294,13 +365,13 @@ pub(crate) fn check_variables<'a>(
             fragments,
             root_type(schema, operation.kind),
             &operation.selection_set,
-            &mut HashSet::new(),
+            &mut Names::new(),
             &mut usages,
         );
 
-        let mut undefined = HashSet::new();
+        let mut undefined = Names::new();
         for usage in &usages {
-            if !definitions.contains_key(usage.name) && undefined.insert(usage.name) {
+            if definitions.get(usage.name).is_none() && undefined.insert(usage.name) {
                 let message = match operation.name {
                     Some(name) => format!(
                         "Variable \"${}\" is not defined by operation \"{name}\".",
@@ -312,7 +383,7 @@ pub(crate) fn check_variables<'a>(
             }
         }
 
-        for variable in definitions.values() {
+        for variable in definitions.iter() {
             if !usages.iter().any(|usage| usage.name == variable.name) {
                 let message = match operation.name {
                     Some(name) => format!(
@@ -325,7 +396,7 @@ pub(crate) fn check_variables<'a>(
             }
         }
 
-        let mut reported = HashSet::new();
+        let mut reported: SmallVec<[(&'a str, Location); 4]> = SmallVec::new();
         for usage in &usages {
             let Some(variable) = definitions.get(usage.name) else {
                 continue;
@@ -333,18 +404,19 @@ pub(crate) fn check_variables<'a>(
             if allowed_position(variable, usage) {
                 continue;
             }
-            if !reported.insert((usage.name, usage.location)) {
+            let duplicate = reported
+                .iter()
+                .any(|(name, location)| *name == usage.name && *location == usage.location);
+            if duplicate {
                 continue;
             }
+            reported.push((usage.name, usage.location));
             errors.push(
                 GraphQLError::new(format!(
                     "Variable \"${}\" of type \"{}\" used in position expecting type \"{}\".",
                     usage.name,
                     variable.ty,
-                    usage
-                        .ty
-                        .as_ref()
-                        .map_or_else(String::new, ToString::to_string)
+                    usage.ty.map_or_else(String::new, ToString::to_string)
                 ))
                 .at(usage.location),
             );

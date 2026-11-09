@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use indexmap::IndexMap;
+use smallvec::SmallVec;
 
 use crate::{
     ast::{Argument, Document, Field, FragmentDefinition, Selection, SelectionSet, Value},
@@ -17,11 +17,57 @@ use crate::{
     validation::{ValidationOptions, rules::types_overlap, visitor::field_context},
 };
 
+#[derive(Clone, Copy)]
 struct Entry<'a> {
     parent: &'a Type,
     field: &'a Field<'a>,
-    return_type: TypeRef,
+    return_type: &'a TypeRef,
 }
+
+/// Entries found in one selection set. Selection sets are usually tiny, so the list lives
+/// inline and only pathological documents spill to the heap.
+type Entries<'a> = SmallVec<[Entry<'a>; 8]>;
+
+/// One response key's entries, in document order.
+type Group<'a> = (&'a str, SmallVec<[Entry<'a>; 4]>);
+
+/// Above this many response keys a hash index beats a linear scan.
+const LINEAR_INDEX_LIMIT: usize = 16;
+
+/// Group entries by response key, preserving first-seen order.
+fn group_entries<'a>(entries: Entries<'a>) -> SmallVec<[Group<'a>; 8]> {
+    let mut groups: SmallVec<[Group<'a>; 8]> = SmallVec::new();
+    let mut index: Option<HashMap<&'a str, usize>> = None;
+    for entry in entries {
+        let key = entry.field.response_key();
+        if let Some(index) = &mut index {
+            if let Some(position) = index.get(key).copied() {
+                groups[position].1.push(entry);
+            } else {
+                index.insert(key, groups.len());
+                groups.push((key, smallvec::smallvec![entry]));
+            }
+            continue;
+        }
+        if let Some(position) = groups.iter().position(|(known, _)| *known == key) {
+            groups[position].1.push(entry);
+            continue;
+        }
+        groups.push((key, smallvec::smallvec![entry]));
+        if groups.len() > LINEAR_INDEX_LIMIT {
+            index = Some(
+                groups
+                    .iter()
+                    .enumerate()
+                    .map(|(position, (key, _))| (*key, position))
+                    .collect(),
+            );
+        }
+    }
+    groups
+}
+
+type Visited<'a> = crate::validation::NameSet<'a>;
 
 struct State<'a, 'b> {
     schema: &'a Schema,
@@ -40,8 +86,8 @@ impl<'a> State<'a, '_> {
         &self,
         parent: &'a Type,
         selection_set: &'a SelectionSet<'a>,
-        visited: &mut HashSet<&'a str>,
-        out: &mut Vec<Entry<'a>>,
+        visited: &mut Visited<'a>,
+        out: &mut Entries<'a>,
     ) {
         for selection in &selection_set.items {
             match selection {
@@ -132,7 +178,7 @@ impl<'a> State<'a, '_> {
             ))
         } else if !same_arguments(&left.field.arguments, &right.field.arguments) {
             Some("they have differing arguments".to_owned())
-        } else if self.types_conflict(&left.return_type, &right.return_type) {
+        } else if self.types_conflict(left.return_type, right.return_type) {
             Some(format!(
                 "they return conflicting types \"{}\" and \"{}\"",
                 left.return_type, right.return_type
@@ -147,48 +193,36 @@ impl<'a> State<'a, '_> {
         }
 
         let (Some(left_parent), Some(right_parent)) = (
-            self.named_composite(&left.return_type),
-            self.named_composite(&right.return_type),
+            self.named_composite(left.return_type),
+            self.named_composite(right.return_type),
         ) else {
             return;
         };
 
-        let mut left_entries = Vec::new();
+        let mut left_entries = Entries::new();
         if let Some(selection_set) = &left.field.selection_set {
             self.collect(
                 left_parent,
                 selection_set,
-                &mut HashSet::new(),
+                &mut Visited::new(),
                 &mut left_entries,
             );
         }
-        let mut right_entries = Vec::new();
+        let mut right_entries = Entries::new();
         if let Some(selection_set) = &right.field.selection_set {
             self.collect(
                 right_parent,
                 selection_set,
-                &mut HashSet::new(),
+                &mut Visited::new(),
                 &mut right_entries,
             );
         }
 
-        let mut left_groups: IndexMap<&str, Vec<Entry<'a>>> = IndexMap::new();
-        for entry in left_entries {
-            left_groups
-                .entry(entry.field.response_key())
-                .or_default()
-                .push(entry);
-        }
-        let mut right_groups: IndexMap<&str, Vec<Entry<'a>>> = IndexMap::new();
-        for entry in right_entries {
-            right_groups
-                .entry(entry.field.response_key())
-                .or_default()
-                .push(entry);
-        }
+        let left_groups = group_entries(left_entries);
+        let right_groups = group_entries(right_entries);
 
         for (key, left_group) in &left_groups {
-            let Some(right_group) = right_groups.get(key) else {
+            let Some((_, right_group)) = right_groups.iter().find(|(known, _)| known == key) else {
                 continue;
             };
             for left_entry in left_group {
@@ -217,16 +251,10 @@ impl<'a> State<'a, '_> {
     }
 
     fn check_selection_set(&mut self, parent: &'a Type, selection_set: &'a SelectionSet<'a>) {
-        let mut entries = Vec::new();
-        self.collect(parent, selection_set, &mut HashSet::new(), &mut entries);
+        let mut entries = Entries::new();
+        self.collect(parent, selection_set, &mut Visited::new(), &mut entries);
 
-        let mut groups: IndexMap<&str, Vec<Entry<'a>>> = IndexMap::new();
-        for entry in entries {
-            groups
-                .entry(entry.field.response_key())
-                .or_default()
-                .push(entry);
-        }
+        let groups = group_entries(entries);
         for (key, group) in &groups {
             for left in 0..group.len() {
                 for right in (left + 1)..group.len() {
