@@ -569,7 +569,17 @@ impl Definitions {
                             )
                         }));
                     }
-                    (RawType::InputObject { fields, .. }, TypeExtensionKind::InputObject(data)) => {
+                    (
+                        RawType::InputObject { fields, one_of, .. },
+                        TypeExtensionKind::InputObject(data),
+                    ) => {
+                        if extension
+                            .directives
+                            .iter()
+                            .any(|directive| directive.name == "oneOf")
+                        {
+                            *one_of = true;
+                        }
                         fields.extend(data.fields.iter().filter_map(|field| {
                             match input_value(field) {
                                 Ok(field) => Some(field),

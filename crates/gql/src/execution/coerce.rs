@@ -792,7 +792,10 @@ fn coerce_input_object_literal(
 
         if node.is_none() || missing_variable {
             if let Some(default) = &field.default_value {
-                coerced.insert(field_name.clone(), default.clone());
+                path.push(field_name.to_string());
+                let value = coerce_input_value(schema, default, &field.ty, path);
+                path.pop();
+                coerced.insert(field_name.clone(), value?);
             } else if field.ty.is_non_null() {
                 if missing_variable {
                     if let Some(ast::Value::Variable(name)) = node {

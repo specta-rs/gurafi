@@ -23,24 +23,22 @@ fn run_vars(schema: &Schema, query: &str, variables: Object) -> Response {
     ))
 }
 
-fn echo_input_field(name: &'static str, ty: TypeRef) -> Field {
-    Field::new(name, ty).resolve(move |context| {
-        Box::pin(async move { Ok(context.args.get("arg").cloned().unwrap_or(Value::Null)) })
-    })
-}
-
-fn echo_arg_field(name: &'static str, ty: TypeRef) -> Field {
-    Field::new(name, ty).resolve(move |context| {
-        Box::pin(async move {
-            Ok(context
-                .args
-                .get("arg")
-                .and_then(Value::as_object)
-                .and_then(|object| object.get("xs"))
-                .cloned()
-                .unwrap_or(Value::Null))
+/// A field `name(arg: <argument_type>): <return_type>` whose resolver echoes the inner input
+/// object field it was given, so coercion results are observable from the client.
+fn echo_arg_field(name: &'static str, argument_type: TypeRef, return_type: TypeRef) -> Field {
+    Field::new(name, return_type)
+        .arg(InputValue::new("arg", argument_type))
+        .resolve(move |context| {
+            Box::pin(async move {
+                Ok(context
+                    .args
+                    .get("arg")
+                    .and_then(Value::as_object)
+                    .and_then(|object| object.get("xs"))
+                    .cloned()
+                    .unwrap_or(Value::Null))
+            })
         })
-    })
 }
 
 /// PROBE 1: an input-object field default is applied *uncoerced* when the request supplies an
@@ -56,7 +54,11 @@ fn probe_input_field_default_coercion() {
             InputObjectType::new("In")
                 .field(InputValue::new("xs", TypeRef::int().list()).default_value(Value::Int(1))),
         )
-        .object(ObjectType::new("Query").field(echo_arg_field("echo", TypeRef::int().list())))
+        .object(ObjectType::new("Query").field(echo_arg_field(
+            "echo",
+            TypeRef::named("In"),
+            TypeRef::int().list(),
+        )))
         .query("Query")
         .build()
         .expect("valid schema");
@@ -78,6 +80,26 @@ fn probe_input_field_default_coercion() {
         literal.data, variable.data,
         "literal and variable paths must coerce defaults identically"
     );
+}
+
+/// PROBE 1b: the same default applied through the *field argument* path (which does coerce).
+#[test]
+fn probe_argument_default_coercion() {
+    let schema = Schema::builder()
+        .input_object(
+            InputObjectType::new("In")
+                .field(InputValue::new("xs", TypeRef::int().list()).default_value(Value::Int(1))),
+        )
+        .object(ObjectType::new("Query").field(echo_arg_field(
+            "echo",
+            TypeRef::named("In"),
+            TypeRef::int().list(),
+        )))
+        .query("Query")
+        .build()
+        .expect("valid schema");
+    let response = run(&schema, "{ echo(arg: {xs: 5}) }");
+    println!("data={:?} errors={:?}", response.data, response.errors);
 }
 
 /// PROBE 2: interface field covariance where the subtype is another interface.
@@ -208,9 +230,10 @@ fn probe_introspection_nullability() {
     )
     .expect("valid schema");
     let query = r#"{
-      __type(name: "Search") { kind name fields { name } interfaces { name } possibleTypes { name } inputFields { name } enumValues { name } isOneOf }
-      __type2: __type(name: "Filter") { kind name fields { name } interfaces { name } possibleTypes { name } inputFields { name type { kind name } } isOneOf }
-      __type3: __type(name: "Date") { kind name fields { name } interfaces { name } possibleTypes { name } }
+      search: __type(name: "Search") { kind name fields { name } interfaces { name } possibleTypes { name } inputFields { name } enumValues { name } isOneOf }
+      filter: __type(name: "Filter") { kind name fields { name } interfaces { name } possibleTypes { name } inputFields { name type { kind name } } isOneOf }
+      date: __type(name: "Date") { kind name fields { name } interfaces { name } possibleTypes { name } }
+      list: __type(name: "User") { kind fields { name args { name } type { kind name ofType { kind name } } } }
       __schema { description types { name } }
     }"#;
     let response = run(&schema, query);

@@ -200,42 +200,42 @@ fn collect_spread_locations<'a>(
     }
 }
 
+/// Maximum selection depth of a selection set, relative to the set itself.
+///
+/// Fragments do not add a level; fields with sub-selections add one. Fragment depths are cached
+/// so a document where fragments spread each other repeatedly cannot make this check exponential.
 fn selection_depth<'a>(
     fragments: &HashMap<&'a str, &'a FragmentDefinition<'a>>,
     selection_set: &'a SelectionSet<'a>,
-    visited: &mut HashSet<&'a str>,
-    depth: usize,
+    cache: &mut HashMap<&'a str, usize>,
+    visiting: &mut HashSet<&'a str>,
 ) -> usize {
-    let mut max = depth;
+    let mut max = 0;
     for selection in &selection_set.items {
-        match selection {
-            Selection::Field(field) => {
-                if let Some(child) = &field.selection_set {
-                    max = max.max(selection_depth(fragments, child, visited, depth + 1));
-                }
-            }
+        let depth = match selection {
+            Selection::Field(field) => field.selection_set.as_ref().map_or(0, |child| {
+                1 + selection_depth(fragments, child, cache, visiting)
+            }),
             Selection::InlineFragment(fragment) => {
-                max = max.max(selection_depth(
-                    fragments,
-                    &fragment.selection_set,
-                    visited,
-                    depth,
-                ));
+                selection_depth(fragments, &fragment.selection_set, cache, visiting)
             }
             Selection::FragmentSpread(spread) => {
-                if !visited.insert(spread.name) {
-                    continue;
-                }
-                if let Some(fragment) = fragments.get(spread.name) {
-                    max = max.max(selection_depth(
-                        fragments,
-                        &fragment.selection_set,
-                        visited,
-                        depth,
-                    ));
+                if let Some(depth) = cache.get(spread.name) {
+                    *depth
+                } else if !visiting.insert(spread.name) {
+                    // A cycle is invalid; treat it as a leaf here and let the cycle rule report it.
+                    0
+                } else {
+                    let depth = fragments.get(spread.name).map_or(0, |fragment| {
+                        selection_depth(fragments, &fragment.selection_set, cache, visiting)
+                    });
+                    visiting.remove(spread.name);
+                    cache.insert(spread.name, depth);
+                    depth
                 }
             }
-        }
+        };
+        max = max.max(depth);
     }
     max
 }
@@ -647,11 +647,16 @@ impl<'a> Validator<'a> {
         if self.options.max_depth == 0 {
             return;
         }
+        let mut cache = HashMap::new();
         for operation in self.document.operations() {
-            let mut visited = HashSet::new();
-            if selection_depth(&self.fragments, &operation.selection_set, &mut visited, 1)
-                > self.options.max_depth
-            {
+            let mut visiting = HashSet::new();
+            let depth = 1 + selection_depth(
+                &self.fragments,
+                &operation.selection_set,
+                &mut cache,
+                &mut visiting,
+            );
+            if depth > self.options.max_depth {
                 self.push(
                     format!(
                         "Query depth exceeds the maximum allowed depth of {}.",

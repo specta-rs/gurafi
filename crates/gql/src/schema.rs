@@ -635,6 +635,15 @@ fn validate_arguments(
                 argument.name
             ));
         }
+        if argument.deprecation_reason.is_some()
+            && matches!(argument.ty, TypeRef::NonNull(_))
+            && argument.default_value.is_none()
+        {
+            errors.push(format!(
+                "Required argument \"{}\" of {owner} cannot be deprecated.",
+                argument.name
+            ));
+        }
     }
 }
 
@@ -944,6 +953,15 @@ fn validate_schema(schema: &Schema, errors: &mut SchemaError) {
                             input.name, field.name
                         ));
                     }
+                    if field.deprecation_reason.is_some()
+                        && matches!(field.ty, TypeRef::NonNull(_))
+                        && field.default_value.is_none()
+                    {
+                        errors.push(format!(
+                            "Required input field \"{}.{}\" cannot be deprecated.",
+                            input.name, field.name
+                        ));
+                    }
                     if input.one_of {
                         if matches!(field.ty, TypeRef::NonNull(_)) {
                             errors.push(format!(
@@ -1079,6 +1097,18 @@ pub fn is_output_subtype(schema: &Schema, sub: &TypeRef, sup: &TypeRef) -> bool 
                 (Type::Object(object), Type::Interface(_)) => schema.object_implements(object, sup),
                 (Type::Object(object), Type::Union(union)) => {
                     union.types.iter().any(|ty| ty == &object.name)
+                }
+                (Type::Interface(sub_interface), Type::Interface(_)) => {
+                    let mut stack = sub_interface.interfaces.clone();
+                    while let Some(name) = stack.pop() {
+                        if name.as_ref() == sup.as_ref() {
+                            return true;
+                        }
+                        if let Some(parent) = schema.interface_type(&name) {
+                            stack.extend(parent.interfaces.iter().cloned());
+                        }
+                    }
+                    false
                 }
                 _ => false,
             }
