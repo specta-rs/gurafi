@@ -785,6 +785,17 @@ fn validate_schema(schema: &Schema, errors: &mut SchemaError) {
                                                 Some(_) => {}
                                             }
                                         }
+                                        for (arg_name, child_arg) in &field.args {
+                                            if !parent_field.args.contains_key(arg_name)
+                                                && matches!(child_arg.ty, TypeRef::NonNull(_))
+                                                && child_arg.default_value.is_none()
+                                            {
+                                                errors.push(format!(
+                                                    "Interface field \"{}.{field_name}\" adds required argument \"{arg_name}\" which is not present on \"{}.{field_name}\".",
+                                                    interface.name, parent.name
+                                                ));
+                                            }
+                                        }
                                         if !is_output_subtype(schema, &field.ty, &parent_field.ty)
                                         {
                                             errors.push(format!(

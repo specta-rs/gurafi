@@ -24,17 +24,15 @@ by a higher-level crate such as [`gurafi`](https://docs.rs/gurafi), and served b
 use gql::{Field, ObjectType, Schema, TypeRef, Value};
 
 let mut builder = Schema::builder();
-builder
-    .add_type(
-        ObjectType::new("Query")
-            .field(Field::new("hello", TypeRef::string().non_null()).resolve(|_| {
-                Box::pin(async { Ok(Value::from("world")) })
-            }))
-            .into(),
-    )
-    .query("Query");
+builder.add_type(
+    ObjectType::new("Query")
+        .field(Field::new("hello", TypeRef::string().non_null()).resolve(|_| {
+            Box::pin(async { Ok(Value::from("world")) })
+        }))
+        .into(),
+);
 
-let schema = builder.build().expect("valid schema");
+let schema = builder.query("Query").build().expect("valid schema");
 let response = futures::executor::block_on(gql::execute(
     &schema,
     gql::Request::new("{ hello }"),
