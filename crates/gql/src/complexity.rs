@@ -215,7 +215,7 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
 
             match selection {
                 ast::Selection::Field(field) => {
-                    merge_field(output, index, field, scope);
+                    merge_field(self.schema, output, index, field, scope);
                 }
                 ast::Selection::FragmentSpread(spread) => {
                     if active_fragments.contains(&spread.name) {
@@ -243,7 +243,7 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
                     let key = (spread.name, effective_scope.clone());
                     let cached = self.fragment_cache.get(&key).cloned();
                     if let Some(fields) = cached {
-                        merge_all(output, index, &fields);
+                        merge_all(self.schema, output, index, &fields);
                         continue;
                     }
 
@@ -260,7 +260,7 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
                     active_fragments.pop();
                     result?;
                     self.fragment_cache.insert(key, fields.clone());
-                    merge_all(output, index, &fields);
+                    merge_all(self.schema, output, index, &fields);
                 }
                 ast::Selection::InlineFragment(fragment) => {
                     let effective_scope = match fragment.type_condition {
@@ -376,7 +376,20 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
     }
 }
 
+/// Prefer the most concrete scope when the same response key is selected through several
+/// fragments. `item` selected on `Node` and again on `User` must be analysed with `User`'s fields,
+/// otherwise fields only present on `User` are invisible to the cost estimate.
+fn refine_scope(schema: &Schema, current: &mut String, candidate: &str) {
+    if schema.object_type(current).is_some() {
+        return;
+    }
+    if schema.object_type(candidate).is_some() {
+        *current = candidate.to_owned();
+    }
+}
+
 fn merge_field<'source, 'document>(
+    schema: &Schema,
     output: &mut Vec<CollectedField<'source, 'document>>,
     index: &mut FxHashMap<&'source str, usize>,
     field: &'document ast::Field<'source>,
@@ -386,6 +399,7 @@ fn merge_field<'source, 'document>(
     if let Some(existing) = index.get(response_key).copied() {
         let collected = &mut output[existing];
         // Validation guarantees that fields merged under one response key have the same name.
+        refine_scope(schema, &mut collected.scope, scope);
         if let Some(selection_set) = &field.selection_set {
             collected.selections.extend(selection_set.items.iter());
         }
@@ -405,6 +419,7 @@ fn merge_field<'source, 'document>(
 }
 
 fn merge_all<'source, 'document>(
+    schema: &Schema,
     output: &mut Vec<CollectedField<'source, 'document>>,
     index: &mut FxHashMap<&'source str, usize>,
     fields: &[CollectedField<'source, 'document>],
@@ -412,6 +427,7 @@ fn merge_all<'source, 'document>(
     for field in fields {
         if let Some(existing) = index.get(field.response_key).copied() {
             let collected = &mut output[existing];
+            refine_scope(schema, &mut collected.scope, &field.scope);
             collected
                 .selections
                 .extend(field.selections.iter().copied());

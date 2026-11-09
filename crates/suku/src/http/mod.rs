@@ -358,6 +358,19 @@ where
     F: FnOnce(ContextRequest) -> Fut + Send,
     Fut: Future<Output = Result<Context, HttpError>> + Send,
 {
+    // GET parameters are a request body too. Without this check a client could put an arbitrarily
+    // large query in the URL and bypass `max_body_bytes`.
+    let max_query_bytes = config
+        .max_body_bytes
+        .unwrap_or_else(|| server.max_body_bytes_limit());
+    if max_query_bytes != 0 && parts.uri.query().map_or(0, str::len) > max_query_bytes {
+        return request_error(
+            accept,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("Request query string exceeds the {max_query_bytes} byte limit."),
+        );
+    }
+
     // Authentication runs before GraphiQL. The page is static, but an operator who protects the
     // endpoint expects the docs and its API surface to be protected too. The context itself is
     // discarded for the HTML response.

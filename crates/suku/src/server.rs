@@ -389,6 +389,11 @@ async fn timed_subscribe<F>(
 where
     F: std::future::Future<Output = Result<gql::SubscriptionResponse, gql::Response>>,
 {
+    // `tokio::time` panics without a runtime; core `Server` execution must still work under a
+    // plain futures executor. Without a reactor we fall back to gql's cooperative deadline.
+    if tokio::runtime::Handle::try_current().is_err() {
+        return future.await;
+    }
     match tokio::time::timeout(timeout, future).await {
         Ok(response) => response,
         Err(_) => Err(gql::Response::error(gql::GraphQLError::new(format!(
@@ -413,6 +418,9 @@ async fn timed<F>(timeout: Duration, future: F) -> gql::Response
 where
     F: std::future::Future<Output = gql::Response>,
 {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return future.await;
+    }
     match tokio::time::timeout(timeout, future).await {
         Ok(response) => response,
         Err(_) => gql::Response::error(gql::GraphQLError::new(format!(
