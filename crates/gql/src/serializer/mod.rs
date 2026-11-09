@@ -8,6 +8,7 @@
 //!  - `erased_serde` has not reached 1.0 yet so we don't want it in our public API.
 //!
 
+mod adapter;
 mod owned_serializer;
 mod serialize_map;
 mod serialize_seq;
@@ -17,11 +18,11 @@ mod serialize_tuple;
 mod serialize_tuple_struct;
 mod serialize_tuple_variant;
 mod serializer;
-
-// This is hidden as an end-user shouldn't ever need it but it's public in-case they need to refer to it.
-#[doc(hidden)]
-pub use owned_serializer::AnyOwnedSerializer;
+mod traits;
 
 pub use owned_serializer::OwnedSerializer;
 pub use serialize_map::SerializeMap;
 pub use serializer::Serializer;
+
+pub(crate) use adapter::SerdeAdapter;
+pub(crate) use traits::{MapImpl, SeqImpl, SerializerImpl};

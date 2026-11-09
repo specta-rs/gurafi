@@ -21,11 +21,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 serde = { version = "1.0.193", default-features = false }
 
 # Private dependencies - MUST NEVER be in public API!!!!
-# TODO: Migrate back to the releases once the required changes land upstream.
-# https://github.com/dtolnay/erased-serde/pull/102
-erased-serde = { git = "https://github.com/gurafi/erased-serde", rev = "29c475a1e1e425d1a850579d4a34eab0a27ea3b5" }
-# TODO: I hate that this is required.
-#       It's due to the Serde's low-level API not being able to express 2D types.
-serde-value = { git = "https://github.com/gurafi/serde-value", rev = "a3c7d1e70bd3feb5c2eb62527748524dcbb358ec" }
+erased-serde = "0.4.11"
 
 # graphql-parser = "0.4.0"
+
+[dev-dependencies]
+serde_json.workspace = true
