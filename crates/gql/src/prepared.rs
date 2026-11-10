@@ -260,7 +260,15 @@ impl PreparedQuery {
         options: &ExecutionOptions,
     ) -> Response {
         let prepared = self.inner.cell.borrow_dependent();
-        execution::execute_prepared(&self.inner.schema, prepared, variables, options).await
+        execution::execute_prepared(
+            &self.inner.schema,
+            prepared,
+            self.inner.operation_name.clone(),
+            &self.inner.root_type,
+            variables,
+            options,
+        )
+        .await
     }
 
     /// Start a prepared subscription.
@@ -283,6 +291,7 @@ impl PreparedQuery {
         execution::subscribe_prepared(
             &self.inner.schema,
             prepared,
+            self.inner.operation_name.clone(),
             variables,
             options,
             move |_context, timeout| prepared_event_handler(inner, timeout),

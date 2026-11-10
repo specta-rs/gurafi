@@ -22,6 +22,7 @@ use crate::{
 
 use super::{
     AuthorizationContext, ExecutionContext, ExecutionOptions, Request, coerce, collect, executor,
+    prepared::PreparedExecution,
 };
 
 /// A subscription's event stream.
@@ -82,6 +83,7 @@ pub(crate) async fn subscribe(
         operation,
         request.variables,
         options,
+        None,
         move |_context, timeout| {
             let query = Arc::clone(&query);
             let operation_name = operation_name.clone();
@@ -111,12 +113,14 @@ pub(crate) async fn subscribe(
 /// `make_event_handler` builds the per-event executor once. Normal requests hand back a closure
 /// that re-parses the query for every event (the response stream is `'static`); prepared requests
 /// hand back one that reuses the prepared document.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn subscribe_document<F>(
     schema: &Schema,
     document: &ast::Document<'_>,
     operation: &ast::OperationDefinition<'_>,
     request_variables: Option<&Object>,
     options: &ExecutionOptions,
+    prepared: Option<PreparedExecution<'_>>,
     make_event_handler: F,
 ) -> Result<SubscriptionResponse, Response>
 where
@@ -128,29 +132,40 @@ where
         )));
     }
 
-    let variables =
-        coerce::coerce_variable_values(schema, operation, request_variables).map_err(|errors| {
-            Response {
-                data: None,
-                errors,
-                extensions: None,
-            }
-        })?;
+    let variables = match prepared.as_ref().and_then(|prepared| prepared.variables) {
+        Some(compiled) => compiled.coerce(schema, request_variables),
+        None => coerce::coerce_variable_values(schema, operation, request_variables),
+    }
+    .map_err(|errors| Response {
+        data: None,
+        errors,
+        extensions: None,
+    })?;
 
-    complexity::analyze_operation(
-        schema,
-        document,
-        operation,
-        &variables.values,
-        &ComplexityOptions {
-            list_factor: options.list_complexity,
-            field_cost: 1,
-            max_complexity: options.max_complexity,
-            max_depth: options.max_depth,
-            max_breadth: options.max_breadth,
-        },
-    )
-    .map_err(Response::error)?;
+    // A prepared document's bound can prove the request limits, so setup only runs the exact
+    // analysis when that bound is unknown or too high.
+    let needs_exact_analysis = match prepared.as_ref() {
+        Some(prepared) => {
+            executor::prepared_needs_exact_analysis(prepared.static_complexity, options)
+        }
+        None => true,
+    };
+    if needs_exact_analysis {
+        complexity::analyze_operation(
+            schema,
+            document,
+            operation,
+            &variables.values,
+            &ComplexityOptions {
+                list_factor: options.list_complexity,
+                field_cost: 1,
+                max_complexity: options.max_complexity,
+                max_depth: options.max_depth,
+                max_breadth: options.max_breadth,
+            },
+        )
+        .map_err(Response::error)?;
+    }
 
     let Some(subscription_type) = schema.subscription_type() else {
         return Err(Response::error(GraphQLError::new(
@@ -159,10 +174,15 @@ where
     };
     let subscription_type = subscription_type.clone();
 
+    let operation_name = prepared
+        .as_ref()
+        .and_then(|prepared| prepared.operation_name.clone())
+        .or_else(|| operation.name.map(Arc::from));
+
     let context = ExecutionContext {
         schema: schema.clone(),
         user_data: options.context.clone(),
-        operation_name: operation.name.map(Arc::from),
+        operation_name,
         variables: variables.values,
         introspection: options.introspection,
         authorizer: options.authorizer.clone(),

@@ -444,3 +444,192 @@ fn prepared_reports_operation_root_errors() {
     assert!(matches!(error, PreparedQueryError::Parse(_)));
     assert!(!matches!(error, PreparedQueryError::Validation(errors) if errors.is_empty()));
 }
+
+fn run_with(
+    schema: &Schema,
+    source: &str,
+    variables: Option<&Object>,
+    options: &ExecutionOptions,
+) -> Response {
+    block_on(gql::execute(
+        schema,
+        Request {
+            query: source,
+            operation_name: None,
+            variables,
+        },
+        options,
+    ))
+}
+
+fn error_messages(response: &Response) -> Vec<&str> {
+    response
+        .errors
+        .iter()
+        .map(gql::GraphQLError::message)
+        .collect()
+}
+
+/// Prepared execution must reproduce the normal path's limit decisions for every limit shape.
+#[test]
+fn prepared_matches_normal_complexity_limits() {
+    let schema = schema();
+    let variables = Object::from_fields([("show", Value::Boolean(true))]);
+    let sources = [
+        "{ hello numbers }",
+        r#"{ user(id: "1") { friend { friend { name } } } }"#,
+        r#"{ user(id: "1") { ...F friend { name } } } fragment F on User { id tags }"#,
+        r#"{ a: hello b: hello c: hello d: numbers }"#,
+        r#"query Limits($show: Boolean!) { user(id: "1") { name @include(if: $show) friend @skip(if: $show) { id } } }"#,
+    ];
+    // `max_depth` is enforced by validation on the normal path before complexity analysis runs,
+    // so its diagnostic can differ from the prepared path's. Every other limit must match exactly;
+    // depth is checked separately below.
+    let limit_sets = [
+        (0usize, 0u32, 0usize),
+        (0, 1, 1),
+        (0, 2, 2),
+        (0, 5, 3),
+        (0, 50, 10),
+        (0, 1000, 32),
+    ];
+
+    for source in sources {
+        let prepared = PreparedQuery::new(&schema, "limits", source, None).expect("prepared");
+        for (depth, complexity, breadth) in limit_sets {
+            let options = options()
+                .root_value(root_value())
+                .max_depth(depth)
+                .max_complexity(complexity)
+                .max_breadth(breadth);
+            let normal = run_with(&schema, source, Some(&variables), &options);
+            let after = block_on(prepared.execute(Some(&variables), &options));
+            assert_eq!(
+                error_messages(&normal),
+                error_messages(&after),
+                "limits {depth}/{complexity}/{breadth} differ for {source}"
+            );
+            assert_eq!(normal.data, after.data, "data differs for {source}");
+        }
+    }
+
+    // A depth limit rejects on both paths, even though the normal path reports it from validation.
+    let source = r#"{ user(id: "1") { friend { friend { name } } } }"#;
+    let prepared = PreparedQuery::new(&schema, "depth", source, None).expect("prepared");
+    let options = options().max_depth(2);
+    let normal = run_with(&schema, source, Some(&variables), &options);
+    let after = block_on(prepared.execute(Some(&variables), &options));
+    assert!(!normal.errors.is_empty());
+    assert!(!after.errors.is_empty());
+    assert_eq!(normal.data, None);
+    assert_eq!(after.data, None);
+}
+
+/// The conservative bound ignores `@skip`/`@include`; when it does not fit, execution must fall
+/// back to the exact analysis instead of rejecting a query the normal path accepts.
+#[test]
+fn prepared_falls_back_when_the_static_bound_is_too_high() {
+    let schema = schema();
+    let source = r#"query Q($skip: Boolean!) { user(id: "1") { name @skip(if: $skip) } }"#;
+    let variables = Object::from_fields([("skip", Value::Boolean(true))]);
+    let options = options().root_value(root_value()).max_complexity(1);
+
+    let normal = run_with(&schema, source, Some(&variables), &options);
+    assert!(normal.errors.is_empty(), "{:?}", normal.errors);
+
+    let prepared = PreparedQuery::new(&schema, "skip", source, None).expect("prepared");
+    let after = block_on(prepared.execute(Some(&variables), &options));
+    assert!(after.errors.is_empty(), "{:?}", after.errors);
+    assert_eq!(normal.data, after.data);
+}
+
+fn estimator_schema() -> Schema {
+    let mut builder = Schema::builder();
+    builder.add_type(
+        ObjectType::new("User")
+            .field(Field::new("id", TypeRef::id().non_null()))
+            .field(Field::new("name", TypeRef::string()))
+            .into(),
+    );
+    builder.add_type(
+        ObjectType::new("Query")
+            .field(
+                Field::new("users", TypeRef::named("User").non_null().list().non_null())
+                    .arg(InputValue::new("first", TypeRef::int()))
+                    .complexity(|args| {
+                        2 + args
+                            .get("first")
+                            .and_then(Value::as_i32)
+                            .unwrap_or(0)
+                            .max(0) as u32
+                    })
+                    .resolve(|_| Box::pin(async { Ok(Value::List(Vec::new())) })),
+            )
+            .into(),
+    );
+    builder.query("Query").build().expect("estimation schema")
+}
+
+/// A custom estimator can read argument values supplied by the request, so those operations must
+/// always take the exact per-request analysis even when prepared.
+#[test]
+fn prepared_uses_the_exact_analysis_for_field_estimators() {
+    let schema = estimator_schema();
+    let source = "query Q($first: Int) { users(first: $first) { name } }";
+    let options = ExecutionOptions::default().max_complexity(20);
+
+    for first in [1, 1000] {
+        let variables = Object::from_fields([("first", Value::Int(first))]);
+        let normal = run_with(&schema, source, Some(&variables), &options);
+        let prepared = PreparedQuery::new(&schema, "estimated", source, None).expect("prepared");
+        let after = block_on(prepared.execute(Some(&variables), &options));
+
+        assert_eq!(error_messages(&normal), error_messages(&after));
+        let rejected = |response: &Response| {
+            response
+                .errors
+                .iter()
+                .any(|error| error.message().contains("complexity"))
+        };
+        assert_eq!(rejected(&normal), rejected(&after));
+        assert_eq!(rejected(&normal), first != 1, "{:?}", normal.errors);
+    }
+}
+
+/// Prepared execution must not weaken variable coercion: invalid request values are still
+/// reported, with the same message as the normal path.
+#[test]
+fn prepared_still_coerces_and_validates_variables() {
+    let schema = schema();
+    let source = "query Person($id: ID!, $include: Boolean = true) { user(id: $id) { name @include(if: $include) } }";
+    let prepared = PreparedQuery::new(&schema, "variables", source, None).expect("prepared");
+
+    let invalid = Object::from_fields([
+        ("id", Value::Null),
+        ("include", Value::from("not a boolean")),
+    ]);
+    let normal = run_with(&schema, source, Some(&invalid), &options());
+    let after = block_on(prepared.execute(Some(&invalid), &options()));
+    assert_eq!(error_messages(&normal), error_messages(&after));
+    assert!(!after.errors.is_empty());
+    assert_eq!(after.data, None);
+
+    let missing = Object::new();
+    let normal = run_with(&schema, source, Some(&missing), &options());
+    let after = block_on(prepared.execute(Some(&missing), &options()));
+    assert_eq!(error_messages(&normal), error_messages(&after));
+    assert!(!after.errors.is_empty());
+}
+
+#[test]
+fn prepared_execute_future_is_send() {
+    fn assert_send<T: Send>(value: T) -> T {
+        value
+    }
+
+    let schema = schema();
+    let prepared = PreparedQuery::new(&schema, "hello", "{ hello }", None).expect("prepared");
+    let options = options();
+    let response = block_on(assert_send(prepared.execute(None, &options)));
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+}

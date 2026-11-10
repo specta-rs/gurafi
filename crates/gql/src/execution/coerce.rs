@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::{
     Object, Value, ast,
-    error::GraphQLError,
+    error::{GraphQLError, Location},
     schema::Schema,
     types::{EnumType, Field, InputObjectType, InputValue, ScalarType, Type, TypeRef},
 };
@@ -25,6 +25,126 @@ use super::selection::type_ref;
 pub struct CoercedVariables {
     /// The coerced values.
     pub values: Object,
+}
+
+/// Variable definitions compiled once for a prepared operation.
+///
+/// Preparing a query splits each definition into its fixed parts — the name, the schema type and
+/// the coerced default — from the per-request work, which is only coercing the values the request
+/// actually supplies. The compiled form reproduces [`coerce_variable_values`] exactly; compilation
+/// fails whenever a definition relies on something validation should have rejected, in which case
+/// the caller keeps the general path.
+pub(crate) struct CompiledVariables {
+    definitions: Vec<CompiledVariable>,
+}
+
+struct CompiledVariable {
+    name: Arc<str>,
+    ty: TypeRef,
+    default: Option<Value>,
+    location: Location,
+}
+
+impl CompiledVariables {
+    /// Compile an operation's variable definitions.
+    ///
+    /// Returns `Err(())` rather than an error value: a prepared document was already validated, so
+    /// a definition that cannot be compiled is a reason to fall back, not a client-facing error.
+    pub(crate) fn compile(
+        schema: &Schema,
+        operation: &ast::OperationDefinition<'_>,
+    ) -> Result<Self, ()> {
+        let mut definitions = Vec::with_capacity(operation.variables.len());
+        for definition in &operation.variables {
+            let ty = type_ref(&definition.ty);
+            if schema.get_type(ty.named_type()).is_none() {
+                return Err(());
+            }
+            let default = match &definition.default_value {
+                Some(default) => Some(coerce_literal(schema, default, &ty, None).map_err(|_| ())?),
+                None => None,
+            };
+            definitions.push(CompiledVariable {
+                name: Arc::from(definition.name),
+                ty,
+                default,
+                location: definition.location,
+            });
+        }
+        Ok(Self { definitions })
+    }
+
+    /// Coerce request values against the compiled definitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns every coercion failure, one per invalid variable, exactly like
+    /// [`coerce_variable_values`].
+    pub(crate) fn coerce(
+        &self,
+        schema: &Schema,
+        inputs: Option<&Object>,
+    ) -> Result<CoercedVariables, Vec<GraphQLError>> {
+        let mut values = Object::with_capacity(self.definitions.len());
+        let mut errors = Vec::new();
+
+        for definition in &self.definitions {
+            match inputs.and_then(|inputs| inputs.get(definition.name.as_ref())) {
+                None => {
+                    if let Some(default) = &definition.default {
+                        // Variable names are unique in a validated operation, so the response map
+                        // needs no duplicate scan.
+                        values.push_unchecked(Arc::clone(&definition.name), default.clone());
+                    } else if definition.ty.is_non_null() {
+                        errors.push(
+                            GraphQLError::new(format!(
+                                "Variable \"${}\" of required type \"{}\" was not provided.",
+                                definition.name, definition.ty
+                            ))
+                            .at(definition.location),
+                        );
+                    }
+                    // A nullable variable that was not provided stays undefined, not null.
+                }
+                Some(input) if input.is_null() => {
+                    if definition.ty.is_non_null() {
+                        errors.push(
+                            GraphQLError::new(format!(
+                                "Variable \"${}\" of non-null type \"{}\" must not be null.",
+                                definition.name, definition.ty
+                            ))
+                            .at(definition.location),
+                        );
+                    } else {
+                        values.push_unchecked(Arc::clone(&definition.name), Value::Null);
+                    }
+                }
+                Some(input) => {
+                    let mut path = Vec::new();
+                    match coerce_input_value(schema, input, &definition.ty, &mut path) {
+                        Ok(value) => {
+                            values.push_unchecked(Arc::clone(&definition.name), value);
+                        }
+                        Err(error) => errors.push(
+                            GraphQLError::new(format!(
+                                "Variable \"${}\" got invalid value {}; {}",
+                                definition.name,
+                                render_value(input),
+                                error.message()
+                            ))
+                            .at(definition.location),
+                        ),
+                    }
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(CoercedVariables { values })
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 /// Coerce variable definitions against the supplied input values.

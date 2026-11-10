@@ -499,6 +499,278 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
     }
 }
 
+/// A conservative, variable-independent upper bound on an operation's limits.
+///
+/// A prepared query analyses its document once, at preparation time. That analysis cannot use the
+/// request's variables, so it deliberately over-estimates: every `@skip`/`@include` branch is
+/// counted, duplicate response keys are charged once per occurrence, and list multipliers are kept
+/// symbolic (one coefficient per list-nesting level) so a request can plug in its own
+/// [`ComplexityOptions::list_factor`] at execution time.
+///
+/// The bound is only an answer for limits it can prove: if any reachable field has a custom
+/// complexity estimator, whose result depends on runtime argument values, no bound is produced and
+/// the operation falls back to the exact per-request analysis.
+pub(crate) struct StaticComplexity {
+    /// `coefficients[i]` is the number of cost units multiplied by `list_factor^i`.
+    coefficients: SmallVec<[u64; 4]>,
+    /// Selection-set nesting depth, in the same unit as [`Complexity::depth`].
+    depth: usize,
+    /// The largest number of distinct response keys in any one selection set.
+    breadth: usize,
+}
+
+impl StaticComplexity {
+    /// Whether this bound proves the operation fits every configured limit.
+    ///
+    /// A `false` answer is not a rejection: it only means the exact analysis has to run so the
+    /// real cost can be compared (and, if it is too large, reported with the usual message).
+    pub(crate) fn within_limits(&self, options: &ComplexityOptions) -> bool {
+        if options.max_depth != 0 && self.depth > options.max_depth {
+            return false;
+        }
+        if options.max_breadth != 0 && self.breadth > options.max_breadth {
+            return false;
+        }
+        if options.max_complexity != 0 {
+            let mut cost = 0u64;
+            let mut factor = 1u64;
+            for coefficient in &self.coefficients {
+                cost = cost.saturating_add(coefficient.saturating_mul(factor));
+                factor = factor.saturating_mul(u64::from(options.list_factor));
+            }
+            if cost > u64::from(options.max_complexity) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Compute a conservative upper bound for an already selected operation.
+///
+/// Returns `None` when the bound cannot be proven (a custom complexity estimator, an unexpected
+/// expansion, an unresolved fragment or the analysis work limit). The caller then falls back to
+/// [`analyze_operation`] so behaviour is never weakened.
+pub(crate) fn static_bound(
+    schema: &Schema,
+    document: &ast::Document<'_>,
+    operation: &ast::OperationDefinition<'_>,
+) -> Option<StaticComplexity> {
+    let root = root_type_name(schema, operation.kind).ok()?;
+    let mut analyzer = StaticAnalyzer {
+        schema,
+        document,
+        work: 0,
+        breadth: 0,
+    };
+    let mut active_fragments = SmallVec::new();
+    let mut keys = SmallVec::new();
+    let bound = analyzer
+        .analyze_selection(
+            operation.selection_set.items.iter(),
+            &root,
+            1,
+            &mut active_fragments,
+            &mut keys,
+        )
+        .ok()?;
+    Some(StaticComplexity {
+        coefficients: bound.coefficients,
+        depth: bound.depth,
+        breadth: analyzer.breadth,
+    })
+}
+
+/// A cost expression grouped by list-nesting level, plus the depth seen so far.
+#[derive(Default)]
+struct StaticBound {
+    coefficients: SmallVec<[u64; 4]>,
+    depth: usize,
+}
+
+impl StaticBound {
+    fn add(&mut self, exponent: usize, amount: u64) {
+        if amount == 0 {
+            return;
+        }
+        if self.coefficients.len() <= exponent {
+            self.coefficients.resize(exponent + 1, 0);
+        }
+        self.coefficients[exponent] = self.coefficients[exponent].saturating_add(amount);
+    }
+
+    /// Fold a nested selection set's bound in, with `shift` list wrappers applied.
+    fn merge_shifted(&mut self, other: Self, shift: usize) {
+        for (exponent, coefficient) in other.coefficients.into_iter().enumerate() {
+            self.add(exponent + shift, coefficient);
+        }
+        self.depth = self.depth.max(other.depth);
+    }
+}
+
+struct StaticAnalyzer<'a, 'document, 'source> {
+    schema: &'a Schema,
+    document: &'document ast::Document<'source>,
+    work: u64,
+    breadth: usize,
+}
+
+impl<'a, 'document, 'source> StaticAnalyzer<'a, 'document, 'source> {
+    fn analyze_selection<I>(
+        &mut self,
+        items: I,
+        scope: &Arc<str>,
+        depth: usize,
+        active_fragments: &mut SmallVec<[&'source str; 8]>,
+        keys: &mut SmallVec<[&'source str; 16]>,
+    ) -> Result<StaticBound, ()>
+    where
+        I: IntoIterator<Item = &'document ast::Selection<'source>>,
+    {
+        let mut bound = StaticBound {
+            coefficients: SmallVec::new(),
+            depth,
+        };
+        for selection in items {
+            self.work = self.work.saturating_add(1);
+            if self.work > MAX_ANALYSIS_WORK {
+                return Err(());
+            }
+
+            match selection {
+                ast::Selection::Field(field) => {
+                    let response_key = field.response_key();
+                    if !keys
+                        .iter()
+                        .any(|known| crate::types::names_eq(known, response_key))
+                    {
+                        keys.push(response_key);
+                    }
+                    // Every field occurrence is charged; the exact analysis merges duplicates, so
+                    // charging each one can only over-estimate.
+                    bound.add(0, u64::from(FIELD_COST));
+
+                    let Some(selection_set) = &field.selection_set else {
+                        continue;
+                    };
+                    let definition = field_definition_on(self.schema.get_type(scope), field.name);
+                    if definition.is_some_and(|definition| definition.complexity.is_some()) {
+                        // The estimator may read argument values supplied by the request.
+                        return Err(());
+                    }
+                    let return_type = match definition {
+                        Some(definition) => Cow::Borrowed(&definition.ty),
+                        None => match meta_field_type(field.name) {
+                            Some(ty) => ty,
+                            // Same as the exact analysis: an unknown field is charged its base
+                            // cost and not descended into.
+                            None => continue,
+                        },
+                    };
+                    let shift = list_depth(&return_type);
+                    let named_type = return_type.named_type().clone();
+                    let mut child_keys = SmallVec::new();
+                    let inner = self.analyze_selection(
+                        selection_set.items.iter(),
+                        &named_type,
+                        depth.saturating_add(1),
+                        active_fragments,
+                        &mut child_keys,
+                    )?;
+                    self.breadth = self.breadth.max(distinct_keys(&child_keys));
+                    bound.merge_shifted(inner, shift);
+                }
+                ast::Selection::FragmentSpread(spread) => {
+                    let Some(fragment) = self.document.fragment(spread.name) else {
+                        return Err(());
+                    };
+                    if active_fragments.contains(&spread.name) {
+                        continue;
+                    }
+                    if active_fragments.len() >= MAX_FRAGMENT_DEPTH {
+                        return Err(());
+                    }
+                    let condition = self.fragment_scope(fragment.type_condition, scope);
+                    active_fragments.push(spread.name);
+                    let inner = self.analyze_selection(
+                        fragment.selection_set.items.iter(),
+                        &condition,
+                        depth,
+                        active_fragments,
+                        keys,
+                    );
+                    active_fragments.pop();
+                    bound.merge_shifted(inner?, 0);
+                }
+                ast::Selection::InlineFragment(fragment) => {
+                    let condition = match fragment.type_condition {
+                        Some(condition) => self.fragment_scope(condition, scope),
+                        None => Arc::clone(scope),
+                    };
+                    let inner = self.analyze_selection(
+                        fragment.selection_set.items.iter(),
+                        &condition,
+                        depth,
+                        active_fragments,
+                        keys,
+                    )?;
+                    bound.merge_shifted(inner, 0);
+                }
+            }
+        }
+        self.breadth = self.breadth.max(distinct_keys(keys));
+        Ok(bound)
+    }
+
+    /// The type a fragment's selections are looked up on.
+    ///
+    /// Applicability is deliberately not checked: including a fragment that cannot apply can only
+    /// raise the estimate. An unknown condition falls back to the enclosing scope, matching the
+    /// exact analysis' defensive behaviour.
+    fn fragment_scope(&self, condition: &'source str, parent: &Arc<str>) -> Arc<str> {
+        if condition == parent.as_ref() || self.schema.get_type(condition).is_none() {
+            return Arc::clone(parent);
+        }
+        Arc::from(condition)
+    }
+}
+
+/// The base cost execution charges for a field with no estimator.
+///
+/// `execute_operation` always analyses with `field_cost: 1`; keeping the constant named here
+/// avoids silently diverging if that ever changes.
+const FIELD_COST: u32 = 1;
+
+fn distinct_keys(keys: &[&str]) -> usize {
+    let mut distinct: SmallVec<[&str; 16]> = SmallVec::new();
+    for key in keys {
+        if !distinct
+            .iter()
+            .any(|known| crate::types::names_eq(known, key))
+        {
+            distinct.push(key);
+        }
+    }
+    distinct.len()
+}
+
+/// The number of list wrappers around a type, which is the exponent of its list multiplier.
+fn list_depth(ty: &TypeRef) -> usize {
+    let mut depth = 0usize;
+    let mut current = ty;
+    loop {
+        match current {
+            TypeRef::NonNull(inner) => current = inner,
+            TypeRef::List(inner) => {
+                depth += 1;
+                current = inner;
+            }
+            TypeRef::Named(_) => break,
+        }
+    }
+    depth
+}
+
 /// The number of distinct response keys in one collected selection set.
 ///
 /// `collected` keeps one entry per (response key, fragment scope) so cost accounting stays

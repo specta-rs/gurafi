@@ -10,13 +10,14 @@ use std::{sync::Arc, time::Instant};
 use crate::{
     Value,
     ast::{self, OperationKind},
+    complexity::{self, StaticComplexity},
     error::{GraphQLError, Response},
     schema::Schema,
     types::ObjectType,
 };
 
 use super::{
-    ExecutionContext, ExecutionOptions, executor,
+    ExecutionContext, ExecutionOptions, coerce, executor,
     subscription::{EventHandler, subscribe_document},
 };
 
@@ -32,6 +33,13 @@ pub(crate) struct PreparedDocument<'a> {
     /// The error normal validation would report for an introspection field when introspection is
     /// disabled. `None` when the document does not use `__schema` or `__type` at all.
     pub(crate) introspection_error: Option<GraphQLError>,
+    /// A conservative upper bound on the selected operation's cost, depth and breadth, computed
+    /// once because the document is fixed. `None` when no bound can be proven, in which case every
+    /// request runs the exact analysis.
+    pub(crate) static_complexity: Option<StaticComplexity>,
+    /// The selected operation's variable definitions, compiled once. `None` when they could not be
+    /// compiled, in which case the general per-request coercion path is used.
+    pub(crate) variables: Option<coerce::CompiledVariables>,
 }
 
 impl<'a> PreparedDocument<'a> {
@@ -52,6 +60,8 @@ impl<'a> PreparedDocument<'a> {
 pub(crate) async fn execute(
     schema: &Schema,
     prepared: &PreparedDocument<'_>,
+    operation_name: Option<Arc<str>>,
+    root_type: &ObjectType,
     request_variables: Option<&crate::Object>,
     options: &ExecutionOptions,
 ) -> Response {
@@ -63,10 +73,14 @@ pub(crate) async fn execute(
             "Internal error: the prepared query has no selected operation.",
         ));
     };
-    executor::execute_operation(
+    executor::execute_prepared_operation(
         schema,
         &prepared.document,
         operation,
+        operation_name,
+        root_type,
+        prepared.static_complexity.as_ref(),
+        prepared.variables.as_ref(),
         request_variables,
         options,
     )
@@ -153,6 +167,21 @@ pub(crate) fn build<'a>(
         Err(error) => return Err(BuildPreparedError::Operation(error)),
     };
 
+    // The document's expansion cannot change between requests, so derive the conservative
+    // complexity bound once and store it next to the document.
+    let static_complexity = match document.definitions.get(operation_index) {
+        Some(ast::Definition::Operation(operation)) => {
+            complexity::static_bound(schema, &document, operation)
+        }
+        _ => None,
+    };
+    let variables = match document.definitions.get(operation_index) {
+        Some(ast::Definition::Operation(operation)) => {
+            coerce::CompiledVariables::compile(schema, operation).ok()
+        }
+        _ => None,
+    };
+
     let introspection_error = if uses_introspection(&document) {
         validation::validate(
             schema,
@@ -173,6 +202,8 @@ pub(crate) fn build<'a>(
         document,
         operation_index,
         introspection_error,
+        static_complexity,
+        variables,
     })
 }
 
@@ -260,11 +291,22 @@ pub(crate) fn root_type(
     }
 }
 
+/// Precomputed metadata a prepared document can lend to the shared subscription setup.
+pub(crate) struct PreparedExecution<'a> {
+    /// The selected operation's name, interned once at preparation.
+    pub(crate) operation_name: Option<Arc<str>>,
+    /// The conservative limit bound computed at preparation.
+    pub(crate) static_complexity: Option<&'a StaticComplexity>,
+    /// The selected operation's compiled variable definitions.
+    pub(crate) variables: Option<&'a coerce::CompiledVariables>,
+}
+
 /// Start a subscription from a prepared document.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn subscribe(
     schema: &Schema,
     prepared: &PreparedDocument<'_>,
+    operation_name: Option<Arc<str>>,
     request_variables: Option<&crate::Object>,
     options: &ExecutionOptions,
     make_event_handler: impl FnOnce(Arc<ExecutionContext>, Option<std::time::Duration>) -> EventHandler,
@@ -277,12 +319,18 @@ pub(crate) async fn subscribe(
             "Internal error: the prepared query has no selected operation.",
         )));
     };
+    let execution = PreparedExecution {
+        operation_name,
+        static_complexity: prepared.static_complexity.as_ref(),
+        variables: prepared.variables.as_ref(),
+    };
     subscribe_document(
         schema,
         &prepared.document,
         operation,
         request_variables,
         options,
+        Some(execution),
         make_event_handler,
     )
     .await

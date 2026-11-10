@@ -24,7 +24,7 @@ use smallvec::SmallVec;
 use crate::{
     Object, Value,
     ast::{self, OperationKind},
-    complexity::{self, ComplexityOptions},
+    complexity::{self, ComplexityOptions, StaticComplexity},
     error::{GraphQLError, Location, Path, PathSegment, Response},
     introspection,
     parser::parse_query,
@@ -201,11 +201,127 @@ pub(crate) async fn execute_operation<'doc>(
         )));
     };
 
+    finish_operation(
+        schema,
+        document,
+        operation,
+        operation.name.map(Arc::from),
+        root_type,
+        variables.values,
+        options,
+    )
+    .await
+}
+
+/// Execute an operation prepared ahead of time, reusing its precomputed metadata.
+///
+/// This is the prepared counterpart of [`execute_operation`]. The document, selected operation,
+/// operation name, root type and a conservative complexity bound are all fixed at preparation, so
+/// only the request's variables and options are consulted here. Variable coercion, authorization
+/// and all limits are still applied exactly as for normal execution.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_prepared_operation<'doc>(
+    schema: &'doc Schema,
+    document: &'doc ast::Document<'doc>,
+    operation: &'doc ast::OperationDefinition<'doc>,
+    operation_name: Option<Arc<str>>,
+    root_type: &'doc ObjectType,
+    static_complexity: Option<&StaticComplexity>,
+    compiled_variables: Option<&coerce::CompiledVariables>,
+    request_variables: Option<&Object>,
+    options: &ExecutionOptions,
+) -> Response {
+    let variables = match match compiled_variables {
+        Some(compiled) => compiled.coerce(schema, request_variables),
+        None => coerce::coerce_variable_values(schema, operation, request_variables),
+    } {
+        Ok(variables) => variables,
+        Err(errors) => {
+            return Response {
+                data: None,
+                errors,
+                extensions: None,
+            };
+        }
+    };
+
+    // A prepared document's expansion is fixed, so a bound computed at preparation proves the
+    // limits for every request whose options fall inside it. The exact analysis still runs when the
+    // bound is unknown or exceeds a limit, preserving the usual error messages.
+    if prepared_needs_exact_analysis(static_complexity, options) {
+        if let Err(error) = complexity::analyze_operation(
+            schema,
+            document,
+            operation,
+            &variables.values,
+            &ComplexityOptions {
+                list_factor: options.list_complexity,
+                field_cost: 1,
+                max_complexity: options.max_complexity,
+                max_depth: options.max_depth,
+                max_breadth: options.max_breadth,
+            },
+        ) {
+            return Response::error(error);
+        }
+    }
+
+    // Executing a subscription is always an error, exactly as on the normal path.
+    if operation.kind == OperationKind::Subscription {
+        return Response::error(GraphQLError::new(
+            "Subscriptions must be executed with `subscribe`, not `execute`.",
+        ));
+    }
+
+    finish_operation(
+        schema,
+        document,
+        operation,
+        operation_name,
+        root_type,
+        variables.values,
+        options,
+    )
+    .await
+}
+
+/// Whether a prepared operation still needs the exact per-request complexity analysis.
+pub(crate) fn prepared_needs_exact_analysis(
+    static_complexity: Option<&StaticComplexity>,
+    options: &ExecutionOptions,
+) -> bool {
+    if options.max_complexity == 0 && options.max_depth == 0 && options.max_breadth == 0 {
+        // No limit is configured, so there is nothing to reject.
+        return false;
+    }
+    match static_complexity {
+        Some(bound) => !bound.within_limits(&ComplexityOptions {
+            list_factor: options.list_complexity,
+            field_cost: 1,
+            max_complexity: options.max_complexity,
+            max_depth: options.max_depth,
+            max_breadth: options.max_breadth,
+        }),
+        None => true,
+    }
+}
+
+/// Build the request context and run an operation that is already known to be allowed.
+#[allow(clippy::too_many_arguments)]
+async fn finish_operation<'doc>(
+    schema: &'doc Schema,
+    document: &'doc ast::Document<'doc>,
+    operation: &'doc ast::OperationDefinition<'doc>,
+    operation_name: Option<Arc<str>>,
+    root_type: &'doc ObjectType,
+    variables: Object,
+    options: &ExecutionOptions,
+) -> Response {
     let context = ExecutionContext {
         schema: schema.clone(),
         user_data: options.context.clone(),
-        operation_name: operation.name.map(Arc::from),
-        variables: variables.values,
+        operation_name,
+        variables,
         introspection: options.introspection,
         authorizer: options.authorizer.clone(),
         max_errors: options.max_errors,
@@ -289,7 +405,7 @@ pub(crate) async fn run_operation<'doc>(
     ) {
         Some(result) => result,
         None => executor
-            .execute_fields(
+            .execute_fields_inner(
                 root_type,
                 &parent,
                 selection_sets,
@@ -383,6 +499,163 @@ impl<'doc> Executor<'doc> {
             .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
+    async fn execute_fields_inner<'s>(
+        &'s self,
+        object_type: &'doc ObjectType,
+        parent: &'s Value,
+        selection_sets: &'s [&'doc ast::SelectionSet<'doc>],
+        path: &'s mut Path,
+        errors: &'s mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> Result<Object, GraphQLError>
+    where
+        'doc: 's,
+    {
+        let mut collected = collect::collect_fields_multi(
+            &self.context.schema,
+            &self.fragments,
+            &self.context.variables,
+            object_type,
+            selection_sets,
+        )?;
+        let mut result = Object::with_capacity(collected.len());
+        if self.parallel
+            && collected.len() > 1
+            && self.try_execute_all_leaves(
+                object_type,
+                parent,
+                &mut collected,
+                path,
+                errors,
+                &mut result,
+            )?
+        {
+            return Ok(result);
+        }
+        if self.parallel && collected.len() > 1 {
+            // The batch lives on the heap so the boxed future below stays small enough to
+            // recurse safely.
+            let mut futures = Vec::with_capacity(collected.len());
+            for (response_key, nodes, field) in collected {
+                if self.expired() {
+                    return Err(GraphQLError::new(
+                        "The operation timed out before it could finish.",
+                    )
+                    .with_path(path.to_vec()));
+                }
+                // Leaf fields that need no resolver complete synchronously; `ready` keeps
+                // them in the same ordered batch as the asynchronous fields without boxing
+                // a future or cloning the path for each one.
+                let mut field_errors = Vec::new();
+                let inline = self.try_execute_leaf(
+                    object_type,
+                    parent,
+                    response_key,
+                    &nodes,
+                    field,
+                    path,
+                    &mut field_errors,
+                );
+                let future = match inline {
+                    Some((response_key, outcome)) => {
+                        Either::Left(ready((response_key, outcome, field_errors)))
+                    }
+                    None => {
+                        let mut field_path = path.clone();
+                        Either::Right(async move {
+                            let (response_key, outcome) = self
+                                .execute_field(
+                                    object_type,
+                                    parent,
+                                    response_key,
+                                    &nodes,
+                                    field,
+                                    &mut field_path,
+                                    &mut field_errors,
+                                    depth,
+                                )
+                                .await;
+                            (response_key, outcome, field_errors)
+                        })
+                    }
+                };
+                futures.push(future);
+            }
+            // `join_all` reaches the same concurrency as `buffered` whenever every sibling
+            // fits under the limit, and does not allocate the ordered-stream bookkeeping.
+            let max_concurrency = self.context.max_concurrency;
+            let outcomes: Vec<_> = if max_concurrency == 0 || futures.len() <= max_concurrency {
+                futures::future::join_all(futures).await
+            } else {
+                buffered(futures, max_concurrency).await
+            };
+            let mut bubble = None;
+            for (response_key, outcome, field_errors) in outcomes {
+                append_errors(errors, field_errors, self.context.max_errors);
+                match outcome {
+                    Ok(value) => result.push_unchecked(response_key, value),
+                    // A non-null field failed; keep collecting the other fields' errors, but
+                    // the object itself becomes null.
+                    Err(error) => {
+                        if bubble.is_none() {
+                            bubble = Some(error);
+                        }
+                    }
+                }
+            }
+            if let Some(error) = bubble {
+                return Err(error);
+            }
+            return Ok(result);
+        }
+        for (response_key, nodes, field) in collected {
+            // Mutations must keep document order, and a single field has no concurrency to
+            // gain.
+            if self.expired() {
+                return Err(
+                    GraphQLError::new("The operation timed out before it could finish.")
+                        .with_path(path.to_vec()),
+                );
+            }
+            let (response_key, outcome) = match self.try_execute_leaf(
+                object_type,
+                parent,
+                response_key,
+                &nodes,
+                field,
+                path,
+                errors,
+            ) {
+                Some(done) => done,
+                None => {
+                    self.execute_field(
+                        object_type,
+                        parent,
+                        response_key,
+                        &nodes,
+                        field,
+                        path,
+                        errors,
+                        depth,
+                    )
+                    .await
+                }
+            };
+            match outcome {
+                Ok(value) => {
+                    result.push_unchecked(response_key, value);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(result)
+    }
+
+    /// Boxed form of [`Self::execute_fields_inner`] for nested completion.
+    ///
+    /// The box is what bounds the recursive poll stack and breaks the future's type recursion:
+    /// `complete_object` is reachable from a field future, which is reachable from this function,
+    /// and naming a concrete `BoxFuture` here keeps that cycle finite.
     fn execute_fields<'s>(
         &'s self,
         object_type: &'doc ObjectType,
@@ -395,147 +668,8 @@ impl<'doc> Executor<'doc> {
     where
         'doc: 's,
     {
-        async move {
-            let mut collected = collect::collect_fields_multi(
-                &self.context.schema,
-                &self.fragments,
-                &self.context.variables,
-                object_type,
-                selection_sets,
-            )?;
-            let mut result = Object::with_capacity(collected.len());
-            if self.parallel
-                && collected.len() > 1
-                && self.try_execute_all_leaves(
-                    object_type,
-                    parent,
-                    &mut collected,
-                    path,
-                    errors,
-                    &mut result,
-                )?
-            {
-                return Ok(result);
-            }
-            if self.parallel && collected.len() > 1 {
-                // The batch lives on the heap so the boxed future below stays small enough to
-                // recurse safely.
-                let mut futures = Vec::with_capacity(collected.len());
-                for (response_key, nodes, field) in collected {
-                    if self.expired() {
-                        return Err(GraphQLError::new(
-                            "The operation timed out before it could finish.",
-                        )
-                        .with_path(path.to_vec()));
-                    }
-                    // Leaf fields that need no resolver complete synchronously; `ready` keeps
-                    // them in the same ordered batch as the asynchronous fields without boxing
-                    // a future or cloning the path for each one.
-                    let mut field_errors = Vec::new();
-                    let inline = self.try_execute_leaf(
-                        object_type,
-                        parent,
-                        response_key,
-                        &nodes,
-                        field,
-                        path,
-                        &mut field_errors,
-                    );
-                    let future = match inline {
-                        Some((response_key, outcome)) => {
-                            Either::Left(ready((response_key, outcome, field_errors)))
-                        }
-                        None => {
-                            let mut field_path = path.clone();
-                            Either::Right(async move {
-                                let (response_key, outcome) = self
-                                    .execute_field(
-                                        object_type,
-                                        parent,
-                                        response_key,
-                                        &nodes,
-                                        field,
-                                        &mut field_path,
-                                        &mut field_errors,
-                                        depth,
-                                    )
-                                    .await;
-                                (response_key, outcome, field_errors)
-                            })
-                        }
-                    };
-                    futures.push(future);
-                }
-                // `join_all` reaches the same concurrency as `buffered` whenever every sibling
-                // fits under the limit, and does not allocate the ordered-stream bookkeeping.
-                let max_concurrency = self.context.max_concurrency;
-                let outcomes: Vec<_> = if max_concurrency == 0 || futures.len() <= max_concurrency {
-                    futures::future::join_all(futures).await
-                } else {
-                    buffered(futures, max_concurrency).await
-                };
-                let mut bubble = None;
-                for (response_key, outcome, field_errors) in outcomes {
-                    append_errors(errors, field_errors, self.context.max_errors);
-                    match outcome {
-                        Ok(value) => result.push_unchecked(response_key, value),
-                        // A non-null field failed; keep collecting the other fields' errors, but
-                        // the object itself becomes null.
-                        Err(error) => {
-                            if bubble.is_none() {
-                                bubble = Some(error);
-                            }
-                        }
-                    }
-                }
-                if let Some(error) = bubble {
-                    return Err(error);
-                }
-                return Ok(result);
-            }
-            for (response_key, nodes, field) in collected {
-                // Mutations must keep document order, and a single field has no concurrency to
-                // gain.
-                if self.expired() {
-                    return Err(GraphQLError::new(
-                        "The operation timed out before it could finish.",
-                    )
-                    .with_path(path.to_vec()));
-                }
-                let (response_key, outcome) = match self.try_execute_leaf(
-                    object_type,
-                    parent,
-                    response_key,
-                    &nodes,
-                    field,
-                    path,
-                    errors,
-                ) {
-                    Some(done) => done,
-                    None => {
-                        self.execute_field(
-                            object_type,
-                            parent,
-                            response_key,
-                            &nodes,
-                            field,
-                            path,
-                            errors,
-                            depth,
-                        )
-                        .await
-                    }
-                };
-                match outcome {
-                    Ok(value) => {
-                        result.push_unchecked(response_key, value);
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            Ok(result)
-        }
-        .boxed()
+        self.execute_fields_inner(object_type, parent, selection_sets, path, errors, depth)
+            .boxed()
     }
 
     /// Complete a selection set made only of object properties.
