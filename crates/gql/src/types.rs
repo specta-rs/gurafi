@@ -252,6 +252,12 @@ pub struct ScalarType {
     pub(crate) serialize: Option<ScalarSerializeFn>,
     pub(crate) parse_value: Option<ScalarParseValueFn>,
     pub(crate) parse_literal: Option<ScalarParseLiteralFn>,
+    /// Whether `serialize` is one of the specification's built-in coercion functions.
+    ///
+    /// Execution may run the built-in functions more than once (a fast path that later falls back
+    /// re-completes a field), which is only sound for code the engine owns. Any scalar built or
+    /// customised by the user is not marked, so its function runs exactly once.
+    pub(crate) builtin: bool,
 }
 
 impl fmt::Debug for ScalarType {
@@ -279,7 +285,16 @@ impl ScalarType {
             serialize: None,
             parse_value: None,
             parse_literal: None,
+            builtin: false,
         }
+    }
+
+    /// Mark this scalar as carrying one of the specification's built-in coercion functions.
+    ///
+    /// Only the built-in constructors call this, and only after installing their own `serialize`.
+    fn builtin(mut self) -> Self {
+        self.builtin = true;
+        self
     }
 
     /// Set the description.
@@ -303,6 +318,9 @@ impl ScalarType {
         function: impl Fn(&Value) -> Result<Value, String> + Send + Sync + 'static,
     ) -> Self {
         self.serialize = Some(Arc::new(function));
+        // A user-provided (or user-replaced) function is not the built-in one, so the fast paths
+        // must not run it speculatively.
+        self.builtin = false;
         self
     }
 
@@ -343,6 +361,7 @@ impl ScalarType {
                 ast::Value::String(value) => Ok(Value::String(Arc::from(value.as_ref()))),
                 _ => Err("String cannot represent a non-string literal".into()),
             })
+            .builtin()
     }
 
     /// The built-in `Int` scalar.
@@ -364,6 +383,7 @@ impl ScalarType {
                     .map_err(|_| "Int cannot represent non 32-bit signed integer value".into()),
                 _ => Err("Int cannot represent a non-integer literal".into()),
             })
+            .builtin()
     }
 
     /// The built-in `Float` scalar.
@@ -389,6 +409,7 @@ impl ScalarType {
                 ast::Value::Int(value) => Ok(Value::Float(*value as f64)),
                 _ => Err("Float cannot represent a non-numeric literal".into()),
             })
+            .builtin()
     }
 
     /// The built-in `Boolean` scalar.
@@ -414,6 +435,7 @@ impl ScalarType {
                 ast::Value::Boolean(value) => Ok(Value::Boolean(*value)),
                 _ => Err("Boolean cannot represent a non-boolean literal".into()),
             })
+            .builtin()
     }
 
     /// The built-in `ID` scalar.
@@ -438,6 +460,7 @@ impl ScalarType {
                 ast::Value::Int(value) => Ok(Value::String(Arc::from(value.to_string()))),
                 _ => Err("ID cannot represent a non-string and non-integer literal".into()),
             })
+            .builtin()
     }
 
     /// The output coercion function, if one was registered.

@@ -35,6 +35,14 @@ use crate::{
 
 use super::{AuthorizationContext, ExecutionContext, ExecutionOptions, Request, coerce, collect};
 
+/// How many nested selection-set levels the synchronous default-completion path may enter.
+///
+/// Default-resolved objects need no `await`, so most of a response can be built without boxing a
+/// future per object. Recursing without bound would make the stack a function of the document's
+/// depth, so past this many levels completion falls back to the boxed asynchronous path — the same
+/// path (and the same stack bound) a document at the parser's depth limit already uses.
+const SYNC_DEPTH_LIMIT: usize = 12;
+
 /// A map of fragment definitions keyed by name, borrowed from the parsed document.
 ///
 /// Documents usually define only a handful of fragments, and execution looks them up once per
@@ -105,7 +113,6 @@ pub(crate) async fn execute(
         Ok(document) => document,
         Err(error) => return Response::error(error),
     };
-
     let validation_errors = validation::validate(
         schema,
         &document,
@@ -250,15 +257,29 @@ pub(crate) async fn run_operation<'doc>(
     };
     let mut path = Path::new();
     let mut errors = Vec::new();
-    let result = executor
-        .execute_fields(
-            root_type,
-            &parent,
-            std::slice::from_ref(&selection_set),
-            &mut path,
-            &mut errors,
-        )
-        .await;
+    let selection_sets = std::slice::from_ref(&selection_set);
+    let result = match executor.try_execute_fields_sync(
+        &root_type,
+        &parent,
+        selection_sets,
+        &mut path,
+        &mut errors,
+        0,
+    ) {
+        Some(result) => result,
+        None => {
+            executor
+                .execute_fields(
+                    root_type,
+                    &parent,
+                    selection_sets,
+                    &mut path,
+                    &mut errors,
+                    0,
+                )
+                .await
+        }
+    };
 
     let data = match result {
         Ok(object) => Some(Value::Object(Arc::new(object))),
@@ -361,6 +382,7 @@ pub(crate) async fn execute_subscription_event(
             first.location,
             &mut path,
             &mut errors,
+            0,
         )
         .await;
 
@@ -413,6 +435,7 @@ impl<'doc> Executor<'doc> {
         selection_sets: &'s [&'doc ast::SelectionSet<'doc>],
         path: &'s mut Path,
         errors: &'s mut Vec<GraphQLError>,
+        depth: usize,
     ) -> BoxFuture<'s, Result<Object, GraphQLError>>
     where
         'doc: 's,
@@ -425,7 +448,6 @@ impl<'doc> Executor<'doc> {
                 object_type.name.as_ref(),
                 selection_sets,
             )?;
-
             let mut result = Object::with_capacity(collected.len());
             if self.parallel
                 && collected.len() > 1
@@ -479,6 +501,7 @@ impl<'doc> Executor<'doc> {
                                         &nodes,
                                         &mut field_path,
                                         &mut field_errors,
+                                        depth,
                                     )
                                     .await;
                                 (response_key, outcome, field_errors)
@@ -540,6 +563,7 @@ impl<'doc> Executor<'doc> {
                             &nodes,
                             path,
                             errors,
+                            depth,
                         )
                         .await
                     }
@@ -667,7 +691,7 @@ impl<'doc> Executor<'doc> {
         let outcome = match default_property(label, field.name.as_ref(), parent) {
             Ok(value) => {
                 let value = property_value(value);
-                match self.complete_leaf(&value, &field.ty, label, location, path) {
+                match self.complete_leaf(&value, &field.ty, label, location, path, false) {
                     Some(outcome) => outcome,
                     None => {
                         path.pop();
@@ -689,6 +713,7 @@ impl<'doc> Executor<'doc> {
         Some((response_key, outcome))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_field<'s>(
         &'s self,
         object_type: Arc<ObjectType>,
@@ -697,6 +722,7 @@ impl<'doc> Executor<'doc> {
         nodes: &'s [&'doc ast::Field<'doc>],
         path: &'s mut Path,
         errors: &'s mut Vec<GraphQLError>,
+        depth: usize,
     ) -> BoxFuture<'s, (Arc<str>, Result<Value, GraphQLError>)>
     where
         'doc: 's,
@@ -721,7 +747,16 @@ impl<'doc> Executor<'doc> {
             path.push(PathSegment::Field(response_key.clone()));
 
             let outcome = self
-                .execute_field_inner(&object_type, field, parent, first, nodes, path, errors)
+                .execute_field_inner(
+                    &object_type,
+                    field,
+                    parent,
+                    first,
+                    nodes,
+                    path,
+                    errors,
+                    depth,
+                )
                 .await;
             path.pop();
             (response_key, outcome)
@@ -739,6 +774,7 @@ impl<'doc> Executor<'doc> {
         nodes: &[&'doc ast::Field<'doc>],
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
+        depth: usize,
     ) -> Result<Value, GraphQLError> {
         let location = first.location;
         let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 2]> = nodes
@@ -784,10 +820,10 @@ impl<'doc> Executor<'doc> {
             let outcome = match denial {
                 Some(error) => Err(error),
                 None => match self.resolve_meta(object_type, parent, first) {
-                    Ok(value) => match self.complete_leaf(&value, &ty, label, location, path) {
-                        Some(completed) => completed,
-                        None => {
-                            self.complete_field_value(
+                    Ok(value) => {
+                        match self.complete_leaf(&value, &ty, label, location, path, false) {
+                            Some(completed) => completed,
+                            None => match self.try_complete_field_value_sync(
                                 &value,
                                 &ty,
                                 label,
@@ -795,10 +831,25 @@ impl<'doc> Executor<'doc> {
                                 location,
                                 path,
                                 errors,
-                            )
-                            .await
+                                depth,
+                            ) {
+                                Some(completed) => completed,
+                                None => {
+                                    self.complete_field_value(
+                                        &value,
+                                        &ty,
+                                        label,
+                                        &selection_sets,
+                                        location,
+                                        path,
+                                        errors,
+                                        depth,
+                                    )
+                                    .await
+                                }
+                            },
                         }
-                    },
+                    }
                     Err(error) => Err(error),
                 },
             };
@@ -896,10 +947,10 @@ impl<'doc> Executor<'doc> {
         };
 
         let outcome = match resolved {
-            Ok(value) => match self.complete_leaf(&value, &field.ty, label, location, path) {
-                Some(completed) => completed,
-                None => {
-                    self.complete_field_value(
+            Ok(value) => {
+                match self.complete_leaf(&value, &field.ty, label, location, path, false) {
+                    Some(completed) => completed,
+                    None => match self.try_complete_field_value_sync(
                         &value,
                         &field.ty,
                         label,
@@ -907,10 +958,25 @@ impl<'doc> Executor<'doc> {
                         location,
                         path,
                         errors,
-                    )
-                    .await
+                        depth,
+                    ) {
+                        Some(completed) => completed,
+                        None => {
+                            self.complete_field_value(
+                                &value,
+                                &field.ty,
+                                label,
+                                &selection_sets,
+                                location,
+                                path,
+                                errors,
+                                depth,
+                            )
+                            .await
+                        }
+                    },
                 }
-            },
+            }
             Err(error) => Err(error),
         };
         finish_field(
@@ -928,6 +994,10 @@ impl<'doc> Executor<'doc> {
     /// Scalars and enums are by far the most common field type and never need to `await`
     /// anything, so resolving them inline avoids one boxed future (plus its allocation) per
     /// leaf field. Returning `None` means the type needs the general path.
+    ///
+    /// `sync_only` is set by the synchronous default-completion path, which may still abandon its
+    /// work and restart asynchronously. A custom scalar's `serialize` is caller-supplied code, so
+    /// that path refuses to run it (returning `None`) rather than risk running it twice.
     fn complete_leaf(
         &self,
         value: &Value,
@@ -935,6 +1005,7 @@ impl<'doc> Executor<'doc> {
         label: FieldLabel<'_>,
         location: Location,
         path: &mut Path,
+        sync_only: bool,
     ) -> Option<Result<Value, GraphQLError>> {
         let mut current = ty;
         let mut non_null = false;
@@ -960,6 +1031,11 @@ impl<'doc> Executor<'doc> {
         let completed = match definition {
             Type::Scalar(scalar) => {
                 let serialized = if let Some(serialize) = scalar.serialize_fn() {
+                    // A scalar the engine did not define may observe the call, and this path can
+                    // still restart asynchronously, so only the built-in functions are safe here.
+                    if sync_only && !scalar.builtin {
+                        return None;
+                    }
                     match serialize(value) {
                         Ok(value) => value,
                         Err(message) => {
@@ -1052,11 +1128,21 @@ impl<'doc> Executor<'doc> {
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
+        depth: usize,
     ) -> Result<Value, GraphQLError> {
         if !value.is_null() {
             if let Some(object) = self.plain_object(ty) {
                 return self
-                    .complete_object(object, value, label, selection_sets, location, path, errors)
+                    .complete_object(
+                        object,
+                        value,
+                        label,
+                        selection_sets,
+                        location,
+                        path,
+                        errors,
+                        depth,
+                    )
                     .await;
             }
             if let Some((object, items_non_null)) = self.object_list(ty) {
@@ -1070,12 +1156,22 @@ impl<'doc> Executor<'doc> {
                         location,
                         path,
                         errors,
+                        depth,
                     )
                     .await;
             }
         }
-        self.complete_value(value, ty, label, selection_sets, location, path, errors)
-            .await
+        self.complete_value(
+            value,
+            ty,
+            label,
+            selection_sets,
+            location,
+            path,
+            errors,
+            depth,
+        )
+        .await
     }
 
     /// The object type a list's items complete as, when every item is a plain object.
@@ -1119,6 +1215,7 @@ impl<'doc> Executor<'doc> {
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
+        depth: usize,
     ) -> Result<Value, GraphQLError> {
         let Value::List(items) = value else {
             return Err(located(
@@ -1152,6 +1249,7 @@ impl<'doc> Executor<'doc> {
                     location,
                     path,
                     errors,
+                    depth,
                 )
                 .await
             };
@@ -1190,12 +1288,22 @@ impl<'doc> Executor<'doc> {
         location: Location,
         path: &'s mut Path,
         errors: &'s mut Vec<GraphQLError>,
+        depth: usize,
     ) -> BoxFuture<'s, Result<Value, GraphQLError>>
     where
         'doc: 's,
     {
-        self.complete_value_inner(value, ty, label, selection_sets, location, path, errors)
-            .boxed()
+        self.complete_value_inner(
+            value,
+            ty,
+            label,
+            selection_sets,
+            location,
+            path,
+            errors,
+            depth,
+        )
+        .boxed()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1208,6 +1316,7 @@ impl<'doc> Executor<'doc> {
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
+        depth: usize,
     ) -> Result<Value, GraphQLError> {
         // Strip non-null wrappers up front instead of recursing through one future per wrapper.
         let mut current = ty;
@@ -1229,12 +1338,30 @@ impl<'doc> Executor<'doc> {
         }
         let completed = match current {
             TypeRef::List(inner) => {
-                self.complete_list(value, inner, label, selection_sets, location, path, errors)
-                    .await?
+                self.complete_list(
+                    value,
+                    inner,
+                    label,
+                    selection_sets,
+                    location,
+                    path,
+                    errors,
+                    depth,
+                )
+                .await?
             }
             TypeRef::Named(name) => {
-                self.complete_named(value, name, label, selection_sets, location, path, errors)
-                    .await?
+                self.complete_named(
+                    value,
+                    name,
+                    label,
+                    selection_sets,
+                    location,
+                    path,
+                    errors,
+                    depth,
+                )
+                .await?
             }
             TypeRef::NonNull(_) => {
                 return Err(located(
@@ -1268,6 +1395,7 @@ impl<'doc> Executor<'doc> {
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
+        depth: usize,
     ) -> Result<Value, GraphQLError> {
         let mut current = inner;
         let mut non_null = false;
@@ -1291,12 +1419,30 @@ impl<'doc> Executor<'doc> {
             // the completion future's size finite.
             TypeRef::List(_) => {
                 return self
-                    .complete_value(item, inner, label, selection_sets, location, path, errors)
+                    .complete_value(
+                        item,
+                        inner,
+                        label,
+                        selection_sets,
+                        location,
+                        path,
+                        errors,
+                        depth,
+                    )
                     .await;
             }
             TypeRef::Named(name) => {
-                self.complete_named(item, name, label, selection_sets, location, path, errors)
-                    .await?
+                self.complete_named(
+                    item,
+                    name,
+                    label,
+                    selection_sets,
+                    location,
+                    path,
+                    errors,
+                    depth,
+                )
+                .await?
             }
             TypeRef::NonNull(_) => {
                 return Err(located(
@@ -1326,6 +1472,7 @@ impl<'doc> Executor<'doc> {
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
+        depth: usize,
     ) -> Result<Value, GraphQLError> {
         let Value::List(items) = value else {
             return Err(located(
@@ -1352,12 +1499,22 @@ impl<'doc> Executor<'doc> {
                         location,
                         path,
                         errors,
+                        depth,
                     )
                     .await
                 }
                 _ => {
-                    self.complete_item(item, inner, label, selection_sets, location, path, errors)
-                        .await
+                    self.complete_item(
+                        item,
+                        inner,
+                        label,
+                        selection_sets,
+                        location,
+                        path,
+                        errors,
+                        depth,
+                    )
+                    .await
                 }
             };
             path.pop();
@@ -1385,6 +1542,7 @@ impl<'doc> Executor<'doc> {
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
+        depth: usize,
     ) -> Result<Value, GraphQLError> {
         let Some(definition) = self.context.schema.get_type(name) else {
             return Err(located(
@@ -1443,8 +1601,17 @@ impl<'doc> Executor<'doc> {
             },
             Type::Object(object) => {
                 let object = object.clone();
-                self.complete_object(object, value, label, selection_sets, location, path, errors)
-                    .await
+                self.complete_object(
+                    object,
+                    value,
+                    label,
+                    selection_sets,
+                    location,
+                    path,
+                    errors,
+                    depth,
+                )
+                .await
             }
             Type::Interface(_) | Type::Union(_) => {
                 if !matches!(value, Value::Object(_) | Value::External(_)) {
@@ -1461,8 +1628,17 @@ impl<'doc> Executor<'doc> {
                 let object = self
                     .resolve_abstract_type(name.as_ref(), value)
                     .map_err(|error| locate(error, path, location))?;
-                self.complete_object(object, value, label, selection_sets, location, path, errors)
-                    .await
+                self.complete_object(
+                    object,
+                    value,
+                    label,
+                    selection_sets,
+                    location,
+                    path,
+                    errors,
+                    depth,
+                )
+                .await
             }
             Type::InputObject(_) => Err(located(
                 format!("Field {label} has input object type \"{name}\" as its return type."),
@@ -1482,6 +1658,7 @@ impl<'doc> Executor<'doc> {
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
+        depth: usize,
     ) -> Result<Value, GraphQLError> {
         if !matches!(value, Value::Object(_) | Value::External(_)) {
             return Err(located(
@@ -1504,10 +1681,767 @@ impl<'doc> Executor<'doc> {
                 location,
             ));
         }
+        // The field that produced this value already tried the synchronous completion path (see
+        // [`Self::try_complete_field_value_sync`]); reaching here means the subtree needs the
+        // asynchronous path somewhere.
         let completed = self
-            .execute_fields(object, value, selection_sets, path, errors)
+            .execute_fields(object, value, selection_sets, path, errors, depth)
             .await?;
         Ok(Value::Object(Arc::new(completed)))
+    }
+
+    /// Try to complete a selection set without awaiting anything.
+    ///
+    /// Returns `None` when the depth limit makes the fast path unsafe or when a field needs the
+    /// asynchronous path. Either way the attempt left no trace: errors went into a dropped scratch
+    /// list, every path segment was popped, and no caller code ran (resolvers, authorizers, meta
+    /// fields, abstract types and non-built-in scalar serializers all bail out first).
+    #[inline(never)]
+    fn try_execute_fields_sync(
+        &self,
+        object_type: &Arc<ObjectType>,
+        parent: &Value,
+        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> Option<Result<Object, GraphQLError>> {
+        if depth >= SYNC_DEPTH_LIMIT
+            || object_type
+                .fields
+                .values()
+                .any(|field| field.resolve.is_some())
+        {
+            return None;
+        }
+        let collected = match collect::collect_fields_multi(
+            &self.context.schema,
+            &self.fragments,
+            &self.context.variables,
+            object_type.name.as_ref(),
+            selection_sets,
+        ) {
+            Ok(collected) => collected,
+            Err(error) => return Some(Err(error)),
+        };
+
+        let mut records = Vec::new();
+        match self.execute_fields_sync(object_type, parent, collected, path, &mut records, depth) {
+            Ok(Ok(object)) => {
+                append_errors(errors, records, self.context.max_errors);
+                Some(Ok(object))
+            }
+            Ok(Err(())) => None,
+            Err(error) => {
+                append_errors(errors, records, self.context.max_errors);
+                Some(Err(error))
+            }
+        }
+    }
+
+    /// [`Self::complete_field_value_sync`] with its own error buffer.
+    ///
+    /// The fast path may abandon a partially completed subtree, so its errors are collected
+    /// separately and only become visible once the completion actually finished. It is never
+    /// inlined, so its locals do not enlarge the recursive frames that bound execution's stack.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn try_complete_field_value_sync(
+        &self,
+        value: &Value,
+        ty: &TypeRef,
+        label: FieldLabel<'_>,
+        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        location: Location,
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> Option<Result<Value, GraphQLError>> {
+        let mut records = Vec::new();
+        let outcome = self.complete_field_value_sync(
+            value,
+            ty,
+            label,
+            selection_sets,
+            location,
+            path,
+            &mut records,
+            depth,
+        )?;
+        append_errors(errors, records, self.context.max_errors);
+        Some(outcome)
+    }
+
+    /// Complete fields that are already collected, without awaiting.
+    ///
+    /// Every construct that could touch caller code is refused rather than approximated:
+    /// resolvers, authorizers, meta fields, abstract types and custom scalar serializers all
+    /// hand the work back so the async path handles them with the exact same semantics.
+    fn execute_fields_sync(
+        &self,
+        object_type: &Arc<ObjectType>,
+        parent: &Value,
+        collected: collect::CollectedFields<'doc>,
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> Result<Result<Object, ()>, GraphQLError> {
+        let mut result = Object::with_capacity(collected.len());
+        let mut index = 0;
+        while index < collected.len() {
+            let (response_key, nodes) = &collected[index];
+            if self.expired() {
+                return Err(
+                    GraphQLError::new("The operation timed out before it could finish.")
+                        .with_path(path.to_vec()),
+                );
+            }
+            let Some((response_key, outcome)) = self.execute_field_sync(
+                object_type,
+                parent,
+                response_key,
+                nodes,
+                path,
+                errors,
+                depth,
+            ) else {
+                return Ok(Err(()));
+            };
+            result.push_unchecked(response_key, outcome?);
+            index += 1;
+        }
+        Ok(Ok(result))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_field_sync(
+        &self,
+        object_type: &Arc<ObjectType>,
+        parent: &Value,
+        response_key: &'doc str,
+        nodes: &[&'doc ast::Field<'doc>],
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> Option<(Arc<str>, Result<Value, GraphQLError>)> {
+        let Some(first) = nodes.first().copied() else {
+            return Some((
+                Arc::from(response_key),
+                Err(GraphQLError::new(format!(
+                    "No field node was provided for response key \"{response_key}\"."
+                ))),
+            ));
+        };
+        // Meta fields have their own resolution rules, including introspection.
+        if meta_return_type(first.name).is_some() {
+            return None;
+        }
+        let field = object_type.get_field(first.name);
+        let response_key: Arc<str> = match (field, first.alias) {
+            (Some(field), None) => field.name.clone(),
+            _ => Arc::from(response_key),
+        };
+        path.push(PathSegment::Field(response_key.clone()));
+        let outcome = self.execute_field_inner_sync(
+            object_type,
+            field,
+            parent,
+            first,
+            nodes,
+            path,
+            errors,
+            depth,
+        );
+        path.pop();
+        Some((response_key, outcome?))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_field_inner_sync(
+        &self,
+        object_type: &ObjectType,
+        field: Option<&crate::types::Field>,
+        parent: &Value,
+        first: &ast::Field<'_>,
+        nodes: &[&'doc ast::Field<'doc>],
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> Option<Result<Value, GraphQLError>> {
+        let location = first.location;
+        let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 2]> = nodes
+            .iter()
+            .filter_map(|node| node.selection_set.as_ref())
+            .collect();
+
+        if self.expired() {
+            return Some(Err(GraphQLError::new(
+                "The operation timed out before it could finish.",
+            )
+            .with_path(path.to_vec())
+            .at(location)));
+        }
+
+        let Some(field) = field else {
+            let error = GraphQLError::new(format!(
+                "Cannot query field \"{}\" on type \"{}\".",
+                first.name, object_type.name
+            ))
+            .at(location);
+            return Some(finish_field(
+                Err(error),
+                None,
+                path,
+                location,
+                errors,
+                self.context.max_errors,
+            ));
+        };
+
+        // A resolver or an authorizer is caller code: hand the whole subtree to the async path
+        // rather than run any of it here.
+        if field.resolve.is_some() || self.context.authorizer.is_some() {
+            return None;
+        }
+
+        let label = FieldLabel {
+            parent: object_type.name.as_ref(),
+            name: field.name.as_ref(),
+        };
+        let args = match coerce::coerce_argument_values(
+            &self.context.schema,
+            field,
+            first,
+            &self.context.variables,
+        ) {
+            Ok(args) => args,
+            Err(error) => {
+                return Some(finish_field(
+                    Err(error),
+                    Some(&field.ty),
+                    path,
+                    location,
+                    errors,
+                    self.context.max_errors,
+                ));
+            }
+        };
+        // The default resolver ignores arguments, but they are coerced above so that a field with
+        // arguments reports exactly the errors the async path would.
+        let _args = args;
+
+        let outcome = match default_property(label, field.name.as_ref(), parent).map(property_value)
+        {
+            Ok(value) => match self.complete_leaf(&value, &field.ty, label, location, path, true) {
+                Some(completed) => completed,
+                // `?` here only propagates "needs the asynchronous path", which abandons the
+                // attempt. The completion result itself is returned to `finish_field` below so
+                // null propagation and error recording stay identical to the async path.
+                None => self.complete_field_value_sync(
+                    &value,
+                    &field.ty,
+                    label,
+                    &selection_sets,
+                    location,
+                    path,
+                    errors,
+                    depth,
+                )?,
+            },
+            Err(error) => Err(error),
+        };
+        Some(finish_field(
+            outcome,
+            Some(&field.ty),
+            path,
+            location,
+            errors,
+            self.context.max_errors,
+        ))
+    }
+
+    /// [`Self::complete_field_value`] without awaiting.
+    #[allow(clippy::too_many_arguments)]
+    fn complete_field_value_sync(
+        &self,
+        value: &Value,
+        ty: &TypeRef,
+        label: FieldLabel<'_>,
+        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        location: Location,
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> Option<Result<Value, GraphQLError>> {
+        if !value.is_null() {
+            if let Some(object) = self.plain_object(ty) {
+                return self.complete_object_sync(
+                    &object,
+                    value,
+                    label,
+                    selection_sets,
+                    location,
+                    path,
+                    errors,
+                    depth + 1,
+                );
+            }
+            if let Some((object, items_non_null)) = self.object_list(ty) {
+                return self.complete_object_list_sync(
+                    &object,
+                    items_non_null,
+                    value,
+                    label,
+                    selection_sets,
+                    location,
+                    path,
+                    errors,
+                    depth + 1,
+                );
+            }
+        }
+        self.complete_value_sync(
+            value,
+            ty,
+            label,
+            selection_sets,
+            location,
+            path,
+            errors,
+            depth,
+        )
+    }
+
+    /// [`Self::complete_value`] without awaiting.
+    ///
+    /// A list nested directly in a list goes back through the boxed algorithm, exactly as the
+    /// asynchronous path does, so this never recurses further than the selection set does.
+    #[allow(clippy::too_many_arguments)]
+    fn complete_value_sync(
+        &self,
+        value: &Value,
+        ty: &TypeRef,
+        label: FieldLabel<'_>,
+        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        location: Location,
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> Option<Result<Value, GraphQLError>> {
+        let mut current = ty;
+        let mut non_null = false;
+        while let TypeRef::NonNull(inner) = current {
+            non_null = true;
+            current = inner;
+        }
+        if value.is_null() {
+            return Some(if non_null {
+                Err(located(
+                    format!("Cannot return null for non-nullable field {label}."),
+                    path,
+                    location,
+                ))
+            } else {
+                Ok(Value::Null)
+            });
+        }
+        let completed = match current {
+            TypeRef::List(inner) => match self.complete_list_sync(
+                value,
+                inner,
+                label,
+                selection_sets,
+                location,
+                path,
+                errors,
+                depth,
+            ) {
+                Some(Ok(value)) => value,
+                Some(Err(error)) => return Some(Err(error)),
+                None => return None,
+            },
+            TypeRef::Named(name) => match self.complete_named_sync(
+                value,
+                name,
+                label,
+                selection_sets,
+                location,
+                path,
+                errors,
+                depth,
+            ) {
+                Some(Ok(value)) => value,
+                Some(Err(error)) => return Some(Err(error)),
+                None => return None,
+            },
+            TypeRef::NonNull(_) => {
+                return Some(Err(located(
+                    "Internal execution error: non-null type was not unwrapped.",
+                    path,
+                    location,
+                )));
+            }
+        };
+        if non_null && completed.is_null() {
+            return Some(Err(located(
+                format!("Cannot return null for non-nullable field {label}."),
+                path,
+                location,
+            )));
+        }
+        Some(Ok(completed))
+    }
+
+    /// [`Self::complete_object_list`] without awaiting.
+    #[allow(clippy::too_many_arguments)]
+    fn complete_object_list_sync(
+        &self,
+        object: &Arc<ObjectType>,
+        items_non_null: bool,
+        value: &Value,
+        label: FieldLabel<'_>,
+        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        location: Location,
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> Option<Result<Value, GraphQLError>> {
+        let Value::List(items) = value else {
+            return Some(Err(located(
+                format!(
+                    "Expected a list for field {label}, but the resolved value is a {}.",
+                    value.kind()
+                ),
+                path,
+                location,
+            )));
+        };
+        let mut completed = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            path.push(PathSegment::index(index));
+            let outcome = if item.is_null() {
+                if items_non_null {
+                    Err(located(
+                        format!("Cannot return null for non-nullable field {label}."),
+                        path,
+                        location,
+                    ))
+                } else {
+                    Ok(Value::Null)
+                }
+            } else {
+                match self.complete_object_sync(
+                    object,
+                    item,
+                    label,
+                    selection_sets,
+                    location,
+                    path,
+                    errors,
+                    depth,
+                ) {
+                    Some(outcome) => outcome,
+                    None => {
+                        path.pop();
+                        return None;
+                    }
+                }
+            };
+            path.pop();
+            match outcome {
+                Ok(value) => completed.push(value),
+                Err(error) => {
+                    if items_non_null {
+                        return Some(Err(error));
+                    }
+                    record_error(errors, error, self.context.max_errors);
+                    completed.push(Value::Null);
+                }
+            }
+        }
+        Some(Ok(Value::List(completed)))
+    }
+
+    /// [`Self::complete_object`] without awaiting.
+    ///
+    /// `depth` is the level of the object's own selection set.
+    #[allow(clippy::too_many_arguments)]
+    fn complete_object_sync(
+        &self,
+        object: &Arc<ObjectType>,
+        value: &Value,
+        label: FieldLabel<'_>,
+        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        location: Location,
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> Option<Result<Value, GraphQLError>> {
+        // A type that defines any resolver is completed by the asynchronous path, whatever this
+        // particular selection asks for. Deciding that before collecting anything keeps the
+        // attempt free for resolver-heavy schemas (introspection, most of all).
+        if depth >= SYNC_DEPTH_LIMIT || object.fields.values().any(|field| field.resolve.is_some())
+        {
+            return None;
+        }
+        if !matches!(value, Value::Object(_) | Value::External(_)) {
+            return Some(Err(located(
+                format!(
+                    "Field {label} expects an object of type \"{}\" but received a {}.",
+                    object.name,
+                    value.kind()
+                ),
+                path,
+                location,
+            )));
+        }
+        if selection_sets.is_empty() {
+            return Some(Err(located(
+                format!(
+                    "Field {label} of type \"{}\" must have a selection set.",
+                    object.name
+                ),
+                path,
+                location,
+            )));
+        }
+        let collected = match collect::collect_fields_multi(
+            &self.context.schema,
+            &self.fragments,
+            &self.context.variables,
+            object.name.as_ref(),
+            selection_sets,
+        ) {
+            Ok(collected) => collected,
+            Err(error) => return Some(Err(error)),
+        };
+        match self.execute_fields_sync(object, value, collected, path, errors, depth) {
+            Ok(Ok(completed)) => Some(Ok(Value::Object(Arc::new(completed)))),
+            Ok(Err(_)) => None,
+            Err(error) => Some(Err(error)),
+        }
+    }
+
+    /// [`Self::complete_list`] without awaiting.
+    #[allow(clippy::too_many_arguments)]
+    fn complete_list_sync(
+        &self,
+        value: &Value,
+        inner: &TypeRef,
+        label: FieldLabel<'_>,
+        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        location: Location,
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> Option<Result<Value, GraphQLError>> {
+        let Value::List(items) = value else {
+            return Some(Err(located(
+                format!(
+                    "Expected a list for field {label}, but the resolved value is a {}.",
+                    value.kind()
+                ),
+                path,
+                location,
+            )));
+        };
+        let object = self.plain_object(inner);
+        let mut completed = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            path.push(PathSegment::index(index));
+            let outcome = match &object {
+                Some(object) if !item.is_null() => match self.complete_object_sync(
+                    object,
+                    item,
+                    label,
+                    selection_sets,
+                    location,
+                    path,
+                    errors,
+                    depth + 1,
+                ) {
+                    Some(outcome) => outcome,
+                    None => {
+                        path.pop();
+                        return None;
+                    }
+                },
+                _ => match self.complete_item_sync(
+                    item,
+                    inner,
+                    label,
+                    selection_sets,
+                    location,
+                    path,
+                    errors,
+                    depth,
+                ) {
+                    Some(outcome) => outcome,
+                    None => {
+                        path.pop();
+                        return None;
+                    }
+                },
+            };
+            path.pop();
+            match outcome {
+                Ok(value) => completed.push(value),
+                Err(error) => {
+                    if inner.is_non_null() {
+                        return Some(Err(error));
+                    }
+                    record_error(errors, error, self.context.max_errors);
+                    completed.push(Value::Null);
+                }
+            }
+        }
+        Some(Ok(Value::List(completed)))
+    }
+
+    /// [`Self::complete_item`] without awaiting.
+    #[allow(clippy::too_many_arguments)]
+    fn complete_item_sync(
+        &self,
+        item: &Value,
+        inner: &TypeRef,
+        label: FieldLabel<'_>,
+        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        location: Location,
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> Option<Result<Value, GraphQLError>> {
+        let mut current = inner;
+        let mut non_null = false;
+        while let TypeRef::NonNull(wrapped) = current {
+            non_null = true;
+            current = wrapped;
+        }
+        if item.is_null() {
+            return Some(if non_null {
+                Err(located(
+                    format!("Cannot return null for non-nullable field {label}."),
+                    path,
+                    location,
+                ))
+            } else {
+                Ok(Value::Null)
+            });
+        }
+        let completed = match current {
+            // A list inside a list goes back through the boxed algorithm, which is what keeps
+            // the completion future's size finite.
+            TypeRef::List(_) => return None,
+            TypeRef::Named(name) => match self.complete_named_sync(
+                item,
+                name,
+                label,
+                selection_sets,
+                location,
+                path,
+                errors,
+                depth,
+            ) {
+                Some(Ok(value)) => value,
+                Some(Err(error)) => return Some(Err(error)),
+                None => return None,
+            },
+            TypeRef::NonNull(_) => {
+                return Some(Err(located(
+                    "Internal execution error: non-null type was not unwrapped.",
+                    path,
+                    location,
+                )));
+            }
+        };
+        if non_null && completed.is_null() {
+            return Some(Err(located(
+                format!("Cannot return null for non-nullable field {label}."),
+                path,
+                location,
+            )));
+        }
+        Some(Ok(completed))
+    }
+
+    /// [`Self::complete_named`] without awaiting.
+    #[allow(clippy::too_many_arguments)]
+    fn complete_named_sync(
+        &self,
+        value: &Value,
+        name: &crate::types::Name,
+        label: FieldLabel<'_>,
+        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        location: Location,
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> Option<Result<Value, GraphQLError>> {
+        let Some(definition) = self.context.schema.get_type(name) else {
+            return Some(Err(located(
+                format!("Type \"{name}\" used by field {label} is not defined by the schema."),
+                path,
+                location,
+            )));
+        };
+        match definition {
+            Type::Scalar(scalar) => {
+                if scalar.serialize_fn().is_some() && !scalar.builtin {
+                    return None;
+                }
+                let serialized = value.clone();
+                if is_legal_scalar_value(&serialized) {
+                    Some(Ok(serialized))
+                } else {
+                    Some(Err(located(
+                        format!(
+                            "Field {label} serialized to a {} which is not a valid scalar value.",
+                            serialized.kind()
+                        ),
+                        path,
+                        location,
+                    )))
+                }
+            }
+            Type::Enum(enumeration) => match value {
+                Value::Enum(value) | Value::String(value) if enumeration.has_value(value) => {
+                    Some(Ok(Value::Enum(value.clone())))
+                }
+                Value::Enum(value) | Value::String(value) => Some(Err(located(
+                    format!(
+                        "Value \"{value}\" does not exist in enum \"{}\" for field {label}.",
+                        enumeration.name
+                    ),
+                    path,
+                    location,
+                ))),
+                other => Some(Err(located(
+                    format!(
+                        "Field {label} expects enum \"{}\" but received a {}.",
+                        enumeration.name,
+                        other.kind()
+                    ),
+                    path,
+                    location,
+                ))),
+            },
+            Type::Object(object) => self.complete_object_sync(
+                object,
+                value,
+                label,
+                selection_sets,
+                location,
+                path,
+                errors,
+                depth + 1,
+            ),
+            Type::Interface(_) | Type::Union(_) => None,
+            Type::InputObject(_) => Some(Err(located(
+                format!("Field {label} has input object type \"{name}\" as its return type."),
+                path,
+                location,
+            ))),
+        }
     }
 
     fn resolve_abstract_type(

@@ -71,10 +71,10 @@ pub fn analyze(
         document,
         variables,
         options,
-        fragment_cache: FxHashMap::default(),
+        fragment_cache: FragmentCache::new(),
         work: 0,
     };
-    let mut active_fragments = Vec::new();
+    let mut active_fragments = SmallVec::new();
     let (cost, depth) = analyzer.analyze_selection(
         operation.selection_set.items.iter(),
         &root,
@@ -152,12 +152,84 @@ struct CollectedField<'source, 'document> {
     selections: SmallVec<[&'document ast::Selection<'source>; 2]>,
 }
 
+/// A memoised fragment expansion: the fragment name, the scope it was expanded for, and the
+/// resulting fields.
+type CachedFragment<'source, 'document> = (
+    &'source str,
+    Arc<str>,
+    SmallVec<[CollectedField<'source, 'document>; 4]>,
+);
+
+/// Fragment expansions memoised for one analysis.
+///
+/// Documents define only a handful of fragments and analysis visits each one a handful of times,
+/// so a linear scan over an inline list is both faster and allocation-free compared to hashing.
+struct FragmentCache<'source, 'document> {
+    entries: SmallVec<[CachedFragment<'source, 'document>; 8]>,
+    index: Option<FxHashMap<(&'source str, Arc<str>), usize>>,
+}
+
+impl<'source, 'document> FragmentCache<'source, 'document> {
+    fn new() -> Self {
+        Self {
+            entries: SmallVec::new(),
+            index: None,
+        }
+    }
+
+    fn get(&self, key: &(&'source str, Arc<str>)) -> Option<&[CollectedField<'source, 'document>]> {
+        match &self.index {
+            Some(index) => index
+                .get(key)
+                .map(|position| self.entries[*position].2.as_slice()),
+            None => self
+                .entries
+                .iter()
+                .find(|(name, scope, _)| *name == key.0 && scope == &key.1)
+                .map(|(_, _, fields)| fields.as_slice()),
+        }
+    }
+
+    fn insert(
+        &mut self,
+        key: (&'source str, Arc<str>),
+        fields: SmallVec<[CollectedField<'source, 'document>; 4]>,
+    ) {
+        let position = self.entries.len();
+        self.entries.push((key.0, key.1, fields));
+        match &mut self.index {
+            Some(index) => {
+                index.insert(
+                    (
+                        self.entries[position].0,
+                        Arc::clone(&self.entries[position].1),
+                    ),
+                    position,
+                );
+            }
+            None if self.entries.len() > LINEAR_INDEX_LIMIT => {
+                self.index = Some(
+                    self.entries
+                        .iter()
+                        .enumerate()
+                        .map(|(position, (name, scope, _))| ((*name, Arc::clone(scope)), position))
+                        .collect(),
+                );
+            }
+            None => {}
+        }
+    }
+}
+
+/// Above this many entries a hash index beats a linear scan.
+const LINEAR_INDEX_LIMIT: usize = 16;
+
 struct Analyzer<'a, 'document, 'source> {
     schema: &'a Schema,
     document: &'document ast::Document<'source>,
     variables: &'a Object,
     options: &'a ComplexityOptions,
-    fragment_cache: FxHashMap<(&'source str, Arc<str>), Vec<CollectedField<'source, 'document>>>,
+    fragment_cache: FragmentCache<'source, 'document>,
     work: u64,
 }
 
@@ -168,13 +240,13 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
         items: I,
         scope: &Arc<str>,
         depth: usize,
-        active_fragments: &mut Vec<&'source str>,
+        active_fragments: &mut SmallVec<[&'source str; 8]>,
     ) -> Result<(u32, usize), GraphQLError>
     where
         I: IntoIterator<Item = &'document ast::Selection<'source>>,
     {
         let mut collected: SmallVec<[CollectedField<'source, 'document>; 4]> = SmallVec::new();
-        let mut index: FxHashMap<&'source str, SmallVec<[usize; 1]>> = FxHashMap::default();
+        let mut index = FieldIndex::new();
         self.collect_fields(items, scope, active_fragments, &mut collected, &mut index)?;
 
         let mut cost = 0u32;
@@ -198,9 +270,9 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
         &mut self,
         items: I,
         scope: &Arc<str>,
-        active_fragments: &mut Vec<&'source str>,
+        active_fragments: &mut SmallVec<[&'source str; 8]>,
         output: &mut SmallVec<[CollectedField<'source, 'document>; 4]>,
-        index: &mut FxHashMap<&'source str, SmallVec<[usize; 1]>>,
+        index: &mut FieldIndex<'source>,
     ) -> Result<(), GraphQLError>
     where
         I: IntoIterator<Item = &'document ast::Selection<'source>>,
@@ -250,7 +322,7 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
                     }
 
                     let mut fields = SmallVec::new();
-                    let mut fragment_index = FxHashMap::default();
+                    let mut fragment_index = FieldIndex::new();
                     active_fragments.push(spread.name);
                     let result = self.collect_fields(
                         fragment.selection_set.items.iter(),
@@ -262,7 +334,7 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
                     active_fragments.pop();
                     result?;
                     merge_all(output, index, &fields);
-                    self.fragment_cache.insert(key, fields.into_vec());
+                    self.fragment_cache.insert(key, fields);
                 }
                 ast::Selection::InlineFragment(fragment) => {
                     let effective_scope = match fragment.type_condition {
@@ -289,7 +361,7 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
         &mut self,
         field: &CollectedField<'source, 'document>,
         depth: usize,
-        active_fragments: &mut Vec<&'source str>,
+        active_fragments: &mut SmallVec<[&'source str; 8]>,
     ) -> Result<(u32, usize), GraphQLError> {
         let base = self.field_cost(field);
 
@@ -378,67 +450,112 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
     }
 }
 
+/// The response-key index for one collected selection set.
+///
+/// Selection sets are small, so the common case scans the collected list directly and never
+/// allocates a hash map. Only a document with many distinct response keys pays for hashing.
+struct FieldIndex<'source> {
+    map: Option<FxHashMap<&'source str, SmallVec<[usize; 1]>>>,
+}
+
+impl<'source> FieldIndex<'source> {
+    fn new() -> Self {
+        Self { map: None }
+    }
+}
+
 fn merge_field<'source, 'document>(
     output: &mut SmallVec<[CollectedField<'source, 'document>; 4]>,
-    index: &mut FxHashMap<&'source str, SmallVec<[usize; 1]>>,
+    index: &mut FieldIndex<'source>,
     field: &'document ast::Field<'source>,
     scope: &Arc<str>,
 ) {
     let response_key = field.response_key();
-    let entries = index.entry(response_key).or_default();
-    for existing in entries.iter().copied() {
-        let collected = &mut output[existing];
-        if collected.scope.as_ref() == scope.as_ref() {
-            // The specification merges field nodes with the same response key and the same
-            // parent scope; their sub-selections are collected once.
-            if let Some(selection_set) = &field.selection_set {
-                collected.selections.extend(selection_set.items.iter());
-            }
-            return;
+    if let Some(existing) = find_entry(output, index, response_key, scope) {
+        // The specification merges field nodes with the same response key and the same parent
+        // scope; their sub-selections are collected once.
+        if let Some(selection_set) = &field.selection_set {
+            output[existing]
+                .selections
+                .extend(selection_set.items.iter());
         }
+        return;
     }
     // The same response key selected through a different, overlapping fragment scope is kept as a
     // separate accounting entry. The executor still resolves it once; charging both scopes is
     // deliberately conservative and prevents a narrow scope from hiding expensive fields that
     // only the other scope can see.
-    let position = output.len();
-    entries.push(position);
-    output.push(CollectedField {
-        response_key,
-        scope: Arc::clone(scope),
-        node: field,
-        selections: field
-            .selection_set
-            .as_ref()
-            .map(|selection_set| selection_set.items.iter().collect())
-            .unwrap_or_default(),
-    });
+    push_entry(
+        output,
+        index,
+        CollectedField {
+            response_key,
+            scope: Arc::clone(scope),
+            node: field,
+            selections: field
+                .selection_set
+                .as_ref()
+                .map(|selection_set| selection_set.items.iter().collect())
+                .unwrap_or_default(),
+        },
+    );
 }
 
 fn merge_all<'source, 'document>(
     output: &mut SmallVec<[CollectedField<'source, 'document>; 4]>,
-    index: &mut FxHashMap<&'source str, SmallVec<[usize; 1]>>,
+    index: &mut FieldIndex<'source>,
     fields: &[CollectedField<'source, 'document>],
 ) {
     for field in fields {
         // Re-run the scope-aware merge for the cached fragment's fields.
-        let entries = index.entry(field.response_key).or_default();
-        let mut merged = false;
-        for existing in entries.iter().copied() {
-            let collected = &mut output[existing];
-            if collected.scope.as_ref() == field.scope.as_ref() {
-                collected
-                    .selections
-                    .extend(field.selections.iter().copied());
-                merged = true;
-                break;
+        match find_entry(output, index, field.response_key, &field.scope) {
+            Some(existing) => output[existing]
+                .selections
+                .extend(field.selections.iter().copied()),
+            None => push_entry(output, index, field.clone()),
+        }
+    }
+}
+
+fn find_entry<'source, 'document>(
+    output: &SmallVec<[CollectedField<'source, 'document>; 4]>,
+    index: &FieldIndex<'source>,
+    response_key: &str,
+    scope: &str,
+) -> Option<usize> {
+    match &index.map {
+        Some(map) => map.get(response_key).and_then(|positions| {
+            positions
+                .iter()
+                .copied()
+                .find(|position| output[*position].scope.as_ref() == scope)
+        }),
+        None => output.iter().position(|collected| {
+            collected.response_key == response_key && collected.scope.as_ref() == scope
+        }),
+    }
+}
+
+fn push_entry<'source, 'document>(
+    output: &mut SmallVec<[CollectedField<'source, 'document>; 4]>,
+    index: &mut FieldIndex<'source>,
+    entry: CollectedField<'source, 'document>,
+) {
+    let position = output.len();
+    let response_key = entry.response_key;
+    output.push(entry);
+    match &mut index.map {
+        Some(map) => map.entry(response_key).or_default().push(position),
+        None if output.len() > LINEAR_INDEX_LIMIT => {
+            let mut map: FxHashMap<&'source str, SmallVec<[usize; 1]>> = FxHashMap::default();
+            for (position, collected) in output.iter().enumerate() {
+                map.entry(collected.response_key)
+                    .or_default()
+                    .push(position);
             }
+            index.map = Some(map);
         }
-        if !merged {
-            let position = output.len();
-            entries.push(position);
-            output.push(field.clone());
-        }
+        None => {}
     }
 }
 
