@@ -680,17 +680,19 @@ impl<'doc> Executor<'doc> {
             // its ordered output vector and a cloned path per object, which is the common shape
             // for a record with one resolver-backed field among scalar properties.
             if self.only_one_async_field(object_type, &collected) {
-                return self
-                    .execute_fields_sequentially_planned(
-                        object_type,
-                        parent,
-                        &collected,
-                        path,
-                        errors,
-                        result,
-                        depth,
-                    )
-                    .await;
+                // Box the sequential variant: it is much larger than the batched path's state,
+                // and inlining it here would enlarge every `run_operation` future (and therefore
+                // the whole execution call chain) even for queries that never take this branch.
+                return Box::pin(self.execute_fields_sequentially_planned(
+                    object_type,
+                    parent,
+                    &collected,
+                    path,
+                    errors,
+                    result,
+                    depth,
+                ))
+                .await;
             }
             // The batch lives on the heap so the boxed future below stays small enough to
             // recurse safely.
@@ -1252,7 +1254,7 @@ impl<'doc> Executor<'doc> {
         let location = first.location;
         // A single leaf node collects no selection sets, which is the majority of fields and
         // does not need to build (or even walk) the list.
-        let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 4]> = match nodes {
+        let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 2]> = match nodes {
             [only] if only.selection_set.is_none() => SmallVec::new(),
             _ => nodes
                 .iter()
@@ -1623,7 +1625,7 @@ impl<'doc> Executor<'doc> {
         let location = first.location;
         // A single leaf node collects no selection sets, which is the majority of fields and
         // does not need to build (or even walk) the list.
-        let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 4]> = match nodes {
+        let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 2]> = match nodes {
             [only] if only.selection_set.is_none() => SmallVec::new(),
             _ => nodes
                 .iter()
@@ -3295,7 +3297,7 @@ impl<'doc> Executor<'doc> {
         depth: usize,
     ) -> Option<Result<Value, GraphQLError>> {
         let location = first.location;
-        let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 4]> = match nodes {
+        let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 2]> = match nodes {
             [only] if only.selection_set.is_none() => SmallVec::new(),
             _ => nodes
                 .iter()

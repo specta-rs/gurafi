@@ -1341,7 +1341,12 @@ mod tests {
             .child
             .expect("child source");
         let user = schema.object_type("User").expect("user type");
-        assert!(!plan.field_plan(child, user).expect("user plan").has_resolvers);
+        assert!(
+            !plan
+                .field_plan(child, user)
+                .expect("user plan")
+                .has_resolvers
+        );
 
         // Selecting the resolver-backed field flips it, so the synchronous path is refused.
         let document = parse_query("query { user { id score } }").expect("parses");
@@ -1352,7 +1357,11 @@ mod tests {
             .expect("variant")
             .child
             .expect("child source");
-        assert!(plan.field_plan(child, user).expect("user plan").has_resolvers);
+        assert!(
+            plan.field_plan(child, user)
+                .expect("user plan")
+                .has_resolvers
+        );
     }
 
     #[test]

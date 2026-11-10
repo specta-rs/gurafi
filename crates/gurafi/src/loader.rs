@@ -695,7 +695,6 @@ where
             }
         }
 
-
         // One yield is the batch window: every load polled before this task is polled again is
         // queued and will be flushed into the same batch.
         YieldNow::new().await;
