@@ -3,7 +3,7 @@
 //! These are the rules that need to know a selection's parent type. Membership rules (fragment
 //! names, reachability, cycles) live in [`super`]; value shape rules live in [`super::values`].
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use indexmap::IndexMap;
 
@@ -179,9 +179,28 @@ pub(crate) struct FieldRules<'a, 'b> {
     pub(crate) schema: &'a Schema,
     pub(crate) fragments: &'b HashMap<&'a str, &'a FragmentDefinition<'a>>,
     pub(crate) errors: &'b mut Vec<GraphQLError>,
+    /// The most recently resolved return type.
+    ///
+    /// Every field of a selection set is checked against its return type, and a response usually
+    /// selects the same handful of types over and over, so one slot avoids most of the schema
+    /// lookups the walk would otherwise hash.
+    pub(crate) type_cache: Option<(&'a str, Option<&'a Type>)>,
 }
 
 impl<'a> FieldRules<'a, '_> {
+    /// Resolve a return type, remembering the previous answer.
+    fn resolve_type(&mut self, reference: &'a TypeRef) -> Option<&'a Type> {
+        let name = reference.named_type().as_ref();
+        if let Some((cached, resolved)) = self.type_cache {
+            if crate::types::names_eq(cached, name) {
+                return resolved;
+            }
+        }
+        let resolved = self.schema.get_type(name);
+        self.type_cache = Some((name, resolved));
+        resolved
+    }
+
     fn check_field_arguments(&mut self, field: &'a Field<'a>, context: &FieldContext<'a>) {
         unique_argument_names(&field.arguments, self.errors);
 
@@ -267,7 +286,7 @@ impl<'a> Visitor<'a> for FieldRules<'a, '_> {
         }
 
         if let Some(return_type) = context.return_type {
-            let named = self.schema.get_type(return_type.named_type());
+            let named = self.resolve_type(return_type);
             let is_leaf = named.is_some_and(|ty| ty.is_leaf());
             let is_composite = named.is_some_and(|ty| ty.is_composite())
                 // The introspection types are injected by the schema builder. If a schema

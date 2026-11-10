@@ -3,7 +3,7 @@
 //! Variable usages are collected per operation, expanding fragment spreads, because a variable
 //! used inside a fragment belongs to every operation that reaches that fragment.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use smallvec::SmallVec;
 

@@ -252,10 +252,15 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
         let mut index = FieldIndex::new();
         self.collect_fields(items, scope, active_fragments, &mut collected, &mut index)?;
 
+        // Every field in the set is looked up on the same parent type, so it is resolved once for
+        // the set instead of once per field. A field merged from a fragment with a narrower scope
+        // carries its own scope and resolves that separately.
+        let parent_type = self.schema.get_type(scope);
         let mut cost = 0u32;
         let mut max_depth = depth;
         for field in &collected {
-            let (field_cost, field_depth) = self.analyze_field(field, depth, active_fragments)?;
+            let (field_cost, field_depth) =
+                self.analyze_field(field, parent_type, scope, depth, active_fragments)?;
             cost = cost.saturating_add(field_cost);
             max_depth = max_depth.max(field_depth);
         }
@@ -363,19 +368,32 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
     fn analyze_field(
         &mut self,
         field: &CollectedField<'source, 'document>,
+        parent_type: Option<&'a Type>,
+        parent_scope: &str,
         depth: usize,
         active_fragments: &mut SmallVec<[&'source str; 8]>,
     ) -> Result<(u32, usize), GraphQLError> {
-        let base = self.field_cost(field);
+        // The field's definition is needed for both its cost and its return type, so it is
+        // resolved once instead of once per question.
+        let definition = if field.scope.as_ref() == parent_scope {
+            field_definition_on(parent_type, field.node.name)
+        } else {
+            self.field_definition(&field.scope, field.node.name)
+        };
+        let base = self.field_cost(field, definition);
 
         if field.selections.is_empty() {
             return Ok((base, depth));
         }
 
-        let Some(return_type) = self.field_type(&field.scope, field.node.name) else {
-            // An unknown field is a validation error. Be defensive: charge its base cost and do
-            // not try to descend into a type we cannot resolve.
-            return Ok((base, depth));
+        let return_type = match definition {
+            Some(definition) => Cow::Borrowed(&definition.ty),
+            None => match meta_field_type(field.node.name) {
+                Some(ty) => ty,
+                // An unknown field is a validation error. Be defensive: charge its base cost and
+                // do not try to descend into a type we cannot resolve.
+                None => return Ok((base, depth)),
+            },
         };
 
         let multiplier = list_multiplier(&return_type, self.options.list_factor);
@@ -391,8 +409,12 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
         Ok((total, selection_depth))
     }
 
-    fn field_cost(&self, field: &CollectedField<'source, 'document>) -> u32 {
-        let Some(definition) = self.field_definition(&field.scope, field.node.name) else {
+    fn field_cost(
+        &self,
+        field: &CollectedField<'source, 'document>,
+        definition: Option<&Field>,
+    ) -> u32 {
+        let Some(definition) = definition else {
             return self.options.field_cost;
         };
         let Some(estimator) = &definition.complexity else {
@@ -411,22 +433,7 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
     }
 
     fn field_definition(&self, scope: &str, name: &str) -> Option<&Field> {
-        match self.schema.get_type(scope)? {
-            Type::Object(object) => object.get_field(name),
-            Type::Interface(interface) => interface.get_field(name),
-            _ => None,
-        }
-    }
-
-    fn field_type<'b>(&'b self, scope: &str, name: &str) -> Option<Cow<'b, TypeRef>> {
-        match name {
-            "__typename" => None,
-            "__schema" => Some(Cow::Owned(TypeRef::named("__Schema").non_null())),
-            "__type" => Some(Cow::Owned(TypeRef::named("__Type"))),
-            _ => self
-                .field_definition(scope, name)
-                .map(|field| Cow::Borrowed(&field.ty)),
-        }
+        field_definition_on(self.schema.get_type(scope), name)
     }
 
     /// Evaluate `@skip` and `@include`.
@@ -604,6 +611,25 @@ fn fragment_scope(schema: &Schema, condition: &str, parent: &Arc<str>) -> Option
                 Some(Arc::from(condition))
             }
         }
+        _ => None,
+    }
+}
+
+/// Look a field up on a type that is already resolved.
+fn field_definition_on<'t>(parent: Option<&'t Type>, name: &str) -> Option<&'t Field> {
+    match parent? {
+        Type::Object(object) => object.get_field(name),
+        Type::Interface(interface) => interface.get_field(name),
+        _ => None,
+    }
+}
+
+/// The return type of a specification meta-field, which has no schema definition.
+fn meta_field_type(name: &str) -> Option<Cow<'_, TypeRef>> {
+    match name {
+        "__typename" => None,
+        "__schema" => Some(Cow::Owned(TypeRef::named("__Schema").non_null())),
+        "__type" => Some(Cow::Owned(TypeRef::named("__Type"))),
         _ => None,
     }
 }

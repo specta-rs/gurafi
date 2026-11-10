@@ -160,28 +160,42 @@ impl<'a> Lexer<'a> {
     ///
     /// Ignored characters are all ASCII except the byte order mark, so this walks bytes and only
     /// falls back to the character-wise path for the BOM. Documents are mostly whitespace, and
-    /// this runs before every token.
+    /// this runs before every token, so runs of spaces are skipped in one step.
     fn skip_ignored(&mut self) {
+        let bytes = self.source.as_bytes();
         loop {
-            match self.source.as_bytes().get(self.pos).copied() {
-                Some(b'\t' | b' ' | b',') => {
-                    self.pos = self.pos.saturating_add(1);
-                    self.column = self.column.saturating_add(1);
+            let Some(&byte) = bytes.get(self.pos) else {
+                return;
+            };
+            match ignored_class(byte) {
+                IGNORED_PLAIN => {
+                    let start = self.pos;
+                    let mut end = start.saturating_add(1);
+                    while let Some(&next) = bytes.get(end) {
+                        if ignored_class(next) != IGNORED_PLAIN {
+                            break;
+                        }
+                        end = end.saturating_add(1);
+                    }
+                    self.pos = end;
+                    self.column = self
+                        .column
+                        .saturating_add(u32::try_from(end - start).unwrap_or(u32::MAX));
                 }
-                Some(b'\n') => {
+                IGNORED_NEWLINE => {
                     self.pos = self.pos.saturating_add(1);
                     self.line = self.line.saturating_add(1);
                     self.column = 1;
                 }
-                Some(b'\r') => {
+                IGNORED_CARRIAGE_RETURN => {
                     self.pos = self.pos.saturating_add(1);
-                    if self.source.as_bytes().get(self.pos) == Some(&b'\n') {
+                    if bytes.get(self.pos) == Some(&b'\n') {
                         self.pos = self.pos.saturating_add(1);
                     }
                     self.line = self.line.saturating_add(1);
                     self.column = 1;
                 }
-                Some(b'#') => {
+                IGNORED_COMMENT => {
                     // Comments may contain any character, so they keep the character-wise walk
                     // that maintains line and column counters.
                     while let Some(ch) = self.peek() {
@@ -191,16 +205,27 @@ impl<'a> Lexer<'a> {
                         self.bump();
                     }
                 }
-                Some(_) => {
+                _ => {
+                    if byte < 0x80 {
+                        return;
+                    }
                     // A byte order mark is the only non-ASCII character ignored here.
-                    if self.peek() == Some('\u{feff}') {
-                        self.bump();
-                    } else {
-                        break;
+                    if !self.consume_bom() {
+                        return;
                     }
                 }
-                None => break,
             }
+        }
+    }
+
+    /// Consume a leading byte order mark, if the source has one here.
+    fn consume_bom(&mut self) -> bool {
+        if self.rest().starts_with('\u{feff}') {
+            self.pos = self.pos.saturating_add('\u{feff}'.len_utf8());
+            self.column = self.column.saturating_add(1);
+            true
+        } else {
+            false
         }
     }
 
@@ -208,67 +233,87 @@ impl<'a> Lexer<'a> {
     pub(crate) fn next(&mut self) -> Result<Token<'a>, GraphQLError> {
         self.skip_ignored();
         let location = self.location();
-        let Some(ch) = self.peek() else {
+        let Some(&byte) = self.source.as_bytes().get(self.pos) else {
             return Ok(Token {
                 kind: TokenKind::Eof,
                 location,
             });
         };
 
-        let kind = match ch {
-            '!' => self.punctuator(Punct::Bang),
-            '$' => self.punctuator(Punct::Dollar),
-            '&' => self.punctuator(Punct::Amp),
-            '(' => self.punctuator(Punct::LParen),
-            ')' => self.punctuator(Punct::RParen),
-            ':' => self.punctuator(Punct::Colon),
-            '=' => self.punctuator(Punct::Equals),
-            '@' => self.punctuator(Punct::At),
-            '[' => self.punctuator(Punct::LBracket),
-            ']' => self.punctuator(Punct::RBracket),
-            '{' => self.punctuator(Punct::LBrace),
-            '|' => self.punctuator(Punct::Pipe),
-            '}' => self.punctuator(Punct::RBrace),
-            '.' => self.spread(location)?,
-            '"' => {
-                if self.rest().starts_with("\"\"\"") {
-                    self.block_string()?
-                } else {
-                    self.string()?
+        // Punctuators and names are ASCII, and they are the overwhelming majority of tokens, so
+        // the byte is classified directly instead of decoding a `char` first.
+        let kind = if byte.is_ascii() {
+            match byte {
+                b'!' => self.punctuator_ascii(Punct::Bang),
+                b'$' => self.punctuator_ascii(Punct::Dollar),
+                b'&' => self.punctuator_ascii(Punct::Amp),
+                b'(' => self.punctuator_ascii(Punct::LParen),
+                b')' => self.punctuator_ascii(Punct::RParen),
+                b':' => self.punctuator_ascii(Punct::Colon),
+                b'=' => self.punctuator_ascii(Punct::Equals),
+                b'@' => self.punctuator_ascii(Punct::At),
+                b'[' => self.punctuator_ascii(Punct::LBracket),
+                b']' => self.punctuator_ascii(Punct::RBracket),
+                b'{' => self.punctuator_ascii(Punct::LBrace),
+                b'|' => self.punctuator_ascii(Punct::Pipe),
+                b'}' => self.punctuator_ascii(Punct::RBrace),
+                b'.' => self.spread(location)?,
+                b'"' => {
+                    if self.rest().starts_with("\"\"\"") {
+                        self.block_string()?
+                    } else {
+                        self.string()?
+                    }
+                }
+                b'-' | b'0'..=b'9' => self.number(location)?,
+                byte if is_name_start_byte(byte) => self.name(),
+                b'\'' => {
+                    return Err(self.error(
+                        location,
+                        "Unexpected single quote character ('), did you mean to use a double quote (\")?"
+                            .to_owned(),
+                    ));
+                }
+                byte => {
+                    return Err(self.error(
+                        location,
+                        format!("Unexpected character: {}.", print_code_point(byte as char)),
+                    ));
                 }
             }
-            '-' | '0'..='9' => self.number(location)?,
-            ch if is_name_start(ch) => self.name(),
-            '\'' => {
-                return Err(self.error(
+        } else {
+            let Some(ch) = self.peek() else {
+                return Ok(Token {
+                    kind: TokenKind::Eof,
                     location,
-                    "Unexpected single quote character ('), did you mean to use a double quote (\")?"
-                        .to_owned(),
-                ));
-            }
-            ch => {
-                return Err(self.error(
-                    location,
-                    format!("Unexpected character: {}.", print_code_point(ch)),
-                ));
+                });
+            };
+            match ch {
+                ch if is_name_start(ch) => self.name(),
+                ch => {
+                    return Err(self.error(
+                        location,
+                        format!("Unexpected character: {}.", print_code_point(ch)),
+                    ));
+                }
             }
         };
 
         Ok(Token { kind, location })
     }
 
-    /// Consume a single-character punctuator.
-    fn punctuator(&mut self, punct: Punct) -> TokenKind<'a> {
-        self.bump();
+    /// Consume a single-character ASCII punctuator.
+    fn punctuator_ascii(&mut self, punct: Punct) -> TokenKind<'a> {
+        self.pos = self.pos.saturating_add(1);
+        self.column = self.column.saturating_add(1);
         TokenKind::Punct(punct)
     }
 
     /// Consume a `...` spread, rejecting stray dots.
     fn spread(&mut self, location: Location) -> Result<TokenKind<'a>, GraphQLError> {
         if self.rest().starts_with("...") {
-            self.bump();
-            self.bump();
-            self.bump();
+            self.pos = self.pos.saturating_add(3);
+            self.column = self.column.saturating_add(3);
             Ok(TokenKind::Punct(Punct::Spread))
         } else {
             Err(self.error(location, "Unexpected character: \".\".".to_owned()))
@@ -277,17 +322,23 @@ impl<'a> Lexer<'a> {
 
     /// Consume a name.
     ///
-    /// Names are ASCII, so scanning bytes avoids decoding a `char` per character.
+    /// Names are ASCII, so scanning bytes avoids decoding a `char` per character, and the whole
+    /// run is counted once instead of updating the column per byte.
     fn name(&mut self) -> TokenKind<'a> {
+        let bytes = self.source.as_bytes();
         let start = self.pos;
-        while let Some(&byte) = self.source.as_bytes().get(self.pos) {
+        let mut end = start;
+        while let Some(&byte) = bytes.get(end) {
             if !is_name_continue_byte(byte) {
                 break;
             }
-            self.pos = self.pos.saturating_add(1);
-            self.column = self.column.saturating_add(1);
+            end = end.saturating_add(1);
         }
-        TokenKind::Name(self.source.get(start..self.pos).unwrap_or(""))
+        self.pos = end;
+        self.column = self
+            .column
+            .saturating_add(u32::try_from(end - start).unwrap_or(u32::MAX));
+        TokenKind::Name(self.source.get(start..end).unwrap_or(""))
     }
 
     /// Consume an integer or float literal.
@@ -680,9 +731,36 @@ fn is_name_start(ch: char) -> bool {
     ch == '_' || ch.is_ascii_alphabetic()
 }
 
+/// Whether a byte may start a name.
+#[inline]
+fn is_name_start_byte(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphabetic()
+}
+
 /// Whether a byte may continue a name.
+#[inline]
 fn is_name_continue_byte(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
+/// The class of an ignored byte, used to skip whitespace runs in one step.
+const IGNORED_NONE: u8 = 0;
+/// A space, tab or comma, all of which only advance the column.
+const IGNORED_PLAIN: u8 = 1;
+const IGNORED_NEWLINE: u8 = 2;
+const IGNORED_CARRIAGE_RETURN: u8 = 3;
+const IGNORED_COMMENT: u8 = 4;
+
+/// Classify one byte for [`Lexer::skip_ignored`].
+#[inline]
+const fn ignored_class(byte: u8) -> u8 {
+    match byte {
+        b' ' | b'\t' | b',' => IGNORED_PLAIN,
+        b'\n' => IGNORED_NEWLINE,
+        b'\r' => IGNORED_CARRIAGE_RETURN,
+        b'#' => IGNORED_COMMENT,
+        _ => IGNORED_NONE,
+    }
 }
 
 /// Render a code point the way the reference implementation does in messages.

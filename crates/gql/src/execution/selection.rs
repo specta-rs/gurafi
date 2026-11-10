@@ -11,7 +11,7 @@ pub(crate) fn type_condition_matches(
     condition: &str,
     runtime_type: &str,
 ) -> Result<bool, GraphQLError> {
-    if condition == runtime_type {
+    if crate::types::names_eq(condition, runtime_type) {
         return Ok(true);
     }
     match schema.get_type(condition) {
@@ -31,7 +31,7 @@ pub(crate) fn type_condition_matches(
 /// Convert an AST type reference into a schema type reference.
 pub(crate) fn type_ref(ty: &crate::ast::Type<'_>) -> TypeRef {
     match ty {
-        crate::ast::Type::Named(name) => TypeRef::named(*name),
+        crate::ast::Type::Named(name) => TypeRef::named_str(name),
         crate::ast::Type::List(inner) => type_ref(inner).list(),
         crate::ast::Type::NonNull(inner) => type_ref(inner).non_null(),
     }

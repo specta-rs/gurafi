@@ -7,12 +7,24 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
-use crate::{Object, Value, ast, error::GraphQLError, schema::Schema};
+use crate::{
+    Object, Value, ast,
+    error::GraphQLError,
+    schema::Schema,
+    types::{ObjectType, names_eq},
+};
 
 use super::{executor::FragmentMap, selection::type_condition_matches};
 
-/// One response key's field nodes, in document order.
-pub(crate) type FieldGroup<'a> = (&'a str, SmallVec<[&'a ast::Field<'a>; 1]>);
+/// One response key's field nodes, in document order, and the schema field they resolve to.
+///
+/// Resolving the definition while grouping means a list completes its items without looking the
+/// same handful of fields up again for every element.
+pub(crate) type FieldGroup<'a> = (
+    &'a str,
+    SmallVec<[&'a ast::Field<'a>; 1]>,
+    Option<&'a crate::types::Field>,
+);
 
 /// Fields grouped by response key, preserving first-seen order.
 ///
@@ -37,17 +49,17 @@ type FieldIndex<'a> = Option<FxHashMap<&'a str, usize>>;
 
 /// Collect fields for one runtime type from a single selection set.
 pub(crate) fn collect_fields<'a>(
-    schema: &Schema,
+    schema: &'a Schema,
     fragments: &FragmentMap<'a>,
     variables: &Object,
-    runtime_type: &str,
+    object_type: &'a ObjectType,
     selection_set: &'a ast::SelectionSet<'a>,
 ) -> Result<CollectedFields<'a>, GraphQLError> {
     collect_fields_multi(
         schema,
         fragments,
         variables,
-        runtime_type,
+        object_type,
         std::slice::from_ref(&selection_set),
     )
 }
@@ -58,10 +70,10 @@ pub(crate) fn collect_fields<'a>(
 /// passing all of those nodes' selection sets here produces the same result without cloning the
 /// syntax tree.
 pub(crate) fn collect_fields_multi<'a>(
-    schema: &Schema,
+    schema: &'a Schema,
     fragments: &FragmentMap<'a>,
     variables: &Object,
-    runtime_type: &str,
+    object_type: &'a ObjectType,
     selection_sets: &[&'a ast::SelectionSet<'a>],
 ) -> Result<CollectedFields<'a>, GraphQLError> {
     let mut fields = CollectedFields::new();
@@ -73,7 +85,7 @@ pub(crate) fn collect_fields_multi<'a>(
             schema,
             fragments,
             variables,
-            runtime_type,
+            object_type,
             selection_set,
             &mut fields,
             &mut index,
@@ -87,10 +99,10 @@ pub(crate) fn collect_fields_multi<'a>(
 
 #[allow(clippy::too_many_arguments)]
 fn collect_into<'a>(
-    schema: &Schema,
+    schema: &'a Schema,
     fragments: &FragmentMap<'a>,
     variables: &Object,
-    runtime_type: &str,
+    object_type: &'a ObjectType,
     selection_set: &'a ast::SelectionSet<'a>,
     fields: &mut CollectedFields<'a>,
     index: &mut FieldIndex<'a>,
@@ -110,7 +122,7 @@ fn collect_into<'a>(
         }
         match selection {
             ast::Selection::Field(field) => {
-                add_field(fields, index, field.response_key(), field);
+                add_field(fields, index, object_type, field.response_key(), field);
             }
             ast::Selection::FragmentSpread(spread) => {
                 let Some(fragment) = fragments.get(spread.name) else {
@@ -131,14 +143,18 @@ fn collect_into<'a>(
                     ))
                     .at(spread.location));
                 }
-                if !type_condition_matches(schema, fragment.type_condition, runtime_type)? {
+                if !type_condition_matches(
+                    schema,
+                    fragment.type_condition,
+                    object_type.name.as_ref(),
+                )? {
                     continue;
                 }
                 collect_into(
                     schema,
                     fragments,
                     variables,
-                    runtime_type,
+                    object_type,
                     &fragment.selection_set,
                     fields,
                     index,
@@ -149,7 +165,7 @@ fn collect_into<'a>(
             }
             ast::Selection::InlineFragment(fragment) => {
                 if let Some(condition) = fragment.type_condition {
-                    if !type_condition_matches(schema, condition, runtime_type)? {
+                    if !type_condition_matches(schema, condition, object_type.name.as_ref())? {
                         continue;
                     }
                 }
@@ -157,7 +173,7 @@ fn collect_into<'a>(
                     schema,
                     fragments,
                     variables,
-                    runtime_type,
+                    object_type,
                     &fragment.selection_set,
                     fields,
                     index,
@@ -175,6 +191,7 @@ fn collect_into<'a>(
 fn add_field<'a>(
     fields: &mut CollectedFields<'a>,
     index: &mut FieldIndex<'a>,
+    object_type: &'a ObjectType,
     response_key: &'a str,
     field: &'a ast::Field<'a>,
 ) {
@@ -183,7 +200,11 @@ fn add_field<'a>(
         return;
     }
     let position = fields.len();
-    fields.push((response_key, smallvec::smallvec![field]));
+    fields.push((
+        response_key,
+        smallvec::smallvec![field],
+        object_type.get_field(field.name),
+    ));
     match index {
         Some(index) => {
             index.insert(response_key, position);
@@ -193,7 +214,7 @@ fn add_field<'a>(
                 fields
                     .iter()
                     .enumerate()
-                    .map(|(position, (key, _))| (*key, position))
+                    .map(|(position, (key, _, _))| (*key, position))
                     .collect(),
             );
         }
@@ -208,7 +229,9 @@ fn find_group<'a>(
 ) -> Option<usize> {
     match index {
         Some(index) => index.get(response_key).copied(),
-        None => fields.iter().position(|(key, _)| *key == response_key),
+        None => fields
+            .iter()
+            .position(|(key, _, _)| names_eq(key, response_key)),
     }
 }
 
@@ -234,7 +257,7 @@ impl<'a> VisitedFragments<'a> {
         if let Some(large) = &mut self.large {
             return large.insert(name);
         }
-        if self.small.contains(&name) {
+        if self.small.iter().any(|known| names_eq(known, name)) {
             return false;
         }
         self.small.push(name);

@@ -13,7 +13,7 @@ mod values;
 mod variables;
 mod visitor;
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use smallvec::SmallVec;
 
@@ -24,7 +24,7 @@ use crate::{
     },
     error::{GraphQLError, Location},
     schema::Schema,
-    types::Type,
+    types::{Type, names_eq},
 };
 use rules::{FieldRules, check_directives};
 use visitor::{type_ref_from_ast, walk};
@@ -54,7 +54,7 @@ pub fn validate<'a>(
     // A very long fragment chain is shallow in the document but deep once expanded. Stop before
     // any of the recursive validation passes can exhaust the stack; the document is invalid
     // regardless of its other contents.
-    let mut fragments: HashMap<&str, &FragmentDefinition<'_>> = HashMap::new();
+    let mut fragments: HashMap<&str, &FragmentDefinition<'_>> = HashMap::default();
     let mut fragment_count = 0;
     for fragment in document.fragments() {
         // First definition wins; UniqueFragmentNames reports the duplicates.
@@ -69,7 +69,9 @@ pub fn validate<'a>(
             return vec![error];
         }
     }
+    let repeats = may_repeat_response_key(&fragments, document);
     let mut validator = Validator::with_fragments(schema, document, options, fragments);
+    validator.check_overlap = repeats;
     validator.run();
     if options.max_errors != 0 {
         validator.errors.truncate(options.max_errors);
@@ -116,12 +118,92 @@ fn check_fragment_chain<'a>(
     }
 
     for fragment in fragments.values() {
-        let mut seen = HashMap::new();
+        let mut seen = HashMap::default();
         if let Some(error) = visit(fragments, fragment.name, 1, &mut Vec::new(), &mut seen) {
             return Some(error);
         }
     }
     None
+}
+
+/// Whether any selection set in the document can repeat a response key.
+///
+/// `OverlappingFieldsCanBeMerged` only reports a conflict for a response key selected more than
+/// once in the same selection set, so a document where every key is unique cannot violate it.
+/// Deciding that costs a single string comparison per selection, which is much less than the
+/// type-aware walk the rule needs.
+fn may_repeat_response_key<'a>(
+    fragments: &HashMap<&'a str, &'a FragmentDefinition<'a>>,
+    document: &'a Document<'a>,
+) -> bool {
+    for operation in document.operations() {
+        if set_may_repeat_key(
+            fragments,
+            &operation.selection_set,
+            &mut SmallVec::new(),
+            &mut SmallVec::new(),
+        ) {
+            return true;
+        }
+    }
+    for fragment in document.fragments() {
+        if set_may_repeat_key(
+            fragments,
+            &fragment.selection_set,
+            &mut SmallVec::new(),
+            &mut SmallVec::new(),
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether one selection set, with its fragments expanded, can repeat a response key.
+fn set_may_repeat_key<'a>(
+    fragments: &HashMap<&'a str, &'a FragmentDefinition<'a>>,
+    selection_set: &'a SelectionSet<'a>,
+    visited: &mut SmallVec<[&'a str; 8]>,
+    keys: &mut SmallVec<[&'a str; 16]>,
+) -> bool {
+    for selection in &selection_set.items {
+        match selection {
+            Selection::Field(field) => {
+                let response_key = field.response_key();
+                if keys.iter().any(|known| names_eq(known, response_key)) {
+                    return true;
+                }
+                keys.push(response_key);
+                if let Some(child) = &field.selection_set {
+                    if set_may_repeat_key(
+                        fragments,
+                        child,
+                        &mut SmallVec::new(),
+                        &mut SmallVec::new(),
+                    ) {
+                        return true;
+                    }
+                }
+            }
+            Selection::InlineFragment(fragment) => {
+                if set_may_repeat_key(fragments, &fragment.selection_set, visited, keys) {
+                    return true;
+                }
+            }
+            Selection::FragmentSpread(spread) => {
+                if visited.iter().any(|name| names_eq(name, spread.name)) {
+                    continue;
+                }
+                visited.push(spread.name);
+                if let Some(fragment) = fragments.get(spread.name) {
+                    if set_may_repeat_key(fragments, &fragment.selection_set, visited, keys) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// A set of borrowed names that stays inline for the handful of names most documents use and
@@ -142,7 +224,7 @@ impl<'a> NameSet<'a> {
     pub(crate) fn contains(&self, name: &str) -> bool {
         match &self.large {
             Some(large) => large.contains(name),
-            None => self.small.contains(&name),
+            None => self.small.iter().any(|known| names_eq(known, name)),
         }
     }
 
@@ -151,7 +233,7 @@ impl<'a> NameSet<'a> {
         if let Some(large) = &mut self.large {
             return large.insert(name);
         }
-        if self.small.contains(&name) {
+        if self.small.iter().any(|known| names_eq(known, name)) {
             return false;
         }
         self.small.push(name);
@@ -254,8 +336,8 @@ fn collect_spread_locations<'a>(
 fn selection_depth<'a>(
     fragments: &HashMap<&'a str, &'a FragmentDefinition<'a>>,
     selection_set: &'a SelectionSet<'a>,
-    cache: &mut HashMap<&'a str, usize>,
-    visiting: &mut HashSet<&'a str>,
+    cache: &mut SmallVec<[(&'a str, usize); 8]>,
+    visiting: &mut SmallVec<[&'a str; 8]>,
 ) -> usize {
     let mut max = 0;
     for selection in &selection_set.items {
@@ -267,17 +349,19 @@ fn selection_depth<'a>(
                 selection_depth(fragments, &fragment.selection_set, cache, visiting)
             }
             Selection::FragmentSpread(spread) => {
-                if let Some(depth) = cache.get(spread.name) {
+                if let Some((_, depth)) = cache.iter().find(|(name, _)| names_eq(name, spread.name))
+                {
                     *depth
-                } else if !visiting.insert(spread.name) {
+                } else if visiting.iter().any(|name| names_eq(name, spread.name)) {
                     // A cycle is invalid; treat it as a leaf here and let the cycle rule report it.
                     0
                 } else {
+                    visiting.push(spread.name);
                     let depth = fragments.get(spread.name).map_or(0, |fragment| {
                         selection_depth(fragments, &fragment.selection_set, cache, visiting)
                     });
-                    visiting.remove(spread.name);
-                    cache.insert(spread.name, depth);
+                    visiting.pop();
+                    cache.push((spread.name, depth));
                     depth
                 }
             }
@@ -291,7 +375,7 @@ fn detect_cycle<'a>(
     fragments: &HashMap<&'a str, &'a FragmentDefinition<'a>>,
     name: &'a str,
     path: &mut Vec<&'a str>,
-    visited: &mut HashSet<&'a str>,
+    visited: &mut NameSet<'a>,
     errors: &mut Vec<GraphQLError>,
 ) {
     if visited.contains(name) || path.contains(&name) {
@@ -366,6 +450,8 @@ struct Validator<'a> {
     options: &'a ValidationOptions,
     errors: Vec<GraphQLError>,
     fragments: HashMap<&'a str, &'a FragmentDefinition<'a>>,
+    /// Whether `OverlappingFieldsCanBeMerged` has anything to compare.
+    check_overlap: bool,
 }
 
 impl<'a> Validator<'a> {
@@ -381,6 +467,7 @@ impl<'a> Validator<'a> {
             options,
             errors: Vec::new(),
             fragments,
+            check_overlap: true,
         }
     }
 
@@ -408,13 +495,15 @@ impl<'a> Validator<'a> {
             self.document,
             &mut self.errors,
         );
-        overlap::check(
-            self.schema,
-            self.options,
-            &self.fragments,
-            self.document,
-            &mut self.errors,
-        );
+        if self.check_overlap {
+            overlap::check(
+                self.schema,
+                self.options,
+                &self.fragments,
+                self.document,
+                &mut self.errors,
+            );
+        }
     }
 
     fn check_executable_definitions(&mut self) {
@@ -508,13 +597,13 @@ impl<'a> Validator<'a> {
         collect_top_level_fields(
             &self.fragments,
             &operation.selection_set,
-            &mut HashSet::new(),
+            &mut HashSet::default(),
             &mut fields,
         );
 
         // The specification groups by response key before counting, so `subscription { a a }`
         // has one entry even though it contains two field nodes.
-        let mut keys = HashSet::new();
+        let mut keys = HashSet::default();
         for field in &fields {
             keys.insert(field.response_key());
         }
@@ -661,6 +750,7 @@ impl<'a> Validator<'a> {
                 schema: self.schema,
                 fragments: &self.fragments,
                 errors: &mut self.errors,
+                type_cache: None,
             };
             walk(
                 self.schema,
@@ -680,6 +770,7 @@ impl<'a> Validator<'a> {
                 schema: self.schema,
                 fragments: &self.fragments,
                 errors: &mut self.errors,
+                type_cache: None,
             };
             walk(
                 self.schema,
@@ -695,9 +786,11 @@ impl<'a> Validator<'a> {
         if self.options.max_depth == 0 {
             return;
         }
-        let mut cache = HashMap::new();
+        // A document names only a handful of fragments, so the memo and the cycle guard stay
+        // inline instead of hashing (and allocating) for a handful of entries.
+        let mut cache: SmallVec<[(&str, usize); 8]> = SmallVec::new();
         for operation in self.document.operations() {
-            let mut visiting = HashSet::new();
+            let mut visiting: SmallVec<[&str; 8]> = SmallVec::new();
             let depth = 1 + selection_depth(
                 &self.fragments,
                 &operation.selection_set,
@@ -745,7 +838,7 @@ impl<'a> Validator<'a> {
 
     fn check_fragment_cycles(&mut self) {
         let document = self.document;
-        let mut visited = HashSet::new();
+        let mut visited = NameSet::new();
         for fragment in document.fragments() {
             detect_cycle(
                 &self.fragments,

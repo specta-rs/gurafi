@@ -31,6 +31,33 @@ pub type Name = Arc<str>;
 /// values or arguments than this.
 pub(crate) const SMALL_MAP_LIMIT: usize = 12;
 
+/// Compare two GraphQL names.
+///
+/// Names are short and compared constantly — every field completion, every schema lookup and
+/// every field collection compares one — and `str == str` compiles to a `memcmp` call whose
+/// overhead dominates the handful of bytes actually compared. Walking the bytes inline is faster
+/// for the lengths real documents use, and falls back to the slice comparison for the rare long
+/// name.
+#[inline]
+pub(crate) fn names_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    if left.len() != right.len() {
+        return false;
+    }
+    if left.len() > 8 {
+        return left == right;
+    }
+    let mut index = 0;
+    while index < left.len() {
+        if left[index] != right[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
 /// Look up a name in a definition map, scanning instead of hashing while the map is small.
 ///
 /// Execution performs these lookups for every field it completes and every argument it coerces,
@@ -39,7 +66,7 @@ pub(crate) fn map_get<'m, V>(map: &'m IndexMap<Name, V>, name: &str) -> Option<&
     if map.len() <= SMALL_MAP_LIMIT {
         return map
             .iter()
-            .find(|(key, _)| &***key == name)
+            .find(|(key, _)| names_eq(key, name))
             .map(|(_, value)| value);
     }
     map.get(name)
@@ -103,11 +130,42 @@ pub enum TypeRef {
     NonNull(Box<TypeRef>),
 }
 
+/// The interned name of a built-in type, when `name` is one.
+///
+/// Schema building and variable coercion turn type names from the document into `Arc<str>`s for
+/// every request. The built-in names never change, so sharing one allocation for each of them
+/// removes a handful of allocations (and their frees) from every request.
+pub(crate) fn interned_builtin(name: &str) -> Option<Name> {
+    static NAMES: [std::sync::OnceLock<Name>; 6] = [
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+    ];
+    let index = match name {
+        "String" => 0,
+        "Int" => 1,
+        "Float" => 2,
+        "Boolean" => 3,
+        "ID" => 4,
+        "__Type" => 5,
+        _ => return None,
+    };
+    Some(NAMES[index].get_or_init(|| Name::from(name)).clone())
+}
+
 impl TypeRef {
     /// A reference to a named type.
     #[must_use]
     pub fn named(name: impl Into<Name>) -> Self {
         Self::Named(name.into())
+    }
+
+    /// A reference to a named type, reusing the interned allocation for built-in names.
+    pub(crate) fn named_str(name: &str) -> Self {
+        Self::Named(interned_builtin(name).unwrap_or_else(|| Name::from(name)))
     }
 
     /// The built-in `String` type.

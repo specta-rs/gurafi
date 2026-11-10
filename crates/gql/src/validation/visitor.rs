@@ -70,7 +70,7 @@ fn meta_type(meta: MetaField) -> &'static TypeRef {
 /// Convert an AST type reference into the schema's runtime representation.
 pub(crate) fn type_ref_from_ast(ty: &ast::Type<'_>) -> TypeRef {
     match ty {
-        ast::Type::Named(name) => TypeRef::named(*name),
+        ast::Type::Named(name) => TypeRef::named_str(name),
         ast::Type::List(inner) => TypeRef::List(Box::new(type_ref_from_ast(inner))),
         ast::Type::NonNull(inner) => TypeRef::NonNull(Box::new(type_ref_from_ast(inner))),
     }

@@ -5,7 +5,7 @@
 //! parent types can occur together, and comparisons are memoised so fragments shared by many
 //! operations are not rechecked exponentially often.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use smallvec::SmallVec;
 
@@ -349,8 +349,8 @@ pub(crate) fn check<'a>(
         options,
         fragments,
         errors,
-        compared: HashSet::new(),
-        reported: HashSet::new(),
+        compared: HashSet::default(),
+        reported: HashSet::default(),
     };
 
     for operation in document.operations() {

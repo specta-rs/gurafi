@@ -11,6 +11,8 @@ use std::{any::Any, borrow::Cow, sync::Arc};
 
 use smallvec::SmallVec;
 
+use crate::types::names_eq;
+
 /// A GraphQL input or result value.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
@@ -369,7 +371,7 @@ impl Object {
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.fields
             .iter()
-            .find(|(name, _)| &**name == key)
+            .find(|(name, _)| names_eq(name, key))
             .map(|(_, value)| value)
     }
 
@@ -377,7 +379,7 @@ impl Object {
     pub fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
         self.fields
             .iter_mut()
-            .find(|(name, _)| &**name == key)
+            .find(|(name, _)| names_eq(name, key))
             .map(|(_, value)| value)
     }
 
@@ -391,7 +393,11 @@ impl Object {
     pub fn insert(&mut self, key: impl Into<Arc<str>>, value: impl Into<Value>) -> Option<Value> {
         let key = key.into();
         let value = value.into();
-        if let Some((_, existing)) = self.fields.iter_mut().find(|(name, _)| *name == key) {
+        if let Some((_, existing)) = self
+            .fields
+            .iter_mut()
+            .find(|(name, _)| names_eq(name, &key))
+        {
             return Some(core::mem::replace(existing, value));
         }
         self.fields.push((key, value));
@@ -410,7 +416,10 @@ impl Object {
 
     /// Remove a field by name.
     pub fn remove(&mut self, key: &str) -> Option<Value> {
-        let index = self.fields.iter().position(|(name, _)| &**name == key)?;
+        let index = self
+            .fields
+            .iter()
+            .position(|(name, _)| names_eq(name, key))?;
         Some(self.fields.remove(index).1)
     }
 

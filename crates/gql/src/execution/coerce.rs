@@ -149,6 +149,24 @@ pub(crate) fn coerce_argument_values_into(
     coerced: &mut Object,
 ) -> Result<(), GraphQLError> {
     debug_assert!(coerced.is_empty(), "argument object must start empty");
+
+    // A document that lists exactly the field's arguments, in schema order, needs no
+    // unknown-argument scan and no per-definition search: the two lists already correspond.
+    if node.arguments.len() == field.args.len()
+        && node
+            .arguments
+            .iter()
+            .zip(field.args.iter())
+            .all(|(argument, (name, _))| crate::types::names_eq(argument.name, name))
+    {
+        for (argument, (name, definition)) in node.arguments.iter().zip(field.args.iter()) {
+            coerce_provided_argument(
+                schema, field, name, definition, argument, variables, coerced,
+            )?;
+        }
+        return Ok(());
+    }
+
     for argument in &node.arguments {
         if crate::types::map_get(&field.args, argument.name).is_none() {
             return Err(GraphQLError::new(format!(
@@ -182,49 +200,61 @@ pub(crate) fn coerce_argument_values_into(
             continue;
         };
 
-        // A top-level variable reference follows the specification's *argument* rules rather
-        // than literal rules: an undefined nullable variable means the argument is omitted.
-        if let ast::Value::Variable(variable_name) = &argument.value {
-            match variables.get(variable_name) {
-                Some(value) => {
-                    if value.is_null() && definition.ty.is_non_null() {
-                        return Err(GraphQLError::new(format!(
-                            "Field \"{}\" argument \"{}\" of non-null type \"{}\" must not be null.",
-                            field.name, name, definition.ty
-                        ))
-                        .at(argument.location));
-                    }
-                    coerced.insert(name.clone(), value.clone());
+        coerce_provided_argument(
+            schema, field, name, definition, argument, variables, coerced,
+        )?;
+    }
+    Ok(())
+}
+
+/// Coerce one provided argument into the field's argument object.
+#[allow(clippy::too_many_arguments)]
+fn coerce_provided_argument(
+    schema: &Schema,
+    field: &Field,
+    name: &crate::types::Name,
+    definition: &InputValue,
+    argument: &ast::Argument<'_>,
+    variables: &Object,
+    coerced: &mut Object,
+) -> Result<(), GraphQLError> {
+    // A top-level variable reference follows the specification's *argument* rules rather
+    // than literal rules: an undefined nullable variable means the argument is omitted.
+    if let ast::Value::Variable(variable_name) = &argument.value {
+        match variables.get(variable_name) {
+            Some(value) => {
+                if value.is_null() && definition.ty.is_non_null() {
+                    return Err(GraphQLError::new(format!(
+                        "Field \"{}\" argument \"{}\" of non-null type \"{}\" must not be null.",
+                        field.name, name, definition.ty
+                    ))
+                    .at(argument.location));
                 }
-                None => {
-                    if let Some(default) = &definition.default_value {
-                        let mut default_path = Vec::new();
-                        let value = coerce_input_value(
-                            schema,
-                            default,
-                            &definition.ty,
-                            &mut default_path,
-                        )
-                        .map_err(|error| {
-                            let message = error.message().to_owned();
-                            error.with_message(format!(
-                                "Field \"{}\" argument \"{}\" has an invalid default value: {message}",
-                                field.name, name
-                            ))
-                        })?;
-                        coerced.insert(name.clone(), value);
-                    } else if definition.ty.is_non_null() {
-                        return Err(GraphQLError::new(format!(
+                coerced.insert(name.clone(), value.clone());
+            }
+            None => {
+                if let Some(default) = &definition.default_value {
+                    let mut default_path = Vec::new();
+                    let value =
+                        coerce_input_value(schema, default, &definition.ty, &mut default_path)
+                            .map_err(|error| {
+                                let message = error.message().to_owned();
+                                error.with_message(format!(
+                            "Field \"{}\" argument \"{}\" has an invalid default value: {message}",
+                            field.name, name
+                        ))
+                            })?;
+                    coerced.insert(name.clone(), value);
+                } else if definition.ty.is_non_null() {
+                    return Err(GraphQLError::new(format!(
                             "Field \"{}\" argument \"{}\" of required type \"{}\" was not provided because variable \"${}\" was not provided.",
                             field.name, name, definition.ty, variable_name
                         ))
                         .at(argument.location));
-                    }
                 }
             }
-            continue;
         }
-
+    } else {
         let mut path = Vec::new();
         match value_from_ast(
             schema,
@@ -238,10 +268,10 @@ pub(crate) fn coerce_argument_values_into(
             }
             Ok(None) => {
                 return Err(GraphQLError::new(format!(
-                    "Field \"{}\" argument \"{}\" is invalid: a variable used in its value was not provided.",
-                    field.name, name
-                ))
-                .at(argument.location));
+                        "Field \"{}\" argument \"{}\" is invalid: a variable used in its value was not provided.",
+                        field.name, name
+                    ))
+                    .at(argument.location));
             }
             Err(error) => {
                 let message = error.message().to_owned();
@@ -254,7 +284,6 @@ pub(crate) fn coerce_argument_values_into(
             }
         }
     }
-
     Ok(())
 }
 

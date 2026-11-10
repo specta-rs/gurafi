@@ -118,7 +118,7 @@ pub(crate) async fn subscribe(
         schema,
         &fragments,
         &context.variables,
-        subscription_type.name.as_ref(),
+        &subscription_type,
         &operation.selection_set,
     )
     .map_err(Response::error)?;
@@ -128,7 +128,7 @@ pub(crate) async fn subscribe(
             "A subscription must select exactly one root field.",
         )));
     }
-    let Some((response_key, nodes)) = collected.first() else {
+    let Some((response_key, nodes, _)) = collected.first() else {
         return Err(Response::error(GraphQLError::new(
             "A subscription must select exactly one root field.",
         )));
