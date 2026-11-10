@@ -416,10 +416,32 @@ pub(crate) async fn run_operation<'doc>(
         0,
     ) {
         Some(result) => result,
-        None => executor
-            .execute_fields_inner(root_type, &parent, &selections, &mut path, &mut errors, 0)
-            .await
-            .map(Arc::new),
+        None => {
+            let result = if executor.plans.is_some() {
+                executor
+                    .execute_fields_inner_planned(
+                        root_type,
+                        &parent,
+                        &selections,
+                        &mut path,
+                        &mut errors,
+                        0,
+                    )
+                    .await
+            } else {
+                executor
+                    .execute_fields_inner_dynamic(
+                        root_type,
+                        &parent,
+                        selections.sets,
+                        &mut path,
+                        &mut errors,
+                        0,
+                    )
+                    .await
+            };
+            result.map(Arc::new)
+        }
     };
 
     let data = match result {
@@ -507,7 +529,7 @@ impl<'doc> Executor<'doc> {
             .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
-    async fn execute_fields_inner<'s>(
+    async fn execute_fields_inner_planned<'s>(
         &'s self,
         object_type: &'doc ObjectType,
         parent: &'s Value,
@@ -530,7 +552,7 @@ impl<'doc> Executor<'doc> {
         let mut result = Object::with_capacity(collected.len());
         if self.parallel
             && collected.len() > 1
-            && self.try_execute_all_leaves(
+            && self.try_execute_all_leaves_planned(
                 object_type,
                 parent,
                 &collected,
@@ -560,8 +582,13 @@ impl<'doc> Executor<'doc> {
                 // them in the same ordered batch as the asynchronous fields without boxing
                 // a future or cloning the path for each one.
                 let mut field_errors = Vec::new();
-                let inline =
-                    self.try_execute_leaf(object_type, parent, &group, path, &mut field_errors);
+                let inline = self.try_execute_leaf_planned(
+                    object_type,
+                    parent,
+                    &group,
+                    path,
+                    &mut field_errors,
+                );
                 let future = match inline {
                     Some((response_key, outcome)) => {
                         Either::Left(ready((response_key, outcome, field_errors)))
@@ -570,7 +597,7 @@ impl<'doc> Executor<'doc> {
                         let mut field_path = path.clone();
                         Either::Right(async move {
                             let (response_key, outcome) = self
-                                .execute_field(
+                                .execute_field_planned(
                                     object_type,
                                     parent,
                                     &group,
@@ -619,16 +646,13 @@ impl<'doc> Executor<'doc> {
             // Mutations must keep document order, and a single field has no concurrency to
             // gain.
             if self.expired() {
-                return Err(
-                    GraphQLError::new("The operation timed out before it could finish.")
-                        .with_path(path.to_vec()),
-                );
+                return Err(timeout_error(path));
             }
             let (response_key, outcome) =
-                match self.try_execute_leaf(object_type, parent, &group, path, errors) {
+                match self.try_execute_leaf_planned(object_type, parent, &group, path, errors) {
                     Some(done) => done,
                     None => {
-                        self.execute_field(object_type, parent, &group, path, errors, depth)
+                        self.execute_field_planned(object_type, parent, &group, path, errors, depth)
                             .await
                     }
                 };
@@ -642,7 +666,874 @@ impl<'doc> Executor<'doc> {
         Ok(result)
     }
 
-    /// Boxed form of [`Self::execute_fields_inner`] for nested completion.
+    async fn execute_fields_inner_dynamic<'s>(
+        &'s self,
+        object_type: &'doc ObjectType,
+        parent: &'s Value,
+        selection_sets: &'s [&'doc ast::SelectionSet<'doc>],
+        path: &'s mut Path,
+        errors: &'s mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> Result<Object, GraphQLError>
+    where
+        'doc: 's,
+    {
+        let mut collected = collect::collect_dynamic(
+            &self.context.schema,
+            &self.fragments,
+            &self.context.variables,
+            object_type,
+            selection_sets,
+        )?;
+        let mut result = Object::with_capacity(collected.len());
+        if self.parallel
+            && collected.len() > 1
+            && self.try_execute_all_leaves_dynamic(
+                object_type,
+                parent,
+                &mut collected,
+                path,
+                errors,
+                &mut result,
+            )?
+        {
+            return Ok(result);
+        }
+        if self.parallel && collected.len() > 1 {
+            // The batch lives on the heap so the boxed future below stays small enough to
+            // recurse safely.
+            let mut futures = Vec::with_capacity(collected.len());
+            for (response_key, nodes, field) in collected {
+                if self.expired() {
+                    return Err(GraphQLError::new(
+                        "The operation timed out before it could finish.",
+                    )
+                    .with_path(path.to_vec()));
+                }
+                // Leaf fields that need no resolver complete synchronously; `ready` keeps
+                // them in the same ordered batch as the asynchronous fields without boxing
+                // a future or cloning the path for each one.
+                let mut field_errors = Vec::new();
+                let inline = self.try_execute_leaf_dynamic(
+                    object_type,
+                    parent,
+                    response_key,
+                    &nodes,
+                    field,
+                    path,
+                    &mut field_errors,
+                );
+                let future = match inline {
+                    Some((response_key, outcome)) => {
+                        Either::Left(ready((response_key, outcome, field_errors)))
+                    }
+                    None => {
+                        let mut field_path = path.clone();
+                        Either::Right(async move {
+                            let (response_key, outcome) = self
+                                .dynamic_field_future(
+                                    object_type,
+                                    parent,
+                                    response_key,
+                                    &nodes,
+                                    field,
+                                    &mut field_path,
+                                    &mut field_errors,
+                                    depth,
+                                )
+                                .await;
+                            (response_key, outcome, field_errors)
+                        })
+                    }
+                };
+                futures.push(future);
+            }
+            // `join_all` reaches the same concurrency as `buffered` whenever every sibling
+            // fits under the limit, and does not allocate the ordered-stream bookkeeping.
+            let max_concurrency = self.context.max_concurrency;
+            let outcomes: Vec<_> = if max_concurrency == 0 || futures.len() <= max_concurrency {
+                futures::future::join_all(futures).await
+            } else {
+                buffered(futures, max_concurrency).await
+            };
+            let mut bubble = None;
+            for (response_key, outcome, field_errors) in outcomes {
+                append_errors(errors, field_errors, self.context.max_errors);
+                match outcome {
+                    Ok(value) => result.push_unchecked(response_key, value),
+                    // A non-null field failed; keep collecting the other fields' errors, but
+                    // the object itself becomes null.
+                    Err(error) => {
+                        if bubble.is_none() {
+                            bubble = Some(error);
+                        }
+                    }
+                }
+            }
+            if let Some(error) = bubble {
+                return Err(error);
+            }
+            return Ok(result);
+        }
+        for (response_key, nodes, field) in collected {
+            // Mutations must keep document order, and a single field has no concurrency to
+            // gain.
+            if self.expired() {
+                return Err(timeout_error(path));
+            }
+            let (response_key, outcome) = match self.try_execute_leaf_dynamic(
+                object_type,
+                parent,
+                response_key,
+                &nodes,
+                field,
+                path,
+                errors,
+            ) {
+                Some(done) => done,
+                None => {
+                    self.dynamic_field_future(
+                        object_type,
+                        parent,
+                        response_key,
+                        &nodes,
+                        field,
+                        path,
+                        errors,
+                        depth,
+                    )
+                    .await
+                }
+            };
+            match outcome {
+                Ok(value) => {
+                    result.push_unchecked(response_key, value);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(result)
+    }
+
+    /// Complete a selection set made only of object properties, without a plan.
+    fn try_execute_all_leaves_dynamic(
+        &self,
+        object_type: &ObjectType,
+        parent: &Value,
+        collected: &mut collect::DynamicFields<'doc>,
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+        result: &mut Object,
+    ) -> Result<bool, GraphQLError> {
+        if !collected.iter().all(|(_, nodes, field)| {
+            self.can_execute_leaf_inline_dynamic(object_type, nodes, *field)
+        }) {
+            return Ok(false);
+        }
+        for (response_key, nodes, field) in collected.drain(..) {
+            if self.expired() {
+                return Err(timeout_error(path));
+            }
+            let (response_key, outcome) = self
+                .try_execute_leaf_dynamic(
+                    object_type,
+                    parent,
+                    response_key,
+                    &nodes,
+                    field,
+                    path,
+                    errors,
+                )
+                .expect("the inline predicate and the fast path agree");
+            result.push_unchecked(response_key, outcome?);
+        }
+        Ok(true)
+    }
+
+    /// Whether a field can be completed by [`Self::try_execute_leaf_planned`].
+    fn can_execute_leaf_inline_dynamic(
+        &self,
+        object_type: &ObjectType,
+        nodes: &[&'doc ast::Field<'doc>],
+        field: Option<&crate::types::Field>,
+    ) -> bool {
+        nodes
+            .first()
+            .is_some_and(|first| self.leaf_field(object_type, first, field).is_some())
+    }
+
+    /// The schema field for a selection that the synchronous leaf path can complete.
+    ///
+    /// The field must exist, have no resolver and no arguments (so argument coercion cannot
+    /// fail or be observed), and return a scalar or enum.
+    fn try_execute_leaf_dynamic<'s>(
+        &'s self,
+        object_type: &ObjectType,
+        parent: &Value,
+        response_key: &'doc str,
+        nodes: &'s [&'doc ast::Field<'doc>],
+        hint: Option<&'doc crate::types::Field>,
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+    ) -> Option<(Arc<str>, Result<Value, GraphQLError>)>
+    where
+        'doc: 's,
+    {
+        let first = nodes.first().copied()?;
+        let field = self.leaf_field(object_type, first, hint)?;
+
+        // An unaliased field's response key is the schema field's interned name, so the
+        // response object and the error path can share that `Arc`.
+        let key: Arc<str> = match first.alias {
+            Some(_) => Arc::from(response_key),
+            None => field.name.clone(),
+        };
+        let location = first.location;
+        // The path takes ownership of the key and hands it back on the way out: cloning it for
+        // the path would add a refcount round trip to every completed field.
+        path.push(PathSegment::Field(key));
+        if self.expired() {
+            let error = GraphQLError::new("The operation timed out before it could finish.")
+                .with_path(path.to_vec());
+            path.pop();
+            return Some((Arc::from(response_key), Err(error)));
+        }
+
+        let label = FieldLabel {
+            parent: object_type.name.as_ref(),
+            name: field.name.as_ref(),
+        };
+        let outcome = match default_property(label, field.name.as_ref(), parent) {
+            Ok(value) => {
+                let value = property_value(value);
+                match self.complete_leaf(&value, &field.ty, label, location, path, false) {
+                    Some(outcome) => outcome,
+                    None => {
+                        path.pop();
+                        return None;
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let outcome = finish_field(
+            outcome,
+            Some(&field.ty),
+            path,
+            location,
+            errors,
+            self.context.max_errors,
+        );
+        Some((pop_field_key(path), outcome))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// The boxed field future for the dynamic path, choosing the argument-free implementation
+    /// when the field has no arguments.
+    #[allow(clippy::too_many_arguments)]
+    fn dynamic_field_future<'s>(
+        &'s self,
+        object_type: &'doc ObjectType,
+        parent: &'s Value,
+        response_key: &'doc str,
+        nodes: &'s [&'doc ast::Field<'doc>],
+        hint: Option<&'doc crate::types::Field>,
+        path: &'s mut Path,
+        errors: &'s mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> BoxFuture<'s, (Arc<str>, Result<Value, GraphQLError>)>
+    where
+        'doc: 's,
+    {
+        let no_args = hint.map_or(true, |field| field.args.is_empty())
+            && nodes.first().is_some_and(|node| node.arguments.is_empty());
+        if no_args {
+            self.execute_field_no_args_async(
+                object_type,
+                parent,
+                response_key,
+                nodes,
+                hint,
+                path,
+                errors,
+                depth,
+            )
+        } else {
+            self.execute_field_dynamic_async(
+                object_type,
+                parent,
+                response_key,
+                nodes,
+                hint,
+                path,
+                errors,
+                depth,
+            )
+        }
+    }
+
+    fn execute_field_dynamic_async<'s>(
+        &'s self,
+        object_type: &'doc ObjectType,
+        parent: &'s Value,
+        response_key: &'doc str,
+        nodes: &'s [&'doc ast::Field<'doc>],
+        hint: Option<&'doc crate::types::Field>,
+        path: &'s mut Path,
+        errors: &'s mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> BoxFuture<'s, (Arc<str>, Result<Value, GraphQLError>)>
+    where
+        'doc: 's,
+    {
+        async move {
+            let Some(first) = nodes.first().copied() else {
+                return (
+                    Arc::from(response_key),
+                    Err(GraphQLError::new(format!(
+                        "No field node was provided for response key \"{response_key}\"."
+                    ))),
+                );
+            };
+
+            // An unaliased field's response key is exactly the schema field's interned name, so the
+            // response object and the error path can share that `Arc` instead of allocating one.
+            let field = match hint {
+                Some(field) => Some(field),
+                None => object_type.get_field(first.name),
+            };
+            let key: Arc<str> = match (field, first.alias) {
+                (Some(field), None) => field.name.clone(),
+                _ => Arc::from(response_key),
+            };
+            path.push(PathSegment::Field(key));
+
+            let outcome = self
+                .execute_field_inner_dynamic_async(
+                    object_type,
+                    field,
+                    parent,
+                    first,
+                    nodes,
+                    path,
+                    errors,
+                    depth,
+                )
+                .await;
+            (pop_field_key(path), outcome)
+        }
+        .boxed()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_field_inner_dynamic_async(
+        &self,
+        object_type: &ObjectType,
+        field: Option<&crate::types::Field>,
+        parent: &Value,
+        first: &ast::Field<'_>,
+        nodes: &[&'doc ast::Field<'doc>],
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> Result<Value, GraphQLError> {
+        let location = first.location;
+        // A single leaf node collects no selection sets, which is the majority of fields and
+        // does not need to build (or even walk) the list.
+        let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 2]> = match nodes {
+            [only] if only.selection_set.is_none() => SmallVec::new(),
+            _ => nodes
+                .iter()
+                .filter_map(|node| node.selection_set.as_ref())
+                .collect(),
+        };
+        let selections = Selections::new(&selection_sets, None);
+
+        if self.expired() {
+            return Err(
+                GraphQLError::new("The operation timed out before it could finish.")
+                    .with_path(path.to_vec())
+                    .at(location),
+            );
+        }
+
+        // Meta fields are resolved before normal field lookup because they never appear in
+        // the schema's type map.
+        if let Some(ty) = meta_return_type(first.name) {
+            let label = FieldLabel {
+                parent: object_type.name.as_ref(),
+                name: first.name,
+            };
+            let empty_args = Object::new();
+            let info = ResolveInfo {
+                field_name: first.name,
+                parent_type: object_type.name.as_ref(),
+                return_type: &ty,
+                path: path.as_slice(),
+                schema: &self.context.schema,
+            };
+            let denial = match self.context.authorizer.as_ref() {
+                Some(authorizer) => {
+                    let authorization = AuthorizationContext {
+                        context: self.context,
+                        field_name: first.name,
+                        parent_type: object_type.name.as_ref(),
+                        return_type: &ty,
+                        path: path.as_slice(),
+                        args: &empty_args,
+                        info: &info,
+                    };
+                    authorizer.authorize_async(&authorization).await.err()
+                }
+                None => None,
+            };
+            let outcome = match denial {
+                Some(error) => Err(error),
+                None => match self.resolve_meta(object_type, parent, first) {
+                    Ok(value) => {
+                        match self.complete_leaf(&value, &ty, label, location, path, false) {
+                            Some(completed) => completed,
+                            None => match self.try_complete_field_value_sync(
+                                &value,
+                                &ty,
+                                label,
+                                &selections,
+                                location,
+                                path,
+                                errors,
+                                depth,
+                            ) {
+                                Some(completed) => completed,
+                                None => {
+                                    self.complete_field_value(
+                                        &value,
+                                        &ty,
+                                        label,
+                                        &selections,
+                                        location,
+                                        path,
+                                        errors,
+                                        depth,
+                                    )
+                                    .await
+                                }
+                            },
+                        }
+                    }
+                    Err(error) => Err(error),
+                },
+            };
+            return finish_field(
+                outcome,
+                Some(&ty),
+                path,
+                location,
+                errors,
+                self.context.max_errors,
+            );
+        }
+
+        let Some(field) = field else {
+            let error = unknown_field_error(first.name, object_type.name.as_ref(), location);
+            return finish_field(
+                Err(error),
+                None,
+                path,
+                location,
+                errors,
+                self.context.max_errors,
+            );
+        };
+
+        let label = FieldLabel {
+            parent: object_type.name.as_ref(),
+            name: field.name.as_ref(),
+        };
+        // Coercing an empty argument list cannot fail, and most fields take no arguments, so the
+        // common case skips the work instead of building an object nothing reads.
+        let mut args = Object::with_capacity(field.args.len());
+        if !(first.arguments.is_empty() && field.args.is_empty()) {
+            if let Err(error) = coerce::coerce_argument_values_into(
+                &self.context.schema,
+                field,
+                first,
+                &self.context.variables,
+                &mut args,
+            ) {
+                return finish_field(
+                    Err(error),
+                    Some(&field.ty),
+                    path,
+                    location,
+                    errors,
+                    self.context.max_errors,
+                );
+            }
+        }
+        let args = &args;
+
+        // The authorizer and the resolver both see the same `ResolveInfo`; the borrow of
+        // `path` ends before completion needs it mutably again.
+        //
+        // A resolver produces an owned value, but a field without one just reads the parent
+        // object's property. Borrowing that property instead of cloning it is what keeps
+        // composite fields free of a full copy of the parent's list or object.
+        let resolved = {
+            let info = ResolveInfo {
+                field_name: field.name.as_ref(),
+                parent_type: object_type.name.as_ref(),
+                return_type: &field.ty,
+                path: path.as_slice(),
+                schema: &self.context.schema,
+            };
+            let denial = match self.context.authorizer.as_ref() {
+                Some(authorizer) if !(self.skip_root_authorization && path.len() == 1) => {
+                    let authorization = AuthorizationContext {
+                        context: self.context,
+                        field_name: field.name.as_ref(),
+                        parent_type: object_type.name.as_ref(),
+                        return_type: &field.ty,
+                        path: path.as_slice(),
+                        args,
+                        info: &info,
+                    };
+                    authorizer.authorize_async(&authorization).await.err()
+                }
+                _ => None,
+            };
+            if let Some(error) = denial {
+                Err(error)
+            } else {
+                let resolver_context = ResolverContext {
+                    parent,
+                    args,
+                    context: self.context,
+                    info: &info,
+                };
+                match &field.resolve {
+                    Some(resolve) => resolve(resolver_context).await.map(Cow::Owned),
+                    None => {
+                        default_property(label, field.name.as_ref(), parent).map(property_value)
+                    }
+                }
+            }
+        };
+
+        let outcome = match resolved {
+            Ok(value) => {
+                match self.complete_leaf(&value, &field.ty, label, location, path, false) {
+                    Some(completed) => completed,
+                    None => match self.try_complete_field_value_sync(
+                        &value,
+                        &field.ty,
+                        label,
+                        &selections,
+                        location,
+                        path,
+                        errors,
+                        depth,
+                    ) {
+                        Some(completed) => completed,
+                        None => {
+                            self.complete_field_value(
+                                &value,
+                                &field.ty,
+                                label,
+                                &selections,
+                                location,
+                                path,
+                                errors,
+                                depth,
+                            )
+                            .await
+                        }
+                    },
+                }
+            }
+            Err(error) => Err(error),
+        };
+        finish_field(
+            outcome,
+            Some(&field.ty),
+            path,
+            location,
+            errors,
+            self.context.max_errors,
+        )
+    }
+
+    fn execute_field_no_args_async<'s>(
+        &'s self,
+        object_type: &'doc ObjectType,
+        parent: &'s Value,
+        response_key: &'doc str,
+        nodes: &'s [&'doc ast::Field<'doc>],
+        hint: Option<&'doc crate::types::Field>,
+        path: &'s mut Path,
+        errors: &'s mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> BoxFuture<'s, (Arc<str>, Result<Value, GraphQLError>)>
+    where
+        'doc: 's,
+    {
+        async move {
+            let Some(first) = nodes.first().copied() else {
+                return (
+                    Arc::from(response_key),
+                    Err(GraphQLError::new(format!(
+                        "No field node was provided for response key \"{response_key}\"."
+                    ))),
+                );
+            };
+
+            // An unaliased field's response key is exactly the schema field's interned name, so the
+            // response object and the error path can share that `Arc` instead of allocating one.
+            let field = match hint {
+                Some(field) => Some(field),
+                None => object_type.get_field(first.name),
+            };
+            let key: Arc<str> = match (field, first.alias) {
+                (Some(field), None) => field.name.clone(),
+                _ => Arc::from(response_key),
+            };
+            path.push(PathSegment::Field(key));
+
+            let outcome = self
+                .execute_field_inner_no_args_async(
+                    object_type,
+                    field,
+                    parent,
+                    first,
+                    nodes,
+                    path,
+                    errors,
+                    depth,
+                )
+                .await;
+            (pop_field_key(path), outcome)
+        }
+        .boxed()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_field_inner_no_args_async(
+        &self,
+        object_type: &ObjectType,
+        field: Option<&crate::types::Field>,
+        parent: &Value,
+        first: &ast::Field<'_>,
+        nodes: &[&'doc ast::Field<'doc>],
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> Result<Value, GraphQLError> {
+        let location = first.location;
+        // A single leaf node collects no selection sets, which is the majority of fields and
+        // does not need to build (or even walk) the list.
+        let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 2]> = match nodes {
+            [only] if only.selection_set.is_none() => SmallVec::new(),
+            _ => nodes
+                .iter()
+                .filter_map(|node| node.selection_set.as_ref())
+                .collect(),
+        };
+        let selections = Selections::new(&selection_sets, None);
+
+        if self.expired() {
+            return Err(
+                GraphQLError::new("The operation timed out before it could finish.")
+                    .with_path(path.to_vec())
+                    .at(location),
+            );
+        }
+
+        // Meta fields are resolved before normal field lookup because they never appear in
+        // the schema's type map.
+        if let Some(ty) = meta_return_type(first.name) {
+            let label = FieldLabel {
+                parent: object_type.name.as_ref(),
+                name: first.name,
+            };
+            let empty_args = Object::new();
+            let info = ResolveInfo {
+                field_name: first.name,
+                parent_type: object_type.name.as_ref(),
+                return_type: &ty,
+                path: path.as_slice(),
+                schema: &self.context.schema,
+            };
+            let denial = match self.context.authorizer.as_ref() {
+                Some(authorizer) => {
+                    let authorization = AuthorizationContext {
+                        context: self.context,
+                        field_name: first.name,
+                        parent_type: object_type.name.as_ref(),
+                        return_type: &ty,
+                        path: path.as_slice(),
+                        args: &empty_args,
+                        info: &info,
+                    };
+                    authorizer.authorize_async(&authorization).await.err()
+                }
+                None => None,
+            };
+            let outcome = match denial {
+                Some(error) => Err(error),
+                None => match self.resolve_meta(object_type, parent, first) {
+                    Ok(value) => {
+                        match self.complete_leaf(&value, &ty, label, location, path, false) {
+                            Some(completed) => completed,
+                            None => match self.try_complete_field_value_sync(
+                                &value,
+                                &ty,
+                                label,
+                                &selections,
+                                location,
+                                path,
+                                errors,
+                                depth,
+                            ) {
+                                Some(completed) => completed,
+                                None => {
+                                    self.complete_field_value(
+                                        &value,
+                                        &ty,
+                                        label,
+                                        &selections,
+                                        location,
+                                        path,
+                                        errors,
+                                        depth,
+                                    )
+                                    .await
+                                }
+                            },
+                        }
+                    }
+                    Err(error) => Err(error),
+                },
+            };
+            return finish_field(
+                outcome,
+                Some(&ty),
+                path,
+                location,
+                errors,
+                self.context.max_errors,
+            );
+        }
+
+        let Some(field) = field else {
+            let error = unknown_field_error(first.name, object_type.name.as_ref(), location);
+            return finish_field(
+                Err(error),
+                None,
+                path,
+                location,
+                errors,
+                self.context.max_errors,
+            );
+        };
+
+        let label = FieldLabel {
+            parent: object_type.name.as_ref(),
+            name: field.name.as_ref(),
+        };
+        // Fields without arguments skip the argument object entirely. Keeping it out of this
+        // frame is what preserves stack headroom at the parser's depth limit.
+        let args = empty_object();
+
+        // The authorizer and the resolver both see the same `ResolveInfo`; the borrow of
+        // `path` ends before completion needs it mutably again.
+        //
+        // A resolver produces an owned value, but a field without one just reads the parent
+        // object's property. Borrowing that property instead of cloning it is what keeps
+        // composite fields free of a full copy of the parent's list or object.
+        let resolved = {
+            let info = ResolveInfo {
+                field_name: field.name.as_ref(),
+                parent_type: object_type.name.as_ref(),
+                return_type: &field.ty,
+                path: path.as_slice(),
+                schema: &self.context.schema,
+            };
+            let denial = match self.context.authorizer.as_ref() {
+                Some(authorizer) if !(self.skip_root_authorization && path.len() == 1) => {
+                    let authorization = AuthorizationContext {
+                        context: self.context,
+                        field_name: field.name.as_ref(),
+                        parent_type: object_type.name.as_ref(),
+                        return_type: &field.ty,
+                        path: path.as_slice(),
+                        args,
+                        info: &info,
+                    };
+                    authorizer.authorize_async(&authorization).await.err()
+                }
+                _ => None,
+            };
+            if let Some(error) = denial {
+                Err(error)
+            } else {
+                let resolver_context = ResolverContext {
+                    parent,
+                    args,
+                    context: self.context,
+                    info: &info,
+                };
+                match &field.resolve {
+                    Some(resolve) => resolve(resolver_context).await.map(Cow::Owned),
+                    None => {
+                        default_property(label, field.name.as_ref(), parent).map(property_value)
+                    }
+                }
+            }
+        };
+
+        let outcome = match resolved {
+            Ok(value) => {
+                match self.complete_leaf(&value, &field.ty, label, location, path, false) {
+                    Some(completed) => completed,
+                    None => match self.try_complete_field_value_sync(
+                        &value,
+                        &field.ty,
+                        label,
+                        &selections,
+                        location,
+                        path,
+                        errors,
+                        depth,
+                    ) {
+                        Some(completed) => completed,
+                        None => {
+                            self.complete_field_value(
+                                &value,
+                                &field.ty,
+                                label,
+                                &selections,
+                                location,
+                                path,
+                                errors,
+                                depth,
+                            )
+                            .await
+                        }
+                    },
+                }
+            }
+            Err(error) => Err(error),
+        };
+        finish_field(
+            outcome,
+            Some(&field.ty),
+            path,
+            location,
+            errors,
+            self.context.max_errors,
+        )
+    }
+
+    /// Boxed form of [`Self::execute_fields_inner_planned`] for nested completion.
     ///
     /// The box is what bounds the recursive poll stack and breaks the future's type recursion:
     /// `complete_object` is reachable from a field future, which is reachable from this function,
@@ -659,8 +1550,22 @@ impl<'doc> Executor<'doc> {
     where
         'doc: 's,
     {
-        self.execute_fields_inner(object_type, parent, selections, path, errors, depth)
+        // Prepared queries use the planned completion path. Normal execution keeps the original
+        // dynamic one, whose frames preserve the stack bound at the parser's depth limit.
+        if self.plans.is_some() {
+            self.execute_fields_inner_planned(object_type, parent, selections, path, errors, depth)
+                .boxed()
+        } else {
+            self.execute_fields_inner_dynamic(
+                object_type,
+                parent,
+                selections.sets,
+                path,
+                errors,
+                depth,
+            )
             .boxed()
+        }
     }
 
     /// Complete a selection set made only of object properties.
@@ -668,7 +1573,7 @@ impl<'doc> Executor<'doc> {
     /// This runs before the asynchronous batch is built so such sets never allocate or poll a
     /// future, and it is a separate function so its locals do not enlarge the recursive
     /// [`Self::execute_fields`] frame.
-    fn try_execute_all_leaves(
+    fn try_execute_all_leaves_planned(
         &self,
         object_type: &'doc ObjectType,
         parent: &Value,
@@ -681,7 +1586,7 @@ impl<'doc> Executor<'doc> {
             let Some(group) = collected.view(index, &self.context.variables, object_type) else {
                 continue;
             };
-            if !self.can_execute_leaf_inline(object_type, &group) {
+            if !self.can_execute_leaf_inline_planned(object_type, &group) {
                 return Ok(false);
             }
         }
@@ -691,21 +1596,18 @@ impl<'doc> Executor<'doc> {
                 continue;
             };
             if check_deadline && self.expired() {
-                return Err(
-                    GraphQLError::new("The operation timed out before it could finish.")
-                        .with_path(path.to_vec()),
-                );
+                return Err(timeout_error(path));
             }
             let (response_key, outcome) = self
-                .try_execute_leaf(object_type, parent, &group, path, errors)
+                .try_execute_leaf_planned(object_type, parent, &group, path, errors)
                 .expect("the inline predicate and the fast path agree");
             result.push_unchecked(response_key, outcome?);
         }
         Ok(true)
     }
 
-    /// Whether a field can be completed by [`Self::try_execute_leaf`].
-    fn can_execute_leaf_inline(
+    /// Whether a field can be completed by [`Self::try_execute_leaf_planned`].
+    fn can_execute_leaf_inline_planned(
         &self,
         object_type: &ObjectType,
         group: &GroupView<'_, 'doc>,
@@ -749,7 +1651,7 @@ impl<'doc> Executor<'doc> {
     /// future and cloning the path for every such field, which is the common case for object
     /// properties. Returning `None` hands the field to the general path unchanged.
     #[allow(clippy::too_many_arguments)]
-    fn try_execute_leaf<'s>(
+    fn try_execute_leaf_planned<'s>(
         &'s self,
         object_type: &ObjectType,
         parent: &Value,
@@ -806,7 +1708,7 @@ impl<'doc> Executor<'doc> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn execute_field<'s>(
+    fn execute_field_planned<'s>(
         &'s self,
         object_type: &'doc ObjectType,
         parent: &'s Value,
@@ -835,7 +1737,7 @@ impl<'doc> Executor<'doc> {
             path.push(PathSegment::Field(key));
 
             let outcome = self
-                .execute_field_inner(object_type, group, parent, path, errors, depth)
+                .execute_field_inner_planned(object_type, group, parent, path, errors, depth)
                 .await;
             (pop_field_key(path), outcome)
         }
@@ -843,7 +1745,7 @@ impl<'doc> Executor<'doc> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn execute_field_inner(
+    async fn execute_field_inner_planned(
         &self,
         object_type: &ObjectType,
         group: &GroupView<'_, 'doc>,
@@ -956,11 +1858,7 @@ impl<'doc> Executor<'doc> {
         }
 
         let Some(field) = group.field else {
-            let error = GraphQLError::new(format!(
-                "Cannot query field \"{}\" on type \"{}\".",
-                first.name, object_type.name
-            ))
-            .at(location);
+            let error = unknown_field_error(first.name, object_type.name.as_ref(), location);
             return finish_field(
                 Err(error),
                 None,
@@ -1336,14 +2234,7 @@ impl<'doc> Executor<'doc> {
         depth: usize,
     ) -> Result<Value, GraphQLError> {
         let Value::List(items) = value else {
-            return Err(located(
-                format!(
-                    "Expected a list for field {label}, but the resolved value is a {}.",
-                    value.kind()
-                ),
-                path,
-                location,
-            ));
+            return Err(list_mismatch_error(label, value, path, location));
         };
         let mut completed = Vec::with_capacity(items.len());
         for (index, item) in items.iter().enumerate() {
@@ -1429,11 +2320,7 @@ impl<'doc> Executor<'doc> {
         }
         if value.is_null() {
             return if non_null {
-                Err(located(
-                    format!("Cannot return null for non-nullable field {label}."),
-                    path,
-                    location,
-                ))
+                Err(non_null_error(label, path, location))
             } else {
                 Ok(Value::Null)
             };
@@ -1460,11 +2347,7 @@ impl<'doc> Executor<'doc> {
             }
         };
         if non_null && completed.is_null() {
-            return Err(located(
-                format!("Cannot return null for non-nullable field {label}."),
-                path,
-                location,
-            ));
+            return Err(non_null_error(label, path, location));
         }
         Ok(completed)
     }
@@ -1493,11 +2376,7 @@ impl<'doc> Executor<'doc> {
         }
         if item.is_null() {
             return if non_null {
-                Err(located(
-                    format!("Cannot return null for non-nullable field {label}."),
-                    path,
-                    location,
-                ))
+                Err(non_null_error(label, path, location))
             } else {
                 Ok(Value::Null)
             };
@@ -1603,11 +2482,7 @@ impl<'doc> Executor<'doc> {
         depth: usize,
     ) -> Result<Value, GraphQLError> {
         let Some(definition) = self.context.schema.get_type(name) else {
-            return Err(located(
-                format!("Type \"{name}\" used by field {label} is not defined by the schema."),
-                path,
-                location,
-            ));
+            return Err(undefined_output_type_error(name, label, path, location));
         };
         match definition {
             Type::Scalar(scalar) => {
@@ -1616,11 +2491,7 @@ impl<'doc> Executor<'doc> {
                 }
                 let serialized = if let Some(serialize) = scalar.serialize_fn() {
                     serialize(value).map_err(|message| {
-                        located(
-                            format!("Field {label} could not be serialized: {message}"),
-                            path,
-                            location,
-                        )
+                        scalar_serialize_error(label, &message, path, location)
                     })?
                 } else {
                     value.clone()
@@ -1628,11 +2499,9 @@ impl<'doc> Executor<'doc> {
                 if is_legal_scalar_value(&serialized) {
                     Ok(serialized)
                 } else {
-                    Err(located(
-                        format!(
-                            "Field {label} serialized to a {} which is not a valid scalar value.",
-                            serialized.kind()
-                        ),
+                    Err(invalid_scalar_value_error(
+                        label,
+                        serialized.kind(),
                         path,
                         location,
                     ))
@@ -1642,20 +2511,17 @@ impl<'doc> Executor<'doc> {
                 Value::Enum(value) | Value::String(value) if enumeration.has_value(value) => {
                     Ok(Value::Enum(value.clone()))
                 }
-                Value::Enum(value) | Value::String(value) => Err(located(
-                    format!(
-                        "Value \"{value}\" does not exist in enum \"{}\" for field {label}.",
-                        enumeration.name
-                    ),
+                Value::Enum(value) | Value::String(value) => Err(unknown_enum_value_error(
+                    value,
+                    &enumeration.name,
+                    label,
                     path,
                     location,
                 )),
-                other => Err(located(
-                    format!(
-                        "Field {label} expects enum \"{}\" but received a {}.",
-                        enumeration.name,
-                        other.kind()
-                    ),
+                other => Err(enum_value_type_error(
+                    label,
+                    &enumeration.name,
+                    other.kind(),
                     path,
                     location,
                 )),
@@ -1668,12 +2534,10 @@ impl<'doc> Executor<'doc> {
             }
             Type::Interface(_) | Type::Union(_) => {
                 if !matches!(value, Value::Object(_) | Value::External(_)) {
-                    return Err(located(
-                        format!(
-                            "Field {label} expects a {} but received a {}.",
-                            name,
-                            value.kind()
-                        ),
+                    return Err(abstract_value_type_error(
+                        name,
+                        label,
+                        value.kind(),
                         path,
                         location,
                     ));
@@ -1686,11 +2550,7 @@ impl<'doc> Executor<'doc> {
                 )
                 .await
             }
-            Type::InputObject(_) => Err(located(
-                format!("Field {label} has input object type \"{name}\" as its return type."),
-                path,
-                location,
-            )),
+            Type::InputObject(_) => Err(input_object_return_error(name, label, path, location)),
         }
     }
 
@@ -1707,25 +2567,10 @@ impl<'doc> Executor<'doc> {
         depth: usize,
     ) -> Result<Value, GraphQLError> {
         if !matches!(value, Value::Object(_) | Value::External(_)) {
-            return Err(located(
-                format!(
-                    "Field {label} expects an object of type \"{}\" but received a {}.",
-                    object.name,
-                    value.kind()
-                ),
-                path,
-                location,
-            ));
+            return Err(object_mismatch_error(label, object, value, path, location));
         }
         if selections.is_empty() {
-            return Err(located(
-                format!(
-                    "Field {label} of type \"{}\" must have a selection set.",
-                    object.name
-                ),
-                path,
-                location,
-            ));
+            return Err(missing_selection_set_error(label, object, path, location));
         }
         // The field that produced this value already tried the synchronous completion path (see
         // [`Self::try_complete_field_value_sync`]); reaching here means the subtree needs the
@@ -1862,10 +2707,7 @@ impl<'doc> Executor<'doc> {
                 continue;
             }
             if check_deadline && self.expired() {
-                return Err(
-                    GraphQLError::new("The operation timed out before it could finish.")
-                        .with_path(path.to_vec()),
-                );
+                return Err(timeout_error(path));
             }
             if let (Some(property), Some(parent_object)) = (&group.property, parent_object) {
                 if let Some(value) = parent_object
@@ -1908,10 +2750,7 @@ impl<'doc> Executor<'doc> {
         for (response_key, nodes, field) in fields {
             let response_key: &'doc str = response_key;
             if check_deadline && self.expired() {
-                return Err(
-                    GraphQLError::new("The operation timed out before it could finish.")
-                        .with_path(path.to_vec()),
-                );
+                return Err(timeout_error(path));
             }
             // A property of a built-in scalar type is the single most common field in a response,
             // and it cannot fail: no resolver, no arguments, no sub-selection and a value that
@@ -1961,9 +2800,7 @@ impl<'doc> Executor<'doc> {
         let Some(first) = nodes.first().copied() else {
             return Some((
                 Arc::from(response_key),
-                Err(GraphQLError::new(format!(
-                    "No field node was provided for response key \"{response_key}\"."
-                ))),
+                Err(missing_field_node_error(response_key)),
             ));
         };
         if meta_return_type(first.name).is_some() {
@@ -2011,19 +2848,11 @@ impl<'doc> Executor<'doc> {
         };
         let selections = Selections::new(&selection_sets, None);
         if self.expired() {
-            return Some(Err(GraphQLError::new(
-                "The operation timed out before it could finish.",
-            )
-            .with_path(path.to_vec())
-            .at(location)));
+            return Some(Err(timeout_error_at(path, location)));
         }
 
         let Some(field) = field else {
-            let error = GraphQLError::new(format!(
-                "Cannot query field \"{}\" on type \"{}\".",
-                first.name, object_type.name
-            ))
-            .at(location);
+            let error = unknown_field_error(first.name, object_type.name.as_ref(), location);
             return Some(finish_field(
                 Err(error),
                 None,
@@ -2164,19 +2993,11 @@ impl<'doc> Executor<'doc> {
         let selections = Selections::new(&selection_sets, variant.child);
 
         if self.expired() {
-            return Some(Err(GraphQLError::new(
-                "The operation timed out before it could finish.",
-            )
-            .with_path(path.to_vec())
-            .at(location)));
+            return Some(Err(timeout_error_at(path, location)));
         }
 
         let Some(field) = group.field(object_type) else {
-            let error = GraphQLError::new(format!(
-                "Cannot query field \"{}\" on type \"{}\".",
-                first.name, object_type.name
-            ))
-            .at(location);
+            let error = unknown_field_error(first.name, object_type.name.as_ref(), location);
             return Some(finish_field(
                 Err(error),
                 None,
@@ -2473,14 +3294,7 @@ impl<'doc> Executor<'doc> {
         depth: usize,
     ) -> Option<Result<Value, GraphQLError>> {
         let Value::List(items) = value else {
-            return Some(Err(located(
-                format!(
-                    "Expected a list for field {label}, but the resolved value is a {}.",
-                    value.kind()
-                ),
-                path,
-                location,
-            )));
+            return Some(Err(list_mismatch_error(label, value, path, location)));
         };
         // Every item completes against the same runtime type and selection sets, so the fields are
         // collected once for the whole list. A missing selection set keeps the per-item path,
@@ -2648,14 +3462,8 @@ impl<'doc> Executor<'doc> {
         depth: usize,
     ) -> Option<Result<Value, GraphQLError>> {
         if !matches!(value, Value::Object(_) | Value::External(_)) {
-            return Some(Err(located(
-                format!(
-                    "Field {label} expects an object of type \"{}\" but received a {}.",
-                    object.name,
-                    value.kind()
-                ),
-                path,
-                location,
+            return Some(Err(object_mismatch_error(
+                label, object, value, path, location,
             )));
         }
         let outcome = match collected {
@@ -3198,6 +4006,216 @@ fn locate(mut error: GraphQLError, path: &[PathSegment], location: Location) -> 
         error = error.at(location);
     }
     error
+}
+
+#[cold]
+#[inline(never)]
+fn object_mismatch_error(
+    label: FieldLabel<'_>,
+    object: &ObjectType,
+    value: &Value,
+    path: &[PathSegment],
+    location: Location,
+) -> GraphQLError {
+    located(
+        format!(
+            "Field {label} expects an object of type \"{}\" but received a {}.",
+            object.name,
+            value.kind()
+        ),
+        path,
+        location,
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn missing_selection_set_error(
+    label: FieldLabel<'_>,
+    object: &ObjectType,
+    path: &[PathSegment],
+    location: Location,
+) -> GraphQLError {
+    located(
+        format!(
+            "Field {label} of type \"{}\" must have a selection set.",
+            object.name
+        ),
+        path,
+        location,
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn timeout_error(path: &[PathSegment]) -> GraphQLError {
+    GraphQLError::new("The operation timed out before it could finish.").with_path(path.to_vec())
+}
+
+#[cold]
+#[inline(never)]
+fn timeout_error_at(path: &[PathSegment], location: Location) -> GraphQLError {
+    timeout_error(path).at(location)
+}
+
+#[cold]
+#[inline(never)]
+fn unknown_field_error(name: &str, parent: &str, location: Location) -> GraphQLError {
+    GraphQLError::new(format!(
+        "Cannot query field \"{name}\" on type \"{parent}\"."
+    ))
+    .at(location)
+}
+
+#[cold]
+#[inline(never)]
+fn missing_field_node_error(response_key: &str) -> GraphQLError {
+    GraphQLError::new(format!(
+        "No field node was provided for response key \"{response_key}\"."
+    ))
+}
+
+#[cold]
+#[inline(never)]
+fn list_mismatch_error(
+    label: FieldLabel<'_>,
+    value: &Value,
+    path: &[PathSegment],
+    location: Location,
+) -> GraphQLError {
+    located(
+        format!(
+            "Expected a list for field {label}, but the resolved value is a {}.",
+            value.kind()
+        ),
+        path,
+        location,
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn non_null_error(label: FieldLabel<'_>, path: &[PathSegment], location: Location) -> GraphQLError {
+    located(
+        format!("Cannot return null for non-nullable field {label}."),
+        path,
+        location,
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn undefined_output_type_error(
+    name: &crate::types::Name,
+    label: FieldLabel<'_>,
+    path: &[PathSegment],
+    location: Location,
+) -> GraphQLError {
+    located(
+        format!("Type \"{name}\" used by field {label} is not defined by the schema."),
+        path,
+        location,
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn scalar_serialize_error(
+    label: FieldLabel<'_>,
+    message: &str,
+    path: &[PathSegment],
+    location: Location,
+) -> GraphQLError {
+    located(
+        format!("Field {label} could not be serialized: {message}"),
+        path,
+        location,
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn invalid_scalar_value_error(
+    label: FieldLabel<'_>,
+    kind: &str,
+    path: &[PathSegment],
+    location: Location,
+) -> GraphQLError {
+    located(
+        format!("Field {label} serialized to a {kind} which is not a valid scalar value."),
+        path,
+        location,
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn unknown_enum_value_error(
+    value: &str,
+    enumeration: &crate::types::Name,
+    label: FieldLabel<'_>,
+    path: &[PathSegment],
+    location: Location,
+) -> GraphQLError {
+    located(
+        format!("Value \"{value}\" does not exist in enum \"{enumeration}\" for field {label}."),
+        path,
+        location,
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn enum_value_type_error(
+    label: FieldLabel<'_>,
+    enumeration: &crate::types::Name,
+    kind: &str,
+    path: &[PathSegment],
+    location: Location,
+) -> GraphQLError {
+    located(
+        format!("Field {label} expects enum \"{enumeration}\" but received a {kind}."),
+        path,
+        location,
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn abstract_value_type_error(
+    name: &crate::types::Name,
+    label: FieldLabel<'_>,
+    kind: &str,
+    path: &[PathSegment],
+    location: Location,
+) -> GraphQLError {
+    located(
+        format!("Field {label} expects a {name} but received a {kind}."),
+        path,
+        location,
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn input_object_return_error(
+    name: &crate::types::Name,
+    label: FieldLabel<'_>,
+    path: &[PathSegment],
+    location: Location,
+) -> GraphQLError {
+    located(
+        format!("Field {label} has input object type \"{name}\" as its return type."),
+        path,
+        location,
+    )
+}
+
+/// A shared empty argument object for fields that take no arguments.
+fn empty_object() -> &'static Object {
+    use std::sync::OnceLock;
+    static EMPTY: OnceLock<Object> = OnceLock::new();
+    EMPTY.get_or_init(Object::new)
 }
 
 fn located(
