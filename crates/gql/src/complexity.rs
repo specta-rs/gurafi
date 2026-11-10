@@ -149,16 +149,19 @@ struct CollectedField<'source, 'document> {
     scope: Arc<str>,
     node: &'document ast::Field<'source>,
     /// Sub-selections of every field merged under this response key.
-    selections: SmallVec<[&'document ast::Selection<'source>; 2]>,
+    selections: SmallVec<[&'document ast::Selection<'source>; 4]>,
 }
+
+/// The fields of one selection set after flattening.
+///
+/// Selection sets overwhelmingly hold a handful of fields, and analysis allocates this for every
+/// one of them, so the common shapes (up to eight fields) stay inline.
+type CollectedFields<'source, 'document> = SmallVec<[CollectedField<'source, 'document>; 8]>;
 
 /// A memoised fragment expansion: the fragment name, the scope it was expanded for, and the
 /// resulting fields.
-type CachedFragment<'source, 'document> = (
-    &'source str,
-    Arc<str>,
-    SmallVec<[CollectedField<'source, 'document>; 4]>,
-);
+type CachedFragment<'source, 'document> =
+    (&'source str, Arc<str>, CollectedFields<'source, 'document>);
 
 /// Fragment expansions memoised for one analysis.
 ///
@@ -193,7 +196,7 @@ impl<'source, 'document> FragmentCache<'source, 'document> {
     fn insert(
         &mut self,
         key: (&'source str, Arc<str>),
-        fields: SmallVec<[CollectedField<'source, 'document>; 4]>,
+        fields: CollectedFields<'source, 'document>,
     ) {
         let position = self.entries.len();
         self.entries.push((key.0, key.1, fields));
@@ -245,7 +248,7 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
     where
         I: IntoIterator<Item = &'document ast::Selection<'source>>,
     {
-        let mut collected: SmallVec<[CollectedField<'source, 'document>; 4]> = SmallVec::new();
+        let mut collected: CollectedFields<'source, 'document> = SmallVec::new();
         let mut index = FieldIndex::new();
         self.collect_fields(items, scope, active_fragments, &mut collected, &mut index)?;
 
@@ -271,7 +274,7 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
         items: I,
         scope: &Arc<str>,
         active_fragments: &mut SmallVec<[&'source str; 8]>,
-        output: &mut SmallVec<[CollectedField<'source, 'document>; 4]>,
+        output: &mut CollectedFields<'source, 'document>,
         index: &mut FieldIndex<'source>,
     ) -> Result<(), GraphQLError>
     where
@@ -465,7 +468,7 @@ impl<'source> FieldIndex<'source> {
 }
 
 fn merge_field<'source, 'document>(
-    output: &mut SmallVec<[CollectedField<'source, 'document>; 4]>,
+    output: &mut CollectedFields<'source, 'document>,
     index: &mut FieldIndex<'source>,
     field: &'document ast::Field<'source>,
     scope: &Arc<str>,
@@ -502,7 +505,7 @@ fn merge_field<'source, 'document>(
 }
 
 fn merge_all<'source, 'document>(
-    output: &mut SmallVec<[CollectedField<'source, 'document>; 4]>,
+    output: &mut CollectedFields<'source, 'document>,
     index: &mut FieldIndex<'source>,
     fields: &[CollectedField<'source, 'document>],
 ) {
@@ -518,7 +521,7 @@ fn merge_all<'source, 'document>(
 }
 
 fn find_entry<'source, 'document>(
-    output: &SmallVec<[CollectedField<'source, 'document>; 4]>,
+    output: &CollectedFields<'source, 'document>,
     index: &FieldIndex<'source>,
     response_key: &str,
     scope: &str,
@@ -537,7 +540,7 @@ fn find_entry<'source, 'document>(
 }
 
 fn push_entry<'source, 'document>(
-    output: &mut SmallVec<[CollectedField<'source, 'document>; 4]>,
+    output: &mut CollectedFields<'source, 'document>,
     index: &mut FieldIndex<'source>,
     entry: CollectedField<'source, 'document>,
 ) {

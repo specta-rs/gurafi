@@ -132,6 +132,14 @@ impl Schema {
         self.inner.types.get(name)
     }
 
+    /// Look up a named type by the position a built schema stored in a field definition.
+    ///
+    /// Execution resolves the same handful of types for every completed field, so a field carries
+    /// its output type's position and avoids hashing the type's name each time.
+    pub(crate) fn type_at(&self, index: u32) -> Option<&Type> {
+        self.inner.types.get_index(index as usize).map(|(_, ty)| ty)
+    }
+
     /// Iterate over all types, in definition order.
     pub fn types(&self) -> impl ExactSizeIterator<Item = (&Name, &Type)> {
         self.inner.types.iter()
@@ -548,6 +556,8 @@ impl SchemaBuilder {
             }
         }
 
+        resolve_field_type_indices(&mut self.types);
+
         let inner = SchemaInner {
             types: self.types,
             query,
@@ -566,6 +576,36 @@ impl SchemaBuilder {
             Ok(schema)
         } else {
             Err(self.errors)
+        }
+    }
+}
+
+/// Record where each field's output type lives in the schema's type map.
+///
+/// The map is complete (introspection types included) by the time this runs, and its order never
+/// changes afterwards, so the positions stay valid for the whole life of the schema. Fields whose
+/// type is not defined are left unresolved; schema validation reports them.
+fn resolve_field_type_indices(types: &mut TypeMap<Type>) {
+    let indices: rustc_hash::FxHashMap<Name, u32> = types
+        .keys()
+        .enumerate()
+        .map(|(index, name)| (name.clone(), index as u32))
+        .collect();
+
+    fn assign(
+        fields: &mut IndexMap<Name, crate::types::Field>,
+        indices: &rustc_hash::FxHashMap<Name, u32>,
+    ) {
+        for field in fields.values_mut() {
+            field.type_index = indices.get(field.ty.named_type()).copied();
+        }
+    }
+
+    for ty in types.values_mut() {
+        match ty {
+            Type::Object(object) => assign(&mut Arc::make_mut(object).fields, &indices),
+            Type::Interface(interface) => assign(&mut Arc::make_mut(interface).fields, &indices),
+            _ => {}
         }
     }
 }

@@ -132,6 +132,23 @@ pub fn coerce_argument_values(
     node: &ast::Field<'_>,
     variables: &Object,
 ) -> Result<Object, GraphQLError> {
+    let mut coerced = Object::with_capacity(field.args.len());
+    coerce_argument_values_into(schema, field, node, variables, &mut coerced)?;
+    Ok(coerced)
+}
+
+/// Coerce a field's arguments into an existing, empty object.
+///
+/// Execution coerces arguments for every field it completes, so building the result in the
+/// caller's slot avoids copying an [`Object`] out of the callee for each one.
+pub(crate) fn coerce_argument_values_into(
+    schema: &Schema,
+    field: &Field,
+    node: &ast::Field<'_>,
+    variables: &Object,
+    coerced: &mut Object,
+) -> Result<(), GraphQLError> {
+    debug_assert!(coerced.is_empty(), "argument object must start empty");
     for argument in &node.arguments {
         if crate::types::map_get(&field.args, argument.name).is_none() {
             return Err(GraphQLError::new(format!(
@@ -142,7 +159,6 @@ pub fn coerce_argument_values(
         }
     }
 
-    let mut coerced = Object::with_capacity(field.args.len());
     for (name, definition) in &field.args {
         let Some(argument) = node.argument(name) else {
             if let Some(default) = &definition.default_value {
@@ -239,7 +255,7 @@ pub fn coerce_argument_values(
         }
     }
 
-    Ok(coerced)
+    Ok(())
 }
 
 /// Coerce a literal to a runtime value for an input type.

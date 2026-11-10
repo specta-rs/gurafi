@@ -706,6 +706,12 @@ pub struct Field {
     pub complexity: Option<ComplexityFn>,
     /// Duplicate argument names encountered while building, reported by schema validation.
     pub(crate) duplicate_args: Vec<Name>,
+    /// Where the output type's innermost named type lives in the schema's type map.
+    ///
+    /// Execution needs the resolved type for every field it completes, and a positional lookup
+    /// avoids hashing the type name each time. `None` means the reference was never resolved (the
+    /// field does not belong to a built schema, or names a type the schema does not define).
+    pub(crate) type_index: Option<u32>,
 }
 
 impl fmt::Debug for Field {
@@ -736,6 +742,7 @@ impl Field {
             subscribe: None,
             complexity: None,
             duplicate_args: Vec::new(),
+            type_index: None,
         }
     }
 
