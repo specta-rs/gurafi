@@ -8,8 +8,15 @@
 pub(crate) mod coerce;
 mod collect;
 mod executor;
+mod prepared;
 mod selection;
-mod subscription;
+pub(crate) mod subscription;
+
+pub(crate) use prepared::{
+    BuildPreparedError, PreparedDocument, build as build_prepared, execute as execute_prepared,
+    execute_event as execute_prepared_event, root_type as prepared_root_type,
+    subscribe as subscribe_prepared,
+};
 
 use std::{any::Any, fmt, sync::Arc, time::Duration};
 

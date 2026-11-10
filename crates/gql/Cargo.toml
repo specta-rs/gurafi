@@ -20,6 +20,7 @@ tracing = ["dep:tracing"]
 futures = { workspace = true }
 indexmap = { workspace = true }
 rustc-hash = { workspace = true }
+self_cell = { workspace = true }
 smallvec = { workspace = true, features = ["serde"] }
 serde = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
@@ -33,4 +34,8 @@ harness = false
 
 [[bench]]
 name = "function_syntax"
+harness = false
+
+[[bench]]
+name = "prepared"
 harness = false

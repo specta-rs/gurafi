@@ -397,32 +397,42 @@ where
 
     let GetParameters {
         query,
+        id,
         variables,
         operation_name,
         extensions,
     } = parameters;
 
-    let Some(query) = query.filter(|query| !query.trim().is_empty()) else {
+    let has_query = query
+        .as_deref()
+        .is_some_and(|query| !query.trim().is_empty());
+    let has_id = id.as_deref().is_some_and(|id| !id.trim().is_empty())
+        || header_persisted_id(&parts.headers).is_some();
+    if !has_query && !has_id {
         return request_error(
             accept,
             StatusCode::BAD_REQUEST,
             "Missing required `query` parameter.",
         );
-    };
+    }
 
-    let request = match get_request(query, variables, operation_name, extensions) {
+    let mut request = match get_request(query, id, variables, operation_name, extensions) {
         Ok(request) => request,
         Err(error) => return request_error(accept, StatusCode::BAD_REQUEST, error.message()),
     };
+    apply_header_id(&mut request, &parts.headers);
 
     // GraphQL over HTTP: GET may only execute queries. Allowing mutations here turns every
     // cookie-authenticated endpoint into a CSRF target; subscriptions also open long-lived
-    // streams that should require an explicit POST.
-    match operation_kind(&request) {
-        Ok(Some(gql::ast::OperationKind::Mutation | gql::ast::OperationKind::Subscription)) => {
-            return HttpResult::Response(method_not_allowed());
-        }
-        _ => {}
+    // streams that should require an explicit POST. A persisted identifier is resolved without
+    // parsing supplied text; an unknown identifier falls through and becomes an error response.
+    if matches!(
+        server.operation_kind(&request),
+        Ok(Some(
+            gql::ast::OperationKind::Mutation | gql::ast::OperationKind::Subscription
+        ))
+    ) {
+        return HttpResult::Response(method_not_allowed());
     }
 
     process_payload(server, accept, RequestPayload::Single(request), context).await
@@ -471,6 +481,8 @@ where
         Ok(payload) => payload,
         Err(error) => return request_error(accept, StatusCode::BAD_REQUEST, error.message()),
     };
+    let mut payload = payload;
+    apply_header_id_to_payload(&mut payload, &parts.headers);
 
     process_payload(server, accept, payload, context).await
 }
@@ -483,14 +495,15 @@ async fn process_payload(
 ) -> HttpResult {
     match payload {
         RequestPayload::Single(request) => {
-            let kind = operation_kind(&request);
+            let kind = server.operation_kind(&request);
             if accept.event_stream {
                 if matches!(&kind, Ok(Some(gql::ast::OperationKind::Subscription))) {
                     return start_subscription(server, accept, &request, context).await;
                 }
                 if let (Err(error), None) = (&kind, accept.json) {
-                    // `text/event-stream` is the only acceptable type. A malformed document is
-                    // still a request error, returned as JSON before any stream is opened.
+                    // `text/event-stream` is the only acceptable type. A malformed document or an
+                    // unknown persisted identifier is still a request error, returned as JSON
+                    // before any stream is opened.
                     return HttpResult::Response(json_response(
                         StatusCode::BAD_REQUEST,
                         accept,
@@ -519,7 +532,7 @@ async fn process_payload(
             if accept.event_stream
                 && requests.iter().any(|request| {
                     matches!(
-                        operation_kind(request),
+                        server.operation_kind(request),
                         Ok(Some(gql::ast::OperationKind::Subscription))
                     )
                 })
@@ -571,33 +584,6 @@ fn sse_response(subscription: gql::SubscriptionResponse) -> HttpResult {
         headers: sse_headers(),
         stream: Box::pin(events),
     })
-}
-
-fn operation_kind(
-    request: &GraphQLRequest,
-) -> Result<Option<gql::ast::OperationKind>, GraphQLError> {
-    let document = gql::parser::parse_query(&request.query)?;
-    match request.operation_name.as_deref() {
-        Some(name) => document
-            .operations()
-            .find(|operation| operation.name == Some(name))
-            .map(|operation| Some(operation.kind))
-            .ok_or_else(|| GraphQLError::new(format!("Unknown operation named \"{name}\"."))),
-        None => {
-            let mut operations = document.operations();
-            let Some(operation) = operations.next() else {
-                return Err(GraphQLError::new(
-                    "The document does not contain any executable operation.",
-                ));
-            };
-            if operations.next().is_some() {
-                return Err(GraphQLError::new(
-                    "Must provide an operation name when the document contains multiple operations.",
-                ));
-            }
-            Ok(Some(operation.kind))
-        }
-    }
 }
 
 fn execution_status(response: &Response, media: JsonMedia) -> StatusCode {
@@ -729,6 +715,8 @@ fn is_json_content_type(value: Option<&HeaderValue>) -> bool {
 #[derive(Debug, Deserialize)]
 struct GetParameters {
     query: Option<String>,
+    #[serde(default, alias = "doc_id", alias = "documentId", alias = "queryId")]
+    id: Option<String>,
     variables: Option<String>,
     #[serde(rename = "operationName")]
     operation_name: Option<String>,
@@ -736,17 +724,60 @@ struct GetParameters {
 }
 
 fn get_request(
-    query: String,
+    query: Option<String>,
+    id: Option<String>,
     variables: Option<String>,
     operation_name: Option<String>,
     extensions: Option<String>,
 ) -> Result<GraphQLRequest, RequestError> {
     Ok(GraphQLRequest {
-        query,
+        query: query.unwrap_or_default(),
+        id,
         operation_name,
         variables: parse_json_object(variables, "variables")?,
         extensions: parse_json_object(extensions, "extensions")?,
     })
+}
+
+/// Headers some persisted-query clients use instead of a body field.
+const PERSISTED_QUERY_HEADERS: [&str; 2] = ["x-persisted-query-id", "x-query-id"];
+
+fn header_persisted_id(headers: &HeaderMap) -> Option<String> {
+    PERSISTED_QUERY_HEADERS.iter().find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+/// Apply a persisted-query header when the request body did not carry an identifier.
+fn apply_header_id(request: &mut GraphQLRequest, headers: &HeaderMap) {
+    if request.id.is_none() {
+        request.id = header_persisted_id(headers);
+    }
+}
+
+fn apply_header_id_to_payload(payload: &mut RequestPayload, headers: &HeaderMap) {
+    let Some(id) = header_persisted_id(headers) else {
+        return;
+    };
+    match payload {
+        RequestPayload::Single(request) => {
+            if request.id.is_none() {
+                request.id = Some(id);
+            }
+        }
+        RequestPayload::Batch(requests) => {
+            for request in requests {
+                if request.id.is_none() {
+                    request.id = Some(id.clone());
+                }
+            }
+        }
+    }
 }
 
 fn parse_json_object(

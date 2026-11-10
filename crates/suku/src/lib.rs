@@ -47,6 +47,8 @@ mod request;
 mod response;
 mod server;
 
+pub mod prepared;
+
 #[cfg(feature = "axum")]
 pub mod axum;
 
@@ -56,6 +58,11 @@ pub use crate::{
         GraphQLResponse, ResponseExt, error_json_bytes, error_response, to_json, to_json_bytes,
     },
     server::{Context, Server},
+};
+
+pub use crate::prepared::{
+    PreparedOperation, PreparedQueries, PreparedQueriesError, persisted_query_not_found,
+    persisted_query_not_found_error,
 };
 
 pub use crate::server::{

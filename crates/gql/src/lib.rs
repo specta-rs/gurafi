@@ -40,6 +40,7 @@ mod error;
 pub mod execution;
 mod introspection;
 pub mod parser;
+pub mod prepared;
 mod schema;
 mod sdl;
 mod sdl_schema;
@@ -51,6 +52,10 @@ pub use error::{GraphQLError, Location, PathSegment, Response, Result};
 pub use execution::{
     AuthorizationContext, Authorizer, ExecutionContext, ExecutionOptions, Request, ResponseStream,
     SubscriptionResponse, execute, subscribe,
+};
+pub use prepared::{
+    PreparedQuery, PreparedQueryError, PreparedQueryRegistry, PreparedQueryRegistryError,
+    execute_prepared,
 };
 pub use schema::{
     Schema, SchemaBuilder, SchemaChange, SchemaDiff, SchemaError, diff, is_output_subtype,

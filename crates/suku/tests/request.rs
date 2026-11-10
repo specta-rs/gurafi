@@ -11,6 +11,7 @@ use suku::{GraphQLRequest, RequestPayload};
 fn request_serializes_operation_name_as_camel_case() {
     let request = GraphQLRequest {
         query: "{ hello }".to_owned(),
+        id: None,
         operation_name: Some("Greeting".to_owned()),
         variables: Some(
             json!({ "name": "Ada" })

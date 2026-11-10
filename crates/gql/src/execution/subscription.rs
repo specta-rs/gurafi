@@ -6,12 +6,12 @@
 //! value: event execution re-runs the subscription selection set with the event as the parent, so
 //! the root field's `resolve` resolver (or the default property resolver) runs for every event.
 
-use std::{fmt, sync::Arc, time::Instant};
+use std::{fmt, sync::Arc, time::Duration, time::Instant};
 
-use futures::{StreamExt, stream::BoxStream};
+use futures::{FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
 
 use crate::{
-    Object, Value,
+    Object, Value, ast,
     complexity::{self, ComplexityOptions},
     error::{GraphQLError, Location, PathSegment, Response},
     parser::parse_query,
@@ -37,6 +37,14 @@ impl fmt::Debug for SubscriptionResponse {
             .finish()
     }
 }
+
+/// Executes one source event for an already prepared subscription.
+///
+/// `SubscriptionResponse` is `'static`, so the closure has to own everything it needs. Normal
+/// execution re-parses the query for each event; a prepared subscription supplies a closure that
+/// reuses the document it already parsed and validated.
+pub(crate) type EventHandler =
+    Arc<dyn Fn(Arc<ExecutionContext>, Value) -> BoxFuture<'static, Response> + Send + Sync>;
 
 /// Start a subscription.
 pub(crate) async fn subscribe(
@@ -65,6 +73,55 @@ pub(crate) async fn subscribe(
 
     let operation =
         executor::select_operation(&document, request.operation_name).map_err(Response::error)?;
+
+    let query: Arc<str> = Arc::from(request.query);
+    let operation_name: Option<Arc<str>> = operation.name.map(Arc::from);
+    subscribe_document(
+        schema,
+        &document,
+        operation,
+        request.variables,
+        options,
+        move |_context, timeout| {
+            let query = Arc::clone(&query);
+            let operation_name = operation_name.clone();
+            Arc::new(move |context: Arc<ExecutionContext>, event: Value| {
+                let query = Arc::clone(&query);
+                let operation_name = operation_name.clone();
+                let deadline = timeout.map(|timeout| Instant::now() + timeout);
+                async move {
+                    executor::execute_subscription_event(
+                        &context,
+                        &query,
+                        operation_name.as_deref(),
+                        event,
+                        deadline,
+                    )
+                    .await
+                }
+                .boxed()
+            })
+        },
+    )
+    .await
+}
+
+/// Start a subscription from a parsed, validated and selected document.
+///
+/// `make_event_handler` builds the per-event executor once. Normal requests hand back a closure
+/// that re-parses the query for every event (the response stream is `'static`); prepared requests
+/// hand back one that reuses the prepared document.
+pub(crate) async fn subscribe_document<F>(
+    schema: &Schema,
+    document: &ast::Document<'_>,
+    operation: &ast::OperationDefinition<'_>,
+    request_variables: Option<&Object>,
+    options: &ExecutionOptions,
+    make_event_handler: F,
+) -> Result<SubscriptionResponse, Response>
+where
+    F: FnOnce(Arc<ExecutionContext>, Option<Duration>) -> EventHandler,
+{
     if operation.kind != crate::ast::OperationKind::Subscription {
         return Err(Response::error(GraphQLError::new(
             "The selected operation is not a subscription; use execute for queries and mutations.",
@@ -72,7 +129,7 @@ pub(crate) async fn subscribe(
     }
 
     let variables =
-        coerce::coerce_variable_values(schema, operation, request.variables).map_err(|errors| {
+        coerce::coerce_variable_values(schema, operation, request_variables).map_err(|errors| {
             Response {
                 data: None,
                 errors,
@@ -80,10 +137,10 @@ pub(crate) async fn subscribe(
             }
         })?;
 
-    complexity::analyze(
+    complexity::analyze_operation(
         schema,
-        &document,
-        operation.name,
+        document,
+        operation,
         &variables.values,
         &ComplexityOptions {
             list_factor: options.list_complexity,
@@ -114,7 +171,7 @@ pub(crate) async fn subscribe(
         extensions: std::sync::Mutex::new(None),
     };
 
-    let fragments = executor::FragmentMap::new(&document);
+    let fragments = executor::FragmentMap::new(document);
     let collected = collect::collect_fields(
         schema,
         &fragments,
@@ -209,33 +266,20 @@ pub(crate) async fn subscribe(
     let field_ty = field.ty.clone();
     let location = node.location;
     let response_key: Arc<str> = Arc::from(*response_key);
-    let operation_name: Option<Arc<str>> = operation.name.map(Arc::from);
-    let query: Arc<str> = Arc::from(request.query);
     // Each event gets its own deadline: a subscription is long-lived, so one absolute deadline
     // would kill the stream after the first timeout window.
-    let timeout = options.timeout;
     let context = Arc::new(context);
+    let handler = make_event_handler(Arc::clone(&context), options.timeout);
 
     let stream = source
         .then(move |event| {
-            let context = context.clone();
-            let query = query.clone();
-            let operation_name = operation_name.clone();
+            let handler = Arc::clone(&handler);
+            let context = Arc::clone(&context);
             let field_ty = field_ty.clone();
             let response_key = response_key.clone();
             async move {
-                let deadline = timeout.map(|timeout| Instant::now() + timeout);
                 match event {
-                    Ok(value) => {
-                        executor::execute_subscription_event(
-                            &context,
-                            &query,
-                            operation_name.as_deref(),
-                            value,
-                            deadline,
-                        )
-                        .await
-                    }
+                    Ok(value) => handler(context, value).await,
                     Err(error) => {
                         event_error_response(error, &response_key, &field_ty, location, &context)
                     }

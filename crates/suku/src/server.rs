@@ -10,9 +10,16 @@
 use core::fmt;
 use std::{any::Any, sync::Arc, time::Duration};
 
-use gql::{Authorizer, ExecutionOptions, Schema, SubscriptionResponse, Value};
+use gql::{
+    Authorizer, ExecutionOptions, Schema, SubscriptionResponse, Value,
+    ast::OperationKind,
+    prepared::{PreparedQuery, PreparedQueryRegistry},
+};
 
-use crate::request::GraphQLRequest;
+use crate::{
+    prepared::{PreparedQueries, persisted_query_not_found, persisted_query_not_found_error},
+    request::GraphQLRequest,
+};
 
 /// Default maximum request body size: 1 MiB.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -121,6 +128,8 @@ struct ServerInner {
     max_batch_size: usize,
     batch_concurrency: usize,
     authorizer: Option<Arc<dyn Authorizer>>,
+    prepared: Option<PreparedQueryRegistry>,
+    require_prepared: bool,
 }
 
 /// A GraphQL server.
@@ -144,6 +153,11 @@ impl fmt::Debug for Server {
             .field("max_batch_size", &self.inner.max_batch_size)
             .field("batch_concurrency", &self.inner.batch_concurrency)
             .field("authorizer", &self.inner.authorizer.is_some())
+            .field(
+                "prepared_queries",
+                &self.inner.prepared.as_ref().map_or(0, |r| r.len()),
+            )
+            .field("require_prepared", &self.inner.require_prepared)
             .finish()
     }
 }
@@ -171,6 +185,8 @@ impl Server {
                 max_batch_size: DEFAULT_MAX_BATCH_SIZE,
                 batch_concurrency: DEFAULT_BATCH_CONCURRENCY,
                 authorizer: None,
+                prepared: None,
+                require_prepared: false,
             }),
         }
     }
@@ -288,6 +304,52 @@ impl Server {
         self
     }
 
+    /// Install a set of persisted operations loaded from a manifest.
+    ///
+    /// When a request carries an identifier that matches an entry, the registered query text is
+    /// executed. Supplied query text is ignored for a matching identifier, so a client can never
+    /// substitute its own document for a trusted persisted one.
+    #[must_use]
+    pub fn prepared_queries(mut self, queries: PreparedQueries) -> Self {
+        self.inner_mut().prepared = Some(queries.into_registry());
+        self
+    }
+
+    /// Install a prepared-query registry directly.
+    #[must_use]
+    pub fn prepared_query_registry(mut self, registry: PreparedQueryRegistry) -> Self {
+        self.inner_mut().prepared = Some(registry);
+        self
+    }
+
+    /// Require every operation to resolve to a registered prepared query.
+    ///
+    /// In allowlist mode requests without an identifier, and requests whose identifier is
+    /// unknown, fail with `PersistedQueryNotFound`. Query text alone is never executed.
+    #[must_use]
+    pub fn require_prepared(mut self, required: bool) -> Self {
+        self.inner_mut().require_prepared = required;
+        self
+    }
+
+    /// The installed prepared-query registry, if any.
+    #[must_use]
+    pub fn prepared_query_registry_ref(&self) -> Option<&PreparedQueryRegistry> {
+        self.inner.prepared.as_ref()
+    }
+
+    /// Look up a prepared query by identifier.
+    #[must_use]
+    pub fn prepared_query(&self, id: &str) -> Option<&PreparedQuery> {
+        self.inner.prepared.as_ref()?.get(id)
+    }
+
+    /// Whether prepared queries are required (allowlist mode).
+    #[must_use]
+    pub fn requires_prepared_queries(&self) -> bool {
+        self.inner.require_prepared
+    }
+
     /// The schema this server executes.
     #[must_use]
     pub fn schema(&self) -> &Schema {
@@ -316,8 +378,26 @@ impl Server {
             Ok(variables) => variables,
             Err(error) => return error.into_response(),
         };
-        let gql_request = request.as_gql(variables.as_ref());
         let options = self.execution_options(context);
+
+        if let Some(id) = request.prepared_id() {
+            if let Some(prepared) = self.prepared_query(id) {
+                let future = prepared.execute(variables.as_ref(), &options);
+                return match options.timeout {
+                    Some(timeout) => timed(timeout, future).await,
+                    None => future.await,
+                };
+            }
+            if self.inner.require_prepared || request.query.trim().is_empty() {
+                return persisted_query_not_found(id);
+            }
+        } else if self.inner.require_prepared {
+            return persisted_query_not_found("");
+        } else if request.query.trim().is_empty() {
+            return missing_query_response();
+        }
+
+        let gql_request = request.as_gql(variables.as_ref());
         let future = gql::execute(&self.inner.schema, gql_request, &options);
         match options.timeout {
             Some(timeout) => timed(timeout, future).await,
@@ -364,13 +444,55 @@ impl Server {
             Ok(variables) => variables,
             Err(error) => return Err(error.into_response()),
         };
-        let gql_request = request.as_gql(variables.as_ref());
         let options = self.execution_options(context);
+
+        if let Some(id) = request.prepared_id() {
+            if let Some(prepared) = self.prepared_query(id) {
+                let future = prepared.subscribe(variables.as_ref(), &options);
+                return match options.timeout {
+                    Some(timeout) => timed_subscribe(timeout, future).await,
+                    None => future.await,
+                };
+            }
+            if self.inner.require_prepared || request.query.trim().is_empty() {
+                return Err(persisted_query_not_found(id));
+            }
+        } else if self.inner.require_prepared {
+            return Err(persisted_query_not_found(""));
+        } else if request.query.trim().is_empty() {
+            return Err(missing_query_response());
+        }
+
+        let gql_request = request.as_gql(variables.as_ref());
         let future = gql::subscribe(&self.inner.schema, gql_request, &options);
         match options.timeout {
             Some(timeout) => timed_subscribe(timeout, future).await,
             None => future.await,
         }
+    }
+
+    /// Determine the operation kind a request will execute.
+    ///
+    /// A prepared identifier is resolved without parsing any client-supplied query text. This is
+    /// what lets the HTTP layer make GET-safety and event-stream decisions for persisted requests.
+    pub(crate) fn operation_kind(
+        &self,
+        request: &GraphQLRequest,
+    ) -> Result<Option<OperationKind>, gql::GraphQLError> {
+        if let Some(id) = request.prepared_id() {
+            if let Some(prepared) = self.prepared_query(id) {
+                return Ok(Some(prepared.kind()));
+            }
+            if self.inner.require_prepared || request.query.trim().is_empty() {
+                return Err(persisted_query_not_found_error(id));
+            }
+        } else if self.inner.require_prepared {
+            return Err(persisted_query_not_found_error(""));
+        } else if request.query.trim().is_empty() {
+            return Err(missing_query_error());
+        }
+
+        operation_kind_from_text(request)
     }
 
     fn execution_options(&self, context: Context) -> ExecutionOptions {
@@ -391,8 +513,44 @@ impl Server {
     }
 }
 
-/// Enforce a real wall-clock deadline around execution.
-///
+/// The request error for a body that has neither query text nor a persisted identifier.
+fn missing_query_error() -> gql::GraphQLError {
+    gql::GraphQLError::new("Missing required `query` field.")
+}
+
+fn missing_query_response() -> gql::Response {
+    gql::Response::error(missing_query_error())
+}
+
+/// Parse the operation kind from query text.
+fn operation_kind_from_text(
+    request: &GraphQLRequest,
+) -> Result<Option<OperationKind>, gql::GraphQLError> {
+    let document = gql::parser::parse_query(&request.query)?;
+    match request.operation_name.as_deref() {
+        Some(name) => document
+            .operations()
+            .find(|operation| operation.name == Some(name))
+            .map(|operation| Some(operation.kind))
+            .ok_or_else(|| gql::GraphQLError::new(format!("Unknown operation named \"{name}\"."))),
+        None => {
+            let mut operations = document.operations();
+            let Some(operation) = operations.next() else {
+                return Err(gql::GraphQLError::new(
+                    "The document does not contain any executable operation.",
+                ));
+            };
+            if operations.next().is_some() {
+                return Err(gql::GraphQLError::new(
+                    "Must provide an operation name when the document contains multiple operations.",
+                ));
+            }
+            Ok(Some(operation.kind))
+        }
+    }
+}
+
+/// Enforce a real wall-clock deadline around execution.///
 /// `gql` checks its own deadline between fields so it can report a partial result, but a resolver
 /// that never yields would otherwise run forever. Transports that have a timer runtime wrap the
 /// future and turn an expiry into a normal GraphQL error response.

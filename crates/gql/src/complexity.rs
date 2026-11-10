@@ -71,6 +71,24 @@ pub fn analyze(
     options: &ComplexityOptions,
 ) -> Result<Complexity, GraphQLError> {
     let operation = select_operation(document, operation_name)?;
+    analyze_operation(schema, document, operation, variables, options)
+}
+
+/// Estimate the cost of an operation that has already been selected.
+///
+/// A prepared query selects its operation once, at preparation time, so it can use this entry
+/// point and skip the document scan [`analyze`] performs on every request.
+///
+/// # Errors
+///
+/// Returns an error when the operation exceeds a configured limit.
+pub(crate) fn analyze_operation(
+    schema: &Schema,
+    document: &ast::Document<'_>,
+    operation: &ast::OperationDefinition<'_>,
+    variables: &Object,
+    options: &ComplexityOptions,
+) -> Result<Complexity, GraphQLError> {
     let root = root_type_name(schema, operation.kind)?;
 
     let mut analyzer = Analyzer {

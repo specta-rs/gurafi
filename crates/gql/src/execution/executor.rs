@@ -135,7 +135,24 @@ pub(crate) async fn execute(
         Err(error) => return Response::error(error),
     };
 
-    let variables = match coerce::coerce_variable_values(schema, operation, request.variables) {
+    execute_operation(schema, &document, operation, request.variables, options).await
+}
+
+/// Execute an operation that has already been parsed, validated and selected.
+///
+/// This is the shared tail of both request execution paths. A prepared query stores the parsed
+/// document and the selected operation, so it enters here directly and never repeats parsing,
+/// validation or operation selection. Everything that depends on the request (variables,
+/// complexity limits, introspection policy and execution options) is still applied per call, so
+/// prepared execution is subject to exactly the same limits and authorization as normal execution.
+pub(crate) async fn execute_operation<'doc>(
+    schema: &'doc Schema,
+    document: &'doc ast::Document<'doc>,
+    operation: &'doc ast::OperationDefinition<'doc>,
+    request_variables: Option<&Object>,
+    options: &ExecutionOptions,
+) -> Response {
+    let variables = match coerce::coerce_variable_values(schema, operation, request_variables) {
         Ok(variables) => variables,
         Err(errors) => {
             return Response {
@@ -146,10 +163,10 @@ pub(crate) async fn execute(
         }
     };
 
-    if let Err(error) = complexity::analyze(
+    if let Err(error) = complexity::analyze_operation(
         schema,
-        &document,
-        operation.name,
+        document,
+        operation,
         &variables.values,
         &ComplexityOptions {
             list_factor: options.list_complexity,
@@ -197,7 +214,7 @@ pub(crate) async fn execute(
     };
     let deadline = options.timeout.map(|timeout| Instant::now() + timeout);
 
-    let fragments = FragmentMap::new(&document);
+    let fragments = FragmentMap::new(document);
     run_operation(
         &context,
         fragments,

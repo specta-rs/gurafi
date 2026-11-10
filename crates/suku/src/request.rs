@@ -26,7 +26,22 @@ use serde_json::{Map, Value as JsonValue};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GraphQLRequest {
     /// The GraphQL document to execute.
+    ///
+    /// This may be omitted for a persisted request that supplies an identifier; see
+    /// [`GraphQLRequest::prepared_id`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub query: String,
+    /// A persisted-query identifier.
+    ///
+    /// Relay sends this as `id`; several other clients use `doc_id`, `documentId` or `queryId`.
+    #[serde(
+        default,
+        alias = "doc_id",
+        alias = "documentId",
+        alias = "queryId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub id: Option<String>,
     /// Selects one operation when the document contains several.
     #[serde(
         rename = "operationName",
@@ -48,17 +63,75 @@ impl GraphQLRequest {
     pub fn new(query: impl Into<String>) -> Self {
         Self {
             query: query.into(),
+            id: None,
             operation_name: None,
             variables: None,
             extensions: None,
         }
     }
 
+    /// Create a request that identifies a persisted operation instead of sending its text.
+    ///
+    /// The request has no `query`; a server with prepared queries resolves `id` to the registered
+    /// document before execution.
+    #[must_use]
+    pub fn persisted(id: impl Into<String>) -> Self {
+        Self {
+            query: String::new(),
+            id: Some(id.into()),
+            operation_name: None,
+            variables: None,
+            extensions: None,
+        }
+    }
+
+    /// Attach a persisted-query identifier.
+    #[must_use]
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    /// The persisted-query identifier carried by this request, if any.
+    ///
+    /// Top-level `id` (and its `doc_id`/`documentId`/`queryId` aliases) wins. Otherwise common
+    /// extension shapes are checked: top-level extension ids and hashes, then Apollo's automatic
+    /// persisted queries extension (`extensions.persistedQuery.sha256Hash`, and the `hash`/`id`
+    /// spellings other clients use).
+    #[must_use]
+    pub fn prepared_id(&self) -> Option<&str> {
+        if let Some(id) = self.id.as_deref().filter(|id| !id.is_empty()) {
+            return Some(id);
+        }
+        let extensions = self.extensions.as_ref()?;
+        for key in ["id", "doc_id", "documentId", "queryId", "hash"] {
+            if let Some(id) = extensions
+                .get(key)
+                .and_then(JsonValue::as_str)
+                .filter(|id| !id.is_empty())
+            {
+                return Some(id);
+            }
+        }
+        let persisted = extensions.get("persistedQuery")?.as_object()?;
+        for key in ["sha256Hash", "hash", "id", "queryId", "documentId"] {
+            if let Some(id) = persisted
+                .get(key)
+                .and_then(JsonValue::as_str)
+                .filter(|id| !id.is_empty())
+            {
+                return Some(id);
+            }
+        }
+        None
+    }
+
     /// Parse one request from JSON bytes.
     ///
     /// # Errors
     ///
-    /// Returns a request error for malformed JSON or a missing `query` field.
+    /// Returns a request error for malformed JSON. A missing `query` is allowed when the request
+    /// supplies a persisted-query identifier.
     pub fn from_json_slice(body: &[u8]) -> Result<Self, RequestError> {
         serde_json::from_slice(body)
             .map_err(|error| RequestError::new(format!("Invalid GraphQL request: {error}")))
@@ -68,7 +141,8 @@ impl GraphQLRequest {
     ///
     /// # Errors
     ///
-    /// Returns a request error for malformed JSON or a missing `query` field.
+    /// Returns a request error for malformed JSON. A missing `query` is allowed when the request
+    /// supplies a persisted-query identifier.
     pub fn from_json_str(body: &str) -> Result<Self, RequestError> {
         serde_json::from_str(body)
             .map_err(|error| RequestError::new(format!("Invalid GraphQL request: {error}")))

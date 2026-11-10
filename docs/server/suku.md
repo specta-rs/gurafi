@@ -75,6 +75,64 @@ already produces `Arc<dyn Any + Send + Sync>`.
 `subscribe` returns `Result<gql::SubscriptionResponse, gql::Response>`. Setup errors arrive as a
 response, exactly like `gql::subscribe`.
 
+## Persisted operations
+
+A persisted operation moves parsing, validation and operation selection to startup. `gql` stores
+the parsed document in a `PreparedQuery`; `suku` resolves a request identifier to the registered
+query and executes it without trusting client-supplied text.
+
+```rust,no_run
+use suku::{PreparedQueries, Server};
+
+# fn build(schema: gql::Schema) -> Result<(), Box<dyn std::error::Error>> {
+let prepared = PreparedQueries::from_json_str(
+    &schema,
+    r#"{ "hello": "{ hello }" }"#,
+)?;
+
+let server = Server::new(schema)
+    .prepared_queries(prepared)
+    .require_prepared(true);
+# let _ = server;
+# Ok(())
+# }
+```
+
+`PreparedQueries` auto-detects these manifest shapes:
+
+| Shape | Example |
+| --- | --- |
+| Relay / codegen / urql map | `{ "id": "query text" }` |
+| Hive / Envelop / codegen operations | `{ "operations": [ { "id", "body", "name", "type" } ] }` |
+| Array of operation objects | `[ { "hash": "...", "query": "..." } ]` |
+| Object map under `operations` | `{ "operations": { "id": "query text" } }` |
+
+Aliases accepted for the identifier are `id`, `hash`, `sha256Hash`, `queryId` and `documentId`;
+the source may be `body`, `query`, `document` or `source`; the operation name may be `name` or
+`operationName`.
+
+Requests may send only an identifier:
+
+```json
+{ "id": "hello" }
+{ "extensions": { "persistedQuery": { "version": 1, "sha256Hash": "hello" } } }
+```
+
+`doc_id`, `documentId`, `queryId`, `extensions.id` and `extensions.hash` are also accepted. The
+`X-Persisted-Query-Id` and `X-Query-Id` headers set the identifier when the body does not carry
+one; for a batch the header applies to every operation that has no identifier of its own. GET
+requests may omit `query` when they carry an identifier.
+
+If an identifier matches, the registered text wins and any request `query` text is ignored. An
+unknown identifier with supplied query text falls back to normal execution unless
+`require_prepared(true)` is set. In allowlist mode every request must resolve to a registered
+query; otherwise the response contains `PersistedQueryNotFound` with
+`extensions.code = "PERSISTED_QUERY_NOT_FOUND"`. The HTTP status follows normal request-error
+handling: 400 for `application/graphql-response+json`, 200 for legacy `application/json`.
+
+Prepared subscriptions are supported and reuse the prepared document for setup and every source
+event.
+
 ## HTTP behaviour
 
 ### Methods and content types

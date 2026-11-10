@@ -12,6 +12,7 @@ A GraphQL reference implementation for Rust.
 - queries, mutations and subscriptions
 - introspection (`__schema`, `__type`, `__typename`)
 - query depth and complexity analysis
+- prepared (persisted) queries that skip parsing and validation on every request
 - schema printing, SDL import and backwards-compatibility diffing
 - pluggable field authorization
 
@@ -41,6 +42,37 @@ let response = futures::executor::block_on(gql::execute(
 
 assert_eq!(response.data.unwrap().as_object().unwrap().get("hello").unwrap().as_str(), Some("world"));
 ```
+
+## Prepared queries
+
+`gql::execute` parses and validates every document it receives, which is what an endpoint that
+accepts arbitrary client documents needs. Once a document is trusted (for example, an operation
+loaded from a build-time manifest), prepare it once and execute it many times:
+
+```rust
+# use gql::{ExecutionOptions, Schema};
+# fn run(schema: &Schema) {
+let prepared = gql::prepared::PreparedQuery::new(
+    schema,
+    "dashboard",
+    "query Dashboard { hello }",
+    None,
+)
+.expect("valid query");
+
+let response = futures::executor::block_on(
+    prepared.execute(None, &ExecutionOptions::default()),
+);
+# let _ = response;
+# }
+```
+
+A prepared query owns its source and AST safely, is `Send + Sync`, and applies the same variables,
+complexity limits, introspection policy, authorization, timeouts and null propagation as normal
+execution. `PreparedQueryRegistry` builds a named set with duplicate-id detection, and
+`gql::execute_prepared` is the free-function form of `PreparedQuery::execute`.
+
+Preparation is done against one schema. A registry is cheap to clone and share.
 
 ## Features
 
