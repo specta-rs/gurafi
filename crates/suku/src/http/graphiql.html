@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GraphiQL</title>
+    <style>
+      body {
+        height: 100%;
+        margin: 0;
+        width: 100%;
+        overflow: hidden;
+      }
+
+      #graphiql {
+        height: 100vh;
+      }
+
+      #loading {
+        align-items: center;
+        display: flex;
+        font-family: system-ui, sans-serif;
+        height: 100vh;
+        justify-content: center;
+      }
+    </style>
+    <link rel="stylesheet" href="https://unpkg.com/graphiql/graphiql.min.css" />
+  </head>
+  <body>
+    <div id="graphiql"><div id="loading">Loading GraphiQL…</div></div>
+
+    <script
+      crossorigin
+      src="https://unpkg.com/react@18/umd/react.production.min.js"
+    ></script>
+    <script
+      crossorigin
+      src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"
+    ></script>
+    <script
+      src="https://unpkg.com/graphiql/graphiql.min.js"
+      type="application/javascript"
+    ></script>
+    <script>
+      (function () {
+        var container = document.getElementById("graphiql");
+        var fetcher = GraphiQL.createFetcher({ url: window.location.pathname });
+
+        ReactDOM.createRoot(container).render(
+          React.createElement(GraphiQL, {
+            fetcher: fetcher,
+            defaultEditorToolsVisibility: true,
+          })
+        );
+      })();
+    </script>
+  </body>
+</html>

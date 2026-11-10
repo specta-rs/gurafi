@@ -1,9 +1,2693 @@
-use crate::ObjectType;
+//! Schema construction, validation and lookup.
 
-/// https://graphql.org/graphql-js/type/#graphqlschema
-#[derive(Debug)]
+use core::fmt;
+use std::sync::Arc;
+
+use indexmap::IndexMap;
+use rustc_hash::FxBuildHasher;
+
+mod composition;
+
+pub use composition::{FieldTransform, SchemaTransform};
+
+use crate::{
+    Value,
+    error::GraphQLError,
+    types::{
+        AppliedDirective, DirectiveDefinition, EnumType, Field, InputObjectType, InputValue,
+        InterfaceType, Name, ObjectType, ScalarType, Type, TypeKind, TypeRef, UnionType,
+    },
+};
+
+/// An error produced while building a schema.
+#[derive(Clone, Debug, Default)]
+pub struct SchemaError {
+    /// Every problem found while validating the schema.
+    pub errors: Vec<GraphQLError>,
+}
+
+impl SchemaError {
+    /// Create an error from a single message.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            errors: vec![GraphQLError::new(message.into())],
+        }
+    }
+
+    /// Whether no errors are present.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.errors.is_empty()
+    }
+
+    /// The number of errors.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.errors.len()
+    }
+
+    pub(crate) fn push(&mut self, message: impl Into<String>) {
+        self.errors.push(GraphQLError::new(message.into()));
+    }
+
+    /// Consume this value into the underlying errors.
+    #[must_use]
+    pub fn into_errors(self) -> Vec<GraphQLError> {
+        self.errors
+    }
+}
+
+impl fmt::Display for SchemaError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, error) in self.errors.iter().enumerate() {
+            if index != 0 {
+                f.write_str("\n")?;
+            }
+            write!(f, "{error}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for SchemaError {}
+
+impl From<GraphQLError> for SchemaError {
+    fn from(value: GraphQLError) -> Self {
+        Self {
+            errors: vec![value],
+        }
+    }
+}
+
+/// A name-keyed map that preserves insertion order and hashes cheaply.
+///
+/// GraphQL schemas look up a definition by name far more often than they resize, so the
+/// cryptographic-quality default hasher is pure overhead here. `FxHash` is a well-distributed
+/// multiply-xor hash; it is not collision resistant, which is fine for a schema built from
+/// trusted definitions (and for documents, which `collect` already hashes with `FxHash`).
+pub(crate) type TypeMap<V> = IndexMap<Name, V, FxBuildHasher>;
+
+#[derive(Clone, Debug)]
+pub(crate) struct SchemaInner {
+    /// Types in definition order, hashed with `FxHash`.
+    ///
+    /// Execution looks up a type for nearly every completed field, so the schema-wide map must
+    /// not pay for a cryptographic hash. Insertion order is what `Schema::types` and the
+    /// introspection response rely on, and it is unchanged.
+    pub(crate) types: TypeMap<Type>,
+    pub(crate) query: Name,
+    pub(crate) mutation: Option<Name>,
+    pub(crate) subscription: Option<Name>,
+    pub(crate) directives: TypeMap<DirectiveDefinition>,
+    pub(crate) applied_directives: Vec<crate::types::AppliedDirective>,
+    pub(crate) description: Option<Arc<str>>,
+}
+
+/// A validated, immutable GraphQL schema.
+///
+/// Cloning a schema is cheap: every definition lives behind an `Arc` inside one shared
+/// allocation.
+#[derive(Clone, Debug)]
 pub struct Schema {
-    pub query: ObjectType,
-    pub mutation: Option<ObjectType>,
-    pub subscription: Option<ObjectType>,
+    pub(crate) inner: Arc<SchemaInner>,
+}
+
+impl Schema {
+    /// Start building a schema.
+    #[must_use]
+    pub fn builder() -> SchemaBuilder {
+        SchemaBuilder::new()
+    }
+
+    /// Create a schema builder that already contains the default root type names.
+    #[must_use]
+    pub fn new() -> SchemaBuilder {
+        Self::builder()
+    }
+
+    /// The schema's optional description.
+    #[must_use]
+    pub fn description(&self) -> Option<&str> {
+        self.inner.description.as_deref()
+    }
+
+    /// Whether two schemas are the same instance.
+    ///
+    /// Cloning a [`Schema`] shares its allocation, so a clone reports `true`. Two schemas built
+    /// separately — even from identical definitions — report `false`, because their types,
+    /// interned names and field positions are distinct allocations. Code that stores a schema
+    /// alongside prepared work (such as a prepared query) can use this to refuse executing that
+    /// work against a different schema instance.
+    #[must_use]
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Directives applied to the schema itself, in source order.
+    #[must_use]
+    pub fn applied_directives(&self) -> &[crate::types::AppliedDirective] {
+        &self.inner.applied_directives
+    }
+
+    /// Look up a named type.
+    #[must_use]
+    pub fn get_type(&self, name: &str) -> Option<&Type> {
+        self.inner.types.get(name)
+    }
+
+    /// Look up a named type by the position a built schema stored in a field definition.
+    ///
+    /// Execution resolves the same handful of types for every completed field, so a field carries
+    /// its output type's position and avoids hashing the type's name each time.
+    pub(crate) fn type_at(&self, index: u32) -> Option<&Type> {
+        self.inner.types.get_index(index as usize).map(|(_, ty)| ty)
+    }
+
+    /// Iterate over all types, in definition order.
+    pub fn types(&self) -> impl ExactSizeIterator<Item = (&Name, &Type)> {
+        self.inner.types.iter()
+    }
+
+    /// Iterate over all directive definitions.
+    pub fn directives(&self) -> impl ExactSizeIterator<Item = (&Name, &DirectiveDefinition)> {
+        self.inner.directives.iter()
+    }
+
+    /// Look up a directive definition.
+    #[must_use]
+    pub fn get_directive(&self, name: &str) -> Option<&DirectiveDefinition> {
+        self.inner.directives.get(name)
+    }
+
+    /// The query root type name.
+    #[must_use]
+    pub fn query_name(&self) -> &Name {
+        &self.inner.query
+    }
+
+    /// The mutation root type name, when mutations are enabled.
+    #[must_use]
+    pub fn mutation_name(&self) -> Option<&Name> {
+        self.inner.mutation.as_ref()
+    }
+
+    /// The subscription root type name, when subscriptions are enabled.
+    #[must_use]
+    pub fn subscription_name(&self) -> Option<&Name> {
+        self.inner.subscription.as_ref()
+    }
+
+    /// The query root object type.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: the schema builder rejects a query root that is not an object.
+    #[must_use]
+    pub fn query_type(&self) -> &Arc<ObjectType> {
+        self.object_type(&self.inner.query)
+            .expect("validated schema has an object query root")
+    }
+
+    /// The mutation root object type, when present.
+    #[must_use]
+    pub fn mutation_type(&self) -> Option<&Arc<ObjectType>> {
+        self.inner
+            .mutation
+            .as_ref()
+            .and_then(|name| self.object_type(name))
+    }
+
+    /// The subscription root object type, when present.
+    #[must_use]
+    pub fn subscription_type(&self) -> Option<&Arc<ObjectType>> {
+        self.inner
+            .subscription
+            .as_ref()
+            .and_then(|name| self.object_type(name))
+    }
+
+    /// Look up an object type by name.
+    #[must_use]
+    pub fn object_type(&self, name: &str) -> Option<&Arc<ObjectType>> {
+        self.get_type(name).and_then(Type::as_object)
+    }
+
+    /// Look up an interface type by name.
+    #[must_use]
+    pub fn interface_type(&self, name: &str) -> Option<&Arc<InterfaceType>> {
+        self.get_type(name).and_then(Type::as_interface)
+    }
+
+    /// Look up a union type by name.
+    #[must_use]
+    pub fn union_type(&self, name: &str) -> Option<&Arc<UnionType>> {
+        self.get_type(name).and_then(Type::as_union)
+    }
+
+    /// Look up an enum type by name.
+    #[must_use]
+    pub fn enum_type(&self, name: &str) -> Option<&Arc<EnumType>> {
+        self.get_type(name).and_then(Type::as_enum)
+    }
+
+    /// Look up an input object type by name.
+    #[must_use]
+    pub fn input_object_type(&self, name: &str) -> Option<&Arc<InputObjectType>> {
+        self.get_type(name).and_then(Type::as_input_object)
+    }
+
+    /// Look up a scalar type by name.
+    #[must_use]
+    pub fn scalar_type(&self, name: &str) -> Option<&Arc<ScalarType>> {
+        self.get_type(name).and_then(Type::as_scalar)
+    }
+
+    /// Resolve a type reference's innermost named type.
+    #[must_use]
+    pub fn type_from_ref<'a>(&'a self, ty: &TypeRef) -> Option<&'a Type> {
+        self.get_type(ty.named_type())
+    }
+
+    /// Whether a concrete object type implements an interface, directly or transitively.
+    #[must_use]
+    pub fn object_implements(&self, object: &ObjectType, interface: &str) -> bool {
+        // Most objects implement their interfaces directly, and most interfaces implement
+        // nothing, so the common questions are answered without building a work list.
+        if object.interfaces.iter().any(|name| &**name == interface) {
+            return true;
+        }
+        let mut stack: smallvec::SmallVec<[&Name; 4]> = object.interfaces.iter().collect();
+        while let Some(name) = stack.pop() {
+            if &**name == interface {
+                return true;
+            }
+            if let Some(ty) = self.interface_type(name) {
+                stack.extend(ty.interfaces.iter());
+            }
+        }
+        false
+    }
+
+    /// Whether a type is a possible type of an abstract type.
+    #[must_use]
+    pub fn is_possible_type(&self, abstract_type: &str, object_type: &str) -> bool {
+        match self.get_type(abstract_type) {
+            Some(Type::Union(union)) => union.types.iter().any(|ty| &**ty == object_type),
+            Some(Type::Interface(_)) => self
+                .object_type(object_type)
+                .is_some_and(|object| self.object_implements(object, abstract_type)),
+            _ => false,
+        }
+    }
+
+    /// Every object type that can appear where the abstract type is expected.
+    #[must_use]
+    pub fn possible_types(&self, abstract_type: &str) -> Vec<Name> {
+        match self.get_type(abstract_type) {
+            Some(Type::Union(union)) => union.types.clone(),
+            Some(Type::Interface(_)) => self
+                .inner
+                .types
+                .values()
+                .filter_map(|ty| match ty {
+                    Type::Object(object) if self.object_implements(object, abstract_type) => {
+                        Some(object.name.clone())
+                    }
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The rendered GraphQL schema definition language document.
+    #[must_use]
+    pub fn sdl(&self) -> String {
+        crate::sdl::print_schema(self)
+    }
+
+    /// Build a schema from a GraphQL SDL document.
+    ///
+    /// The resulting schema has no resolvers; it is intended for tooling, compatibility checks
+    /// and introspection snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns parse and schema validation errors.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            level = "info",
+            name = "gql.schema.from_sdl",
+            fields(sdl_bytes = source.len())
+        )
+    )]
+    pub fn from_sdl(source: &str) -> Result<Self, SchemaError> {
+        crate::sdl_schema::schema_from_sdl(source)
+    }
+}
+
+/// Builds and validates a [`Schema`].
+///
+/// The builder is mutable and explicit. Higher-level crates such as `gurafi` provide a more
+/// ergonomic API on top; this one only cares about the specification.
+#[derive(Debug)]
+pub struct SchemaBuilder {
+    types: TypeMap<Type>,
+    query: Option<Name>,
+    mutation: Option<Name>,
+    subscription: Option<Name>,
+    directives: TypeMap<DirectiveDefinition>,
+    applied_directives: Vec<crate::types::AppliedDirective>,
+    description: Option<Arc<str>>,
+    errors: SchemaError,
+}
+
+impl Default for SchemaBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SchemaBuilder {
+    /// Create a builder pre-populated with the built-in directives.
+    ///
+    /// Built-in scalars are added during [`SchemaBuilder::build`] only when something in the
+    /// schema references them, matching the reference implementation's introspection output.
+    #[must_use]
+    pub fn new() -> Self {
+        let mut directives = TypeMap::default();
+        for directive in builtin_directives() {
+            directives.insert(directive.name.clone(), directive.clone());
+        }
+
+        Self {
+            types: TypeMap::default(),
+            query: None,
+            mutation: None,
+            subscription: None,
+            directives,
+            applied_directives: Vec::new(),
+            description: None,
+            errors: SchemaError::default(),
+        }
+    }
+
+    /// Set the schema description.
+    #[must_use]
+    pub fn description(mut self, description: impl Into<Arc<str>>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Add a directive application to the schema itself.
+    #[must_use]
+    pub fn schema_directive(mut self, directive: crate::types::AppliedDirective) -> Self {
+        self.applied_directives.push(directive);
+        self
+    }
+
+    /// Add several schema-level directive applications.
+    #[must_use]
+    pub fn schema_directives(
+        mut self,
+        directives: impl IntoIterator<Item = crate::types::AppliedDirective>,
+    ) -> Self {
+        self.applied_directives.extend(directives);
+        self
+    }
+
+    /// Set the query root type by name.
+    #[must_use]
+    pub fn query(mut self, name: impl Into<Name>) -> Self {
+        self.query = Some(name.into());
+        self
+    }
+
+    /// Set the mutation root type by name.
+    #[must_use]
+    pub fn mutation(mut self, name: impl Into<Name>) -> Self {
+        self.mutation = Some(name.into());
+        self
+    }
+
+    /// Set the subscription root type by name.
+    #[must_use]
+    pub fn subscription(mut self, name: impl Into<Name>) -> Self {
+        self.subscription = Some(name.into());
+        self
+    }
+
+    /// Register a scalar.
+    #[must_use]
+    pub fn scalar(mut self, scalar: ScalarType) -> Self {
+        self.add_type(Type::Scalar(Arc::new(scalar)));
+        self
+    }
+
+    /// Register an object type.
+    #[must_use]
+    pub fn object(mut self, object: ObjectType) -> Self {
+        self.add_type(Type::Object(Arc::new(object)));
+        self
+    }
+
+    /// Register an interface type.
+    #[must_use]
+    pub fn interface(mut self, interface: InterfaceType) -> Self {
+        self.add_type(Type::Interface(Arc::new(interface)));
+        self
+    }
+
+    /// Register a union type.
+    #[must_use]
+    pub fn union(mut self, union: UnionType) -> Self {
+        self.add_type(Type::Union(Arc::new(union)));
+        self
+    }
+
+    /// Register an enum type.
+    #[must_use]
+    pub fn enumeration(mut self, enumeration: EnumType) -> Self {
+        self.add_type(Type::Enum(Arc::new(enumeration)));
+        self
+    }
+
+    /// Register an input object type.
+    #[must_use]
+    pub fn input_object(mut self, input: InputObjectType) -> Self {
+        self.add_type(Type::InputObject(Arc::new(input)));
+        self
+    }
+
+    /// Register an arbitrary type definition.
+    #[must_use]
+    pub fn register(mut self, ty: Type) -> Self {
+        self.add_type(ty);
+        self
+    }
+
+    /// Register an arbitrary type definition, taking `&mut self` for builder style code.
+    pub fn add_type(&mut self, ty: Type) -> &mut Self {
+        let name = ty.name().clone();
+        if name.starts_with("__") {
+            self.errors.push(format!(
+                "Type name \"{name}\" must not begin with \"__\", which is reserved by GraphQL introspection."
+            ));
+            return self;
+        }
+        if self.types.contains_key(&name) {
+            self.errors
+                .push(format!("There can be only one type named \"{name}\"."));
+            return self;
+        }
+        self.types.insert(name, ty);
+        self
+    }
+
+    /// Register a directive definition.
+    #[must_use]
+    pub fn directive(mut self, definition: DirectiveDefinition) -> Self {
+        self.add_directive(definition);
+        self
+    }
+
+    /// Register a directive definition, taking `&mut self`.
+    pub fn add_directive(&mut self, definition: DirectiveDefinition) -> &mut Self {
+        let name = definition.name.clone();
+        if name.starts_with("__") {
+            self.errors.push(format!(
+                "Directive name \"@{name}\" must not begin with \"__\", which is reserved by GraphQL introspection."
+            ));
+            return self;
+        }
+        if self.directives.contains_key(&name) {
+            self.errors.push(format!(
+                "There can be only one directive named \"@{name}\"."
+            ));
+            return self;
+        }
+        self.directives.insert(name, definition);
+        self
+    }
+
+    /// Whether a type with the given name is already registered.
+    #[must_use]
+    pub fn has_type(&self, name: &str) -> bool {
+        self.types.contains_key(name)
+    }
+
+    /// Every error recorded so far.
+    #[must_use]
+    pub fn errors(&self) -> &[GraphQLError] {
+        &self.errors.errors
+    }
+
+    /// Validate and freeze the schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns every validation problem found. The GraphQL specification requires a schema to
+    /// reject duplicate types, dangling references, invalid interface implementations and
+    /// invalid input cycles; all of those are reported here rather than deferred to execution.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            level = "info",
+            name = "gql.schema.build",
+            fields(
+                types = self.types.len(),
+                directives = self.directives.len(),
+                errors = tracing::field::Empty,
+            )
+        )
+    )]
+    pub fn build(mut self) -> Result<Schema, SchemaError> {
+        // Introspection types are always present. Users cannot register them, so no duplicate
+        // check is needed. They are immutable, hold no resolvers and reference nothing a user
+        // defines, so every schema shares one cached copy instead of rebuilding them.
+        if self.types.get("__Schema").is_none() {
+            for ty in introspection_types() {
+                self.types.insert(ty.name().clone(), ty.clone());
+            }
+        }
+
+        let query = self.query.clone().or_else(|| {
+            if self.types.contains_key("Query") {
+                Some("Query".into())
+            } else {
+                None
+            }
+        });
+        let Some(query) = query else {
+            self.errors
+                .push("A schema must define a query root type.".to_owned());
+            return Err(self.errors);
+        };
+        if self.types.get(&query).is_none() {
+            self.errors
+                .push(format!("The query root type \"{query}\" does not exist."));
+        }
+        if let Some(mutation) = &self.mutation {
+            if self.types.get(mutation).is_none() {
+                self.errors.push(format!(
+                    "The mutation root type \"{mutation}\" does not exist."
+                ));
+            }
+        }
+        if let Some(subscription) = &self.subscription {
+            if self.types.get(subscription).is_none() {
+                self.errors.push(format!(
+                    "The subscription root type \"{subscription}\" does not exist."
+                ));
+            }
+        }
+
+        add_referenced_builtin_scalars(&mut self.types, &self.directives);
+
+        apply_dedicated_directives(&mut self.types, &mut self.directives);
+
+        resolve_field_type_indices(&mut self.types);
+
+        let inner = SchemaInner {
+            types: self.types,
+            applied_directives: self.applied_directives,
+            query,
+            mutation: self.mutation,
+            subscription: self.subscription,
+            directives: self.directives,
+            description: self.description,
+        };
+        let mut schema = Schema {
+            inner: Arc::new(inner),
+        };
+
+        validate_schema(&schema, &mut self.errors);
+        validate_applied_directives(&schema, &mut self.errors);
+        if self.errors.is_empty() {
+            coerce_applied_directive_arguments(&mut schema, &mut self.errors);
+        }
+        if self.errors.is_empty() {
+            strip_dedicated_directives(&mut schema);
+        }
+
+        if self.errors.is_empty() {
+            Ok(schema)
+        } else {
+            Err(self.errors)
+        }
+    }
+}
+
+/// The specification's default `@deprecated` reason.
+const DEFAULT_DEPRECATION_REASON: &str = "No longer supported";
+
+/// The built-in directive definitions, constructed once and cloned per builder.
+///
+/// A builder owns its directive map and a schema is immutable, so cloning these plain
+/// definitions is total and cheap; rebuilding them from scratch on every build was not.
+fn builtin_directives() -> &'static [DirectiveDefinition] {
+    static DIRECTIVES: std::sync::OnceLock<Vec<DirectiveDefinition>> = std::sync::OnceLock::new();
+    DIRECTIVES.get_or_init(|| {
+        vec![
+            DirectiveDefinition::skip(),
+            DirectiveDefinition::include(),
+            DirectiveDefinition::deprecated(),
+            DirectiveDefinition::specified_by(),
+            DirectiveDefinition::one_of(),
+        ]
+    })
+}
+
+/// Copy dedicated built-in directive applications into their authoritative model fields.
+///
+/// `@deprecated`, `@specifiedBy` and `@oneOf` have first-class fields on the type model, and the
+/// SDL printer deliberately skips the directive form to avoid printing the same fact twice. A
+/// code-first schema that applies one through [`AppliedDirective`] would therefore lose it unless
+/// it is mapped here. The application itself is kept in the `directives` list so it is still
+/// validated; mapping only supplies the authoritative field.
+///
+/// SDL-imported built-ins are mapped here too. The mapping is idempotent, so they are not
+/// reported or printed twice.
+fn apply_dedicated_directives(
+    types: &mut TypeMap<Type>,
+    definitions: &mut TypeMap<DirectiveDefinition>,
+) {
+    fn deprecation(directives: &[AppliedDirective]) -> Option<Option<Arc<str>>> {
+        let directive = directives
+            .iter()
+            .rev()
+            .find(|directive| directive.name.as_ref() == "deprecated")?;
+        Some(match directive.get_argument("reason") {
+            Some(Value::String(reason)) => Some(reason.clone()),
+            Some(Value::Null) | None => Some(Arc::from(DEFAULT_DEPRECATION_REASON)),
+            // Validation reports a wrong-typed reason; leave the field untouched so a broken
+            // application cannot become a deprecation reason.
+            Some(_) => None,
+        })
+    }
+
+    fn apply_deprecation(directives: &[AppliedDirective], target: &mut Option<Arc<str>>) {
+        if let Some(reason) = deprecation(directives) {
+            *target = reason;
+        }
+    }
+
+    fn string_argument(
+        directives: &[AppliedDirective],
+        directive_name: &str,
+        argument_name: &str,
+    ) -> Option<Arc<str>> {
+        let directive = directives
+            .iter()
+            .rev()
+            .find(|directive| directive.name.as_ref() == directive_name)?;
+        match directive.get_argument(argument_name) {
+            Some(Value::String(value)) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    fn apply_input_value(value: &mut InputValue) {
+        apply_deprecation(&value.directives, &mut value.deprecation_reason);
+    }
+
+    fn apply_field(field: &mut Field) {
+        apply_deprecation(&field.directives, &mut field.deprecation_reason);
+        for argument in field.args.values_mut() {
+            apply_input_value(argument);
+        }
+    }
+
+    for ty in types.values_mut() {
+        match ty {
+            Type::Scalar(scalar) => {
+                if !has_named(&scalar.directives, "specifiedBy") {
+                    continue;
+                }
+                let scalar = Arc::make_mut(scalar);
+                if let Some(url) = string_argument(&scalar.directives, "specifiedBy", "url") {
+                    scalar.specified_by_url = Some(url);
+                }
+            }
+            Type::Object(object) => {
+                if !object_has_deprecation(object) {
+                    continue;
+                }
+                let object = Arc::make_mut(object);
+                for field in object.fields.values_mut() {
+                    apply_field(field);
+                }
+            }
+            Type::Interface(interface) => {
+                if !interface_has_deprecation(interface) {
+                    continue;
+                }
+                let interface = Arc::make_mut(interface);
+                for field in interface.fields.values_mut() {
+                    apply_field(field);
+                }
+            }
+            Type::Union(_) => {}
+            Type::Enum(enumeration) => {
+                if !enum_has_deprecation(enumeration) {
+                    continue;
+                }
+                let enumeration = Arc::make_mut(enumeration);
+                for value in enumeration.values.values_mut() {
+                    apply_deprecation(&value.directives, &mut value.deprecation_reason);
+                }
+            }
+            Type::InputObject(input) => {
+                if !input_has_dedicated(input) {
+                    continue;
+                }
+                let input = Arc::make_mut(input);
+                if has_named(&input.directives, "oneOf") {
+                    input.one_of = true;
+                }
+                for field in input.fields.values_mut() {
+                    apply_input_value(field);
+                }
+            }
+        }
+    }
+
+    for directive in definitions.values_mut() {
+        if !directive_has_deprecation(directive) {
+            continue;
+        }
+        apply_deprecation(&directive.directives, &mut directive.deprecation_reason);
+        for argument in directive.args.values_mut() {
+            apply_input_value(argument);
+        }
+    }
+}
+
+/// Whether a directive with the given name is applied.
+fn has_named(directives: &[AppliedDirective], name: &str) -> bool {
+    directives
+        .iter()
+        .any(|directive| directive.name.as_ref() == name)
+}
+
+fn field_has_deprecation(field: &Field) -> bool {
+    has_named(&field.directives, "deprecated")
+}
+
+fn has_argument_deprecation(args: &IndexMap<Name, InputValue>) -> bool {
+    args.values()
+        .any(|argument| has_named(&argument.directives, "deprecated"))
+}
+
+fn object_has_deprecation(object: &ObjectType) -> bool {
+    has_named(&object.directives, "deprecated")
+        || object
+            .fields
+            .values()
+            .any(|field| field_has_deprecation(field) || has_argument_deprecation(&field.args))
+}
+
+fn interface_has_deprecation(interface: &InterfaceType) -> bool {
+    has_named(&interface.directives, "deprecated")
+        || interface
+            .fields
+            .values()
+            .any(|field| field_has_deprecation(field) || has_argument_deprecation(&field.args))
+}
+
+fn enum_has_deprecation(enumeration: &EnumType) -> bool {
+    has_named(&enumeration.directives, "deprecated")
+        || enumeration
+            .values
+            .values()
+            .any(|value| has_named(&value.directives, "deprecated"))
+}
+
+fn input_has_dedicated(input: &InputObjectType) -> bool {
+    has_named(&input.directives, "oneOf")
+        || has_named(&input.directives, "deprecated")
+        || input
+            .fields
+            .values()
+            .any(|field| has_named(&field.directives, "deprecated"))
+}
+
+fn directive_has_deprecation(directive: &DirectiveDefinition) -> bool {
+    has_named(&directive.directives, "deprecated") || has_argument_deprecation(&directive.args)
+}
+
+/// Remove `@deprecated`, `@specifiedBy` and `@oneOf` applications now that their authoritative
+/// model fields hold the same data.
+///
+/// SDL parsing records both forms; keeping the directive list as well would make a schema built
+/// from SDL structurally different from the identical code-first schema, and would make
+/// [`Schema::extend_sdl`](super::Schema::extend_sdl) change a schema's observable structure even
+/// when the SDL adds nothing. Validation and argument coercion run before this, so an invalid
+/// application is still reported.
+fn strip_dedicated_directives(schema: &mut Schema) {
+    const DEDICATED: [&str; 3] = ["deprecated", "specifiedBy", "oneOf"];
+
+    fn strip(directives: &mut Vec<AppliedDirective>) {
+        if directives
+            .iter()
+            .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+        {
+            directives.retain(|directive| !DEDICATED.contains(&directive.name.as_ref()));
+        }
+    }
+
+    fn strip_input_value(value: &mut InputValue) {
+        strip(&mut value.directives);
+    }
+
+    fn strip_field(field: &mut Field) {
+        strip(&mut field.directives);
+        for argument in field.args.values_mut() {
+            strip_input_value(argument);
+        }
+    }
+
+    let inner = Arc::make_mut(&mut schema.inner);
+    for ty in inner.types.values_mut() {
+        match ty {
+            Type::Scalar(scalar) => {
+                if scalar
+                    .directives
+                    .iter()
+                    .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+                {
+                    strip(&mut Arc::make_mut(scalar).directives);
+                }
+            }
+            Type::Object(object) => {
+                if object
+                    .directives
+                    .iter()
+                    .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+                    || object.fields.values().any(|field| {
+                        field
+                            .directives
+                            .iter()
+                            .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+                    })
+                {
+                    let object = Arc::make_mut(object);
+                    strip(&mut object.directives);
+                    for field in object.fields.values_mut() {
+                        strip_field(field);
+                    }
+                }
+            }
+            Type::Interface(interface) => {
+                if interface
+                    .directives
+                    .iter()
+                    .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+                    || interface.fields.values().any(|field| {
+                        field
+                            .directives
+                            .iter()
+                            .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+                    })
+                {
+                    let interface = Arc::make_mut(interface);
+                    strip(&mut interface.directives);
+                    for field in interface.fields.values_mut() {
+                        strip_field(field);
+                    }
+                }
+            }
+            Type::Union(union) => {
+                if union
+                    .directives
+                    .iter()
+                    .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+                {
+                    strip(&mut Arc::make_mut(union).directives);
+                }
+            }
+            Type::Enum(enumeration) => {
+                if enumeration
+                    .directives
+                    .iter()
+                    .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+                    || enumeration.values.values().any(|value| {
+                        value
+                            .directives
+                            .iter()
+                            .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+                    })
+                {
+                    let enumeration = Arc::make_mut(enumeration);
+                    strip(&mut enumeration.directives);
+                    for value in enumeration.values.values_mut() {
+                        strip(&mut value.directives);
+                    }
+                }
+            }
+            Type::InputObject(input) => {
+                if input
+                    .directives
+                    .iter()
+                    .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+                    || input.fields.values().any(|field| {
+                        field
+                            .directives
+                            .iter()
+                            .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+                    })
+                {
+                    let input = Arc::make_mut(input);
+                    strip(&mut input.directives);
+                    for field in input.fields.values_mut() {
+                        strip_input_value(field);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Coerce every applied directive argument to the input type its definition declares.
+///
+/// Directive applications are stored as values, not as AST literals, so SDL parsing turns a
+/// literal into its runtime shape first and this pass then applies the same rules as a variable
+/// value: `ID` renders an integer as a decimal string, `Float` widens an integer, `Int` rejects a
+/// value outside 32 bits, and a custom scalar's `parse_value` runs.
+///
+/// A schema is needed to resolve named input types, and the schema owns the values being
+/// rewritten, so the pass snapshots the build and mutates through `Arc::make_mut`. It runs only
+/// when validation succeeded, which also means every coercion here succeeds; anything else is
+/// still reported rather than silently kept.
+fn coerce_applied_directive_arguments(schema: &mut Schema, errors: &mut SchemaError) {
+    // Most schemas have no directive applications at all. Coercion needs a snapshot of the
+    // schema to resolve named input types, which forces a deep copy of every definition through
+    // `Arc::make_mut`; skip all of that when there is nothing to coerce.
+    if !has_applied_directives(schema) {
+        return;
+    }
+
+    fn coerce(
+        lookup: &Schema,
+        directives: &mut [AppliedDirective],
+        owner: &str,
+        errors: &mut SchemaError,
+    ) {
+        for directive in directives {
+            let Some(definition) = lookup.get_directive(&directive.name) else {
+                continue;
+            };
+            for (name, value) in &mut directive.arguments {
+                let Some(declared) = definition.args.get(name) else {
+                    continue;
+                };
+                let mut path = Vec::new();
+                match crate::execution::coerce::coerce_input_value(
+                    lookup,
+                    value,
+                    &declared.ty,
+                    &mut path,
+                ) {
+                    Ok(coerced) => *value = coerced,
+                    Err(error) => errors.push(format!(
+                        "Argument \"{name}\" of directive \"@{}\" on {owner} is invalid: {}",
+                        directive.name,
+                        error.message()
+                    )),
+                }
+            }
+        }
+    }
+
+    fn input_value(lookup: &Schema, value: &mut InputValue, owner: &str, errors: &mut SchemaError) {
+        coerce(lookup, &mut value.directives, owner, errors);
+    }
+
+    fn field(lookup: &Schema, field: &mut Field, owner: &str, errors: &mut SchemaError) {
+        coerce(lookup, &mut field.directives, owner, errors);
+        for argument in field.args.values_mut() {
+            if argument.directives.is_empty() {
+                continue;
+            }
+            let owner = format!("argument \"{}\" of {owner}", argument.name);
+            input_value(lookup, argument, &owner, errors);
+        }
+    }
+
+    let lookup = schema.clone();
+    let inner = Arc::make_mut(&mut schema.inner);
+
+    coerce(&lookup, &mut inner.applied_directives, "the schema", errors);
+    for ty in inner.types.values_mut() {
+        if !type_has_applied_directives(ty) {
+            continue;
+        }
+        match ty {
+            Type::Scalar(scalar) => {
+                let scalar = Arc::make_mut(scalar);
+                coerce(
+                    &lookup,
+                    &mut scalar.directives,
+                    &format!("scalar \"{}\"", scalar.name),
+                    errors,
+                );
+            }
+            Type::Object(object) => {
+                let object = Arc::make_mut(object);
+                for field_value in object.fields.values_mut() {
+                    let owner = format!("field \"{}.{}\"", object.name, field_value.name);
+                    field(&lookup, field_value, &owner, errors);
+                }
+            }
+            Type::Interface(interface) => {
+                let interface = Arc::make_mut(interface);
+                for field_value in interface.fields.values_mut() {
+                    let owner = format!("field \"{}.{}\"", interface.name, field_value.name);
+                    field(&lookup, field_value, &owner, errors);
+                }
+            }
+            Type::Union(union) => {
+                let union = Arc::make_mut(union);
+                coerce(
+                    &lookup,
+                    &mut union.directives,
+                    &format!("union \"{}\"", union.name),
+                    errors,
+                );
+            }
+            Type::Enum(enumeration) => {
+                let enumeration = Arc::make_mut(enumeration);
+                coerce(
+                    &lookup,
+                    &mut enumeration.directives,
+                    &format!("enum \"{}\"", enumeration.name),
+                    errors,
+                );
+                for value in enumeration.values.values_mut() {
+                    let owner = format!("enum value \"{}.{}\"", enumeration.name, value.name);
+                    coerce(&lookup, &mut value.directives, &owner, errors);
+                }
+            }
+            Type::InputObject(input) => {
+                let input = Arc::make_mut(input);
+                coerce(
+                    &lookup,
+                    &mut input.directives,
+                    &format!("input object \"{}\"", input.name),
+                    errors,
+                );
+                for field_value in input.fields.values_mut() {
+                    let owner = format!("input field \"{}.{}\"", input.name, field_value.name);
+                    input_value(&lookup, field_value, &owner, errors);
+                }
+            }
+        }
+    }
+    for directive in inner.directives.values_mut() {
+        if directive.directives.is_empty()
+            && directive.args.values().all(|a| a.directives.is_empty())
+        {
+            continue;
+        }
+        let owner = format!("directive \"@{}\"", directive.name);
+        coerce(&lookup, &mut directive.directives, &owner, errors);
+        for argument in directive.args.values_mut() {
+            let owner = format!("argument \"{}\" of {owner}", argument.name);
+            input_value(&lookup, argument, &owner, errors);
+        }
+    }
+}
+
+/// Whether any element of the schema has an applied directive.
+///
+/// The directive passes are not free: coercion snapshots the whole schema and then deep-clones
+/// every definition it rewrites. Nearly every schema has none, so this scan lets the build skip
+/// those passes entirely.
+fn has_applied_directives(schema: &Schema) -> bool {
+    !schema.inner.applied_directives.is_empty()
+        || schema.inner.types.values().any(type_has_applied_directives)
+        || schema.inner.directives.values().any(|directive| {
+            !directive.directives.is_empty()
+                || directive.args.values().any(|a| !a.directives.is_empty())
+        })
+}
+
+fn type_has_applied_directives(ty: &Type) -> bool {
+    match ty {
+        Type::Scalar(scalar) => !scalar.directives.is_empty(),
+        Type::Object(object) => {
+            !object.directives.is_empty()
+                || object.fields.values().any(field_has_applied_directives)
+        }
+        Type::Interface(interface) => {
+            !interface.directives.is_empty()
+                || interface.fields.values().any(field_has_applied_directives)
+        }
+        Type::Union(union) => !union.directives.is_empty(),
+        Type::Enum(enumeration) => {
+            !enumeration.directives.is_empty()
+                || enumeration
+                    .values
+                    .values()
+                    .any(|value| !value.directives.is_empty())
+        }
+        Type::InputObject(input) => {
+            !input.directives.is_empty()
+                || input
+                    .fields
+                    .values()
+                    .any(|field| !field.directives.is_empty())
+        }
+    }
+}
+
+fn field_has_applied_directives(field: &Field) -> bool {
+    !field.directives.is_empty()
+        || field
+            .args
+            .values()
+            .any(|argument| !argument.directives.is_empty())
+}
+
+/// The built-in scalars, in the canonical order they are added to a schema.
+const BUILT_IN_SCALARS: [&str; 5] = ["String", "Int", "Float", "Boolean", "ID"];
+
+/// The index of a built-in scalar name in [`BUILT_IN_SCALARS`].
+fn builtin_scalar_index(name: &str) -> Option<usize> {
+    BUILT_IN_SCALARS.iter().position(|builtin| *builtin == name)
+}
+
+/// Build the built-in scalar at `index` in [`BUILT_IN_SCALARS`].
+fn builtin_scalar(index: usize) -> ScalarType {
+    match index {
+        0 => ScalarType::string(),
+        1 => ScalarType::int(),
+        2 => ScalarType::float(),
+        3 => ScalarType::boolean(),
+        _ => ScalarType::id(),
+    }
+}
+
+/// Add the built-in scalars the schema actually references.
+///
+/// The October 2021 specification's introspection model includes only types reachable from the
+/// schema's roots, directives and definitions (graphql-js behaves the same way). Registering all
+/// five built-ins up front made `__schema.types` and `__type(name: "Float")` disagree with that
+/// model. A user who explicitly registers a built-in scalar keeps their definition; only missing,
+/// unreferenced built-ins are skipped.
+fn add_referenced_builtin_scalars(
+    types: &mut TypeMap<Type>,
+    directives: &TypeMap<DirectiveDefinition>,
+) {
+    // Fast path for the common fully-populated schema.
+    if BUILT_IN_SCALARS
+        .iter()
+        .all(|name| types.contains_key(*name))
+    {
+        return;
+    }
+
+    // Only the five built-in scalar names matter here, so a fixed mask avoids building a set of
+    // every name the schema references.
+    let mut referenced = [false; BUILT_IN_SCALARS.len()];
+
+    fn add_type_ref(ty: &TypeRef, referenced: &mut [bool; BUILT_IN_SCALARS.len()]) {
+        if let Some(index) = builtin_scalar_index(ty.named_type()) {
+            referenced[index] = true;
+        }
+    }
+
+    fn add_fields<'a>(
+        fields: impl Iterator<Item = &'a Field>,
+        referenced: &mut [bool; BUILT_IN_SCALARS.len()],
+    ) {
+        for field in fields {
+            add_type_ref(&field.ty, referenced);
+            for argument in field.args.values() {
+                add_type_ref(&argument.ty, referenced);
+            }
+        }
+    }
+
+    for ty in types.values() {
+        match ty {
+            Type::Object(object) => add_fields(object.fields.values(), &mut referenced),
+            Type::Interface(interface) => add_fields(interface.fields.values(), &mut referenced),
+            Type::InputObject(input) => {
+                for field in input.fields.values() {
+                    add_type_ref(&field.ty, &mut referenced);
+                }
+            }
+            // Enums and scalars reference no other type; unions and interfaces name object types.
+            Type::Union(_) | Type::Enum(_) | Type::Scalar(_) => {}
+        }
+    }
+    for directive in directives.values() {
+        for argument in directive.args.values() {
+            add_type_ref(&argument.ty, &mut referenced);
+        }
+    }
+
+    let missing: Vec<ScalarType> = BUILT_IN_SCALARS
+        .iter()
+        .enumerate()
+        .filter(|(index, name)| referenced[*index] && !types.contains_key(**name))
+        .map(|(index, _)| builtin_scalar(index))
+        .collect();
+
+    if missing.is_empty() {
+        return;
+    }
+
+    // Built-ins keep their canonical position at the front of the type map, which preserves the
+    // stable introspection order existing clients rely on.
+    let mut ordered = TypeMap::default();
+    ordered.reserve(types.len().saturating_add(missing.len()));
+    for scalar in missing {
+        ordered.insert(scalar.name.clone(), Type::Scalar(Arc::new(scalar)));
+    }
+    for (name, ty) in types.drain(..) {
+        ordered.insert(name, ty);
+    }
+    *types = ordered;
+}
+
+/// The introspection types, constructed once and shared by every schema.
+///
+/// A schema is immutable and these definitions have no resolvers and reference no user type, so
+/// sharing one copy is safe. Their fields deliberately keep `type_index` unset: filling it in
+/// would mutate a shared definition, forcing a deep clone on every build. Execution falls back to
+/// a name lookup for those fields, and introspection queries are not the hot path.
+fn introspection_types() -> &'static [Type] {
+    static TYPES: std::sync::OnceLock<Vec<Type>> = std::sync::OnceLock::new();
+    TYPES.get_or_init(crate::introspection::types)
+}
+
+/// Record where each field's output type lives in the schema's type map.
+///
+/// The map is complete (introspection types included) by the time this runs, and its order never
+/// changes afterwards, so the positions stay valid for the whole life of the schema. Fields whose
+/// type is not defined are left unresolved; schema validation reports them.
+fn resolve_field_type_indices(types: &mut TypeMap<Type>) {
+    let indices: rustc_hash::FxHashMap<Name, u32> = types
+        .keys()
+        .enumerate()
+        .map(|(index, name)| (name.clone(), index as u32))
+        .collect();
+
+    fn resolved(
+        fields: &IndexMap<Name, crate::types::Field>,
+        indices: &rustc_hash::FxHashMap<Name, u32>,
+    ) -> bool {
+        fields
+            .values()
+            .all(|field| field.type_index == indices.get(field.ty.named_type()).copied())
+    }
+
+    fn assign(
+        fields: &mut IndexMap<Name, crate::types::Field>,
+        indices: &rustc_hash::FxHashMap<Name, u32>,
+    ) {
+        for field in fields.values_mut() {
+            field.type_index = indices.get(field.ty.named_type()).copied();
+        }
+    }
+
+    for (name, ty) in types.iter_mut() {
+        if name.starts_with("__") {
+            // Introspection definitions are shared with every other schema and keep their
+            // `type_index` unset; execution resolves them by name.
+            continue;
+        }
+        match ty {
+            // A definition shared with the schema this one was composed from already holds the
+            // right positions when the type map kept its order, which is the normal case for
+            // merge/retain/transform. `Arc::make_mut` would deep-clone it for nothing.
+            Type::Object(object) if !resolved(&object.fields, &indices) => {
+                assign(&mut Arc::make_mut(object).fields, &indices);
+            }
+            Type::Interface(interface) if !resolved(&interface.fields, &indices) => {
+                assign(&mut Arc::make_mut(interface).fields, &indices);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A named schema element, formatted only when an error is recorded.
+///
+/// Validation formats an owner for every field and argument it visits. Building that string up
+/// front made a successful build allocate once per element, so owners are now formed on demand.
+pub(crate) struct NamedOwner<'a> {
+    pub(crate) kind: &'static str,
+    pub(crate) name: &'a str,
+}
+
+impl fmt::Display for NamedOwner<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} \"{}\"", self.kind, self.name)
+    }
+}
+
+/// A `Kind "type.member"` path, formatted only when an error is recorded.
+pub(crate) struct NamedPath<'a> {
+    pub(crate) kind: &'static str,
+    pub(crate) type_name: &'a str,
+    pub(crate) name: &'a str,
+}
+
+impl fmt::Display for NamedPath<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} \"{}.{}\"", self.kind, self.type_name, self.name)
+    }
+}
+
+/// A directive definition's owner (`directive "@name"`).
+pub(crate) struct DirectiveOwner<'a>(pub(crate) &'a str);
+
+impl fmt::Display for DirectiveOwner<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "directive \"@{}\"", self.0)
+    }
+}
+
+/// An argument of a field or directive definition.
+pub(crate) struct ArgumentPath<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) owner: &'a dyn fmt::Display,
+}
+
+impl fmt::Display for ArgumentPath<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Argument \"{}\" of {}", self.name, self.owner)
+    }
+}
+
+/// Check that an output type reference is structurally valid and names an output type.
+fn validate_output_type(
+    schema: &Schema,
+    reference: &TypeRef,
+    owner: &dyn fmt::Display,
+    errors: &mut SchemaError,
+) {
+    match reference {
+        TypeRef::NonNull(inner) => {
+            if matches!(**inner, TypeRef::NonNull(_)) {
+                errors.push(format!(
+                    "{owner} uses a non-null wrapper around another non-null type."
+                ));
+            }
+            validate_output_type(schema, inner, owner, errors);
+        }
+        TypeRef::List(inner) => validate_output_type(schema, inner, owner, errors),
+        TypeRef::Named(name) => match schema.get_type(name) {
+            None => errors.push(format!("{owner} references an unknown type \"{name}\".")),
+            Some(ty) if !ty.is_output_type() => errors.push(format!(
+                "{owner} must use an output type but \"{name}\" is an input object."
+            )),
+            Some(_) => {}
+        },
+    }
+}
+
+/// Check that an input type reference is structurally valid and names an input type.
+fn validate_input_type(
+    schema: &Schema,
+    reference: &TypeRef,
+    owner: &dyn fmt::Display,
+    errors: &mut SchemaError,
+) {
+    match reference {
+        TypeRef::NonNull(inner) => {
+            if matches!(**inner, TypeRef::NonNull(_)) {
+                errors.push(format!(
+                    "{owner} uses a non-null wrapper around another non-null type."
+                ));
+            }
+            validate_input_type(schema, inner, owner, errors);
+        }
+        TypeRef::List(inner) => validate_input_type(schema, inner, owner, errors),
+        TypeRef::Named(name) => match schema.get_type(name) {
+            None => errors.push(format!("{owner} references an unknown type \"{name}\".")),
+            Some(ty) if !ty.is_input_type() => errors.push(format!(
+                "{owner} must use an input type but \"{name}\" is not one."
+            )),
+            Some(_) => {}
+        },
+    }
+}
+
+fn validate_arguments(
+    schema: &Schema,
+    args: &IndexMap<Name, InputValue>,
+    owner: &dyn fmt::Display,
+    errors: &mut SchemaError,
+) {
+    for argument in args.values() {
+        validate_input_type(
+            schema,
+            &argument.ty,
+            &ArgumentPath {
+                name: &argument.name,
+                owner,
+            },
+            errors,
+        );
+        if let Some(default) = &argument.default_value {
+            if let Err(error) =
+                crate::execution::coerce::validate_default_value(schema, default, &argument.ty)
+            {
+                errors.push(format!(
+                    "Default value for argument \"{}\" of {owner} is invalid: {}",
+                    argument.name,
+                    error.message()
+                ));
+            }
+        }
+        if argument.name.starts_with("__") {
+            errors.push(format!(
+                "Argument \"{}\" of {owner} must not begin with \"__\".",
+                argument.name
+            ));
+        }
+        if argument.deprecation_reason.is_some()
+            && matches!(argument.ty, TypeRef::NonNull(_))
+            && argument.default_value.is_none()
+        {
+            errors.push(format!(
+                "Required argument \"{}\" of {owner} cannot be deprecated.",
+                argument.name
+            ));
+        }
+    }
+}
+
+/// Validate directive applications built through the code-first API.
+fn validate_applied_directives(schema: &Schema, errors: &mut SchemaError) {
+    use crate::ast::DirectiveLocation;
+
+    crate::sdl_schema::validate_applied_directives(
+        schema,
+        schema.applied_directives(),
+        DirectiveLocation::Schema,
+        &"the schema",
+        errors,
+    );
+    for (_name, ty) in schema.types() {
+        match ty {
+            Type::Scalar(scalar) => crate::sdl_schema::validate_applied_directives(
+                schema,
+                &scalar.directives,
+                DirectiveLocation::Scalar,
+                &NamedOwner {
+                    kind: "scalar",
+                    name: scalar.name.as_ref(),
+                },
+                errors,
+            ),
+            Type::Object(object) => {
+                crate::sdl_schema::validate_applied_directives(
+                    schema,
+                    &object.directives,
+                    DirectiveLocation::Object,
+                    &NamedOwner {
+                        kind: "object",
+                        name: object.name.as_ref(),
+                    },
+                    errors,
+                );
+                for field in object.fields.values() {
+                    validate_field_directives(schema, field, errors);
+                }
+            }
+            Type::Interface(interface) => {
+                crate::sdl_schema::validate_applied_directives(
+                    schema,
+                    &interface.directives,
+                    DirectiveLocation::Interface,
+                    &NamedOwner {
+                        kind: "interface",
+                        name: interface.name.as_ref(),
+                    },
+                    errors,
+                );
+                for field in interface.fields.values() {
+                    validate_field_directives(schema, field, errors);
+                }
+            }
+            Type::Union(union) => crate::sdl_schema::validate_applied_directives(
+                schema,
+                &union.directives,
+                DirectiveLocation::Union,
+                &NamedOwner {
+                    kind: "union",
+                    name: union.name.as_ref(),
+                },
+                errors,
+            ),
+            Type::Enum(enumeration) => {
+                crate::sdl_schema::validate_applied_directives(
+                    schema,
+                    &enumeration.directives,
+                    DirectiveLocation::Enum,
+                    &format!("enum \"{}\"", enumeration.name),
+                    errors,
+                );
+                for value in enumeration.values.values() {
+                    crate::sdl_schema::validate_applied_directives(
+                        schema,
+                        &value.directives,
+                        DirectiveLocation::EnumValue,
+                        &NamedPath {
+                            kind: "enum value",
+                            type_name: enumeration.name.as_ref(),
+                            name: value.name.as_ref(),
+                        },
+                        errors,
+                    );
+                }
+            }
+            Type::InputObject(input) => {
+                crate::sdl_schema::validate_applied_directives(
+                    schema,
+                    &input.directives,
+                    DirectiveLocation::InputObject,
+                    &format!("input object \"{}\"", input.name),
+                    errors,
+                );
+                for field in input.fields.values() {
+                    crate::sdl_schema::validate_applied_directives(
+                        schema,
+                        &field.directives,
+                        DirectiveLocation::InputFieldDefinition,
+                        &NamedPath {
+                            kind: "input field",
+                            type_name: input.name.as_ref(),
+                            name: field.name.as_ref(),
+                        },
+                        errors,
+                    );
+                }
+            }
+        }
+    }
+    for directive in schema.directives() {
+        crate::sdl_schema::validate_applied_directives(
+            schema,
+            &directive.1.directives,
+            DirectiveLocation::DirectiveDefinition,
+            &DirectiveOwner(&directive.1.name),
+            errors,
+        );
+        for argument in directive.1.args.values() {
+            crate::sdl_schema::validate_applied_directives(
+                schema,
+                &argument.directives,
+                DirectiveLocation::ArgumentDefinition,
+                &NamedOwner {
+                    kind: "argument",
+                    name: argument.name.as_ref(),
+                },
+                errors,
+            );
+        }
+    }
+}
+
+fn validate_field_directives(schema: &Schema, field: &Field, errors: &mut SchemaError) {
+    use crate::ast::DirectiveLocation;
+    crate::sdl_schema::validate_applied_directives(
+        schema,
+        &field.directives,
+        DirectiveLocation::FieldDefinition,
+        &NamedOwner {
+            kind: "field",
+            name: field.name.as_ref(),
+        },
+        errors,
+    );
+    for argument in field.args.values() {
+        crate::sdl_schema::validate_applied_directives(
+            schema,
+            &argument.directives,
+            DirectiveLocation::ArgumentDefinition,
+            &NamedOwner {
+                kind: "argument",
+                name: argument.name.as_ref(),
+            },
+            errors,
+        );
+    }
+}
+
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        skip_all,
+        level = "debug",
+        name = "gql.schema.validate",
+        fields(types = schema.types().len(), directives = schema.directives().len())
+    )
+)]
+fn validate_schema(schema: &Schema, errors: &mut SchemaError) {
+    for ty in schema.inner.types.values() {
+        match ty {
+            Type::Scalar(_) => {}
+            Type::Object(object) => {
+                if object.fields.is_empty() {
+                    errors.push(format!(
+                        "Object type \"{}\" must define at least one field.",
+                        object.name
+                    ));
+                }
+                for duplicate in &object.duplicates {
+                    errors.push(format!(
+                        "Object \"{}\" defines field \"{duplicate}\" more than once.",
+                        object.name
+                    ));
+                }
+                for field in object.fields.values() {
+                    validate_field(schema, field, &object.name, errors);
+                }
+                for interface in &object.interfaces {
+                    match schema.get_type(interface) {
+                        Some(Type::Interface(interface_ty)) => {
+                            // Every field on the interface must be present with a compatible type
+                            // and every required argument must be accepted.
+                            for (field_name, interface_field) in &interface_ty.fields {
+                                match object.fields.get(field_name) {
+                                    None => errors.push(format!(
+                                        "Interface field \"{}.{field_name}\" expected but \"{}\" does not provide it.",
+                                        interface_ty.name, object.name
+                                    )),
+                                    Some(object_field) => {
+                                        for (arg_name, object_arg) in &object_field.args {
+                                            if !interface_field.args.contains_key(arg_name)
+                                                && matches!(object_arg.ty, TypeRef::NonNull(_))
+                                                && object_arg.default_value.is_none()
+                                            {
+                                                errors.push(format!(
+                                                    "Object field \"{}.{field_name}\" adds required argument \"{arg_name}\" which is not present on interface field \"{}.{field_name}\".",
+                                                    object.name, interface_ty.name
+                                                ));
+                                            }
+                                        }
+                                        if !is_output_subtype(
+                                            schema,
+                                            &object_field.ty,
+                                            &interface_field.ty,
+                                        ) {
+                                            errors.push(format!(
+                                                "Interface field \"{}.{field_name}\" expects type \"{}\" but \"{}.{field_name}\" is type \"{}\".",
+                                                interface_ty.name,
+                                                interface_field.ty,
+                                                object.name,
+                                                object_field.ty
+                                            ));
+                                        }
+                                        for (arg_name, interface_arg) in &interface_field.args {
+                                            match object_field.args.get(arg_name) {
+                                                None => errors.push(format!(
+                                                    "Interface field argument \"{}.{field_name}({arg_name}:)\" expected but \"{}.{field_name}\" does not provide it.",
+                                                    interface_ty.name, object.name
+                                                )),
+                                                Some(object_arg) => {
+                                                    if object_arg.ty != interface_arg.ty {
+                                                        errors.push(format!(
+                                                            "Interface field argument \"{}.{field_name}({arg_name}:)\" expects type \"{}\" but \"{}.{field_name}({arg_name}:)\" is type \"{}\".",
+                                                            interface_ty.name,
+                                                            interface_arg.ty,
+                                                            object.name,
+                                                            object_arg.ty
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Some(_) => errors.push(format!(
+                            "Type \"{}\" must only implement interfaces, but \"{interface}\" is not an interface.",
+                            object.name
+                        )),
+                        None => errors.push(format!(
+                            "Type \"{}\" implements unknown interface \"{interface}\".",
+                            object.name
+                        )),
+                    }
+                }
+                for (index, interface) in object.interfaces.iter().enumerate() {
+                    if object.interfaces[index + 1..].contains(interface) {
+                        errors.push(format!(
+                            "Type \"{}\" implements interface \"{interface}\" more than once.",
+                            object.name
+                        ));
+                    }
+                    if let Some(interface_ty) = schema.interface_type(interface) {
+                        for transitive in &interface_ty.interfaces {
+                            if !object.interfaces.contains(transitive) {
+                                errors.push(format!(
+                                    "Type \"{}\" must implement interface \"{transitive}\" because it implements \"{interface}\".",
+                                    object.name
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            Type::Interface(interface) => {
+                if interface.fields.is_empty() {
+                    errors.push(format!(
+                        "Interface type \"{}\" must define at least one field.",
+                        interface.name
+                    ));
+                }
+                for duplicate in &interface.duplicates {
+                    errors.push(format!(
+                        "Interface \"{}\" defines field \"{duplicate}\" more than once.",
+                        interface.name
+                    ));
+                }
+                for field in interface.fields.values() {
+                    validate_field(schema, field, &interface.name, errors);
+                }
+                for implemented in &interface.interfaces {
+                    match schema.get_type(implemented) {
+                        Some(Type::Interface(parent)) => {
+                            for (field_name, parent_field) in &parent.fields {
+                                match interface.fields.get(field_name) {
+                                    None => errors.push(format!(
+                                        "Interface field \"{}.{field_name}\" expected but \"{}\" does not provide it.",
+                                        parent.name, interface.name
+                                    )),
+                                    Some(field) => {
+                                        for (arg_name, parent_arg) in &parent_field.args {
+                                            match field.args.get(arg_name) {
+                                                None => errors.push(format!(
+                                                    "Interface field argument \"{}.{field_name}({arg_name}:)\" expected but \"{}.{field_name}\" does not provide it.",
+                                                    parent.name, interface.name
+                                                )),
+                                                Some(arg) if arg.ty != parent_arg.ty => errors.push(format!(
+                                                    "Interface field argument \"{}.{field_name}({arg_name}:)\" expects type \"{}\" but \"{}.{field_name}({arg_name}:)\" is type \"{}\".",
+                                                    parent.name, parent_arg.ty, interface.name, arg.ty
+                                                )),
+                                                Some(_) => {}
+                                            }
+                                        }
+                                        for (arg_name, child_arg) in &field.args {
+                                            if !parent_field.args.contains_key(arg_name)
+                                                && matches!(child_arg.ty, TypeRef::NonNull(_))
+                                                && child_arg.default_value.is_none()
+                                            {
+                                                errors.push(format!(
+                                                    "Interface field \"{}.{field_name}\" adds required argument \"{arg_name}\" which is not present on \"{}.{field_name}\".",
+                                                    interface.name, parent.name
+                                                ));
+                                            }
+                                        }
+                                        if !is_output_subtype(schema, &field.ty, &parent_field.ty)
+                                        {
+                                            errors.push(format!(
+                                                "Interface field \"{}.{field_name}\" expects type \"{}\" but \"{}.{field_name}\" is type \"{}\".",
+                                                parent.name,
+                                                parent_field.ty,
+                                                interface.name,
+                                                field.ty
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Some(_) => errors.push(format!(
+                            "Interface \"{}\" must only implement interfaces, but \"{implemented}\" is not an interface.",
+                            interface.name
+                        )),
+                        None => errors.push(format!(
+                            "Interface \"{}\" implements unknown interface \"{implemented}\".",
+                            interface.name
+                        )),
+                    }
+                }
+                for (index, implemented) in interface.interfaces.iter().enumerate() {
+                    if interface.interfaces[index + 1..].contains(implemented) {
+                        errors.push(format!(
+                            "Interface \"{}\" implements interface \"{implemented}\" more than once.",
+                            interface.name
+                        ));
+                    }
+                    if implemented == &interface.name {
+                        errors.push(format!(
+                            "Interface \"{}\" must not implement itself.",
+                            interface.name
+                        ));
+                    }
+                }
+                // Walk the interface graph to catch longer cycles.
+                let mut stack: Vec<Name> = interface.interfaces.clone();
+                let mut visited: Vec<Name> = Vec::new();
+                while let Some(current) = stack.pop() {
+                    if current == interface.name {
+                        errors.push(format!(
+                            "Interface \"{}\" must not implement itself through another interface.",
+                            interface.name
+                        ));
+                        break;
+                    }
+                    if visited.contains(&current) {
+                        continue;
+                    }
+                    visited.push(current.clone());
+                    if let Some(parent) = schema.interface_type(&current) {
+                        stack.extend(parent.interfaces.iter().cloned());
+                    }
+                }
+            }
+            Type::Union(union) => {
+                if union.types.is_empty() {
+                    errors.push(format!(
+                        "Union \"{}\" must include at least one object type.",
+                        union.name
+                    ));
+                }
+                let mut seen = Vec::new();
+                for member in &union.types {
+                    match schema.get_type(member) {
+                        Some(Type::Object(_)) => {}
+                        Some(_) => errors.push(format!(
+                            "Union \"{}\" can only include object types, but \"{member}\" is not an object.",
+                            union.name
+                        )),
+                        None => errors.push(format!(
+                            "Union \"{}\" includes unknown type \"{member}\".",
+                            union.name
+                        )),
+                    }
+                    if seen.contains(member) {
+                        errors.push(format!(
+                            "Union \"{}\" can only include type \"{member}\" once.",
+                            union.name
+                        ));
+                    } else {
+                        seen.push(member.clone());
+                    }
+                }
+            }
+            Type::Enum(enumeration) => {
+                for duplicate in &enumeration.duplicates {
+                    errors.push(format!(
+                        "Enum \"{}\" defines value \"{duplicate}\" more than once.",
+                        enumeration.name
+                    ));
+                }
+                if enumeration.values.is_empty() {
+                    errors.push(format!(
+                        "Enum \"{}\" must define at least one value.",
+                        enumeration.name
+                    ));
+                }
+                for value in enumeration.values.values() {
+                    if matches!(&*value.name, "true" | "false" | "null") {
+                        errors.push(format!(
+                            "Enum value \"{}.{}\" must not be \"true\", \"false\" or \"null\".",
+                            enumeration.name, value.name
+                        ));
+                    }
+                    if value.name.starts_with("__") {
+                        errors.push(format!(
+                            "Enum value \"{}.{}\" must not begin with \"__\".",
+                            enumeration.name, value.name
+                        ));
+                    }
+                }
+            }
+            Type::InputObject(input) => {
+                for duplicate in &input.duplicates {
+                    errors.push(format!(
+                        "Input object \"{}\" defines field \"{duplicate}\" more than once.",
+                        input.name
+                    ));
+                }
+                if input.fields.is_empty() {
+                    errors.push(format!(
+                        "Input object \"{}\" must define at least one field.",
+                        input.name
+                    ));
+                }
+                for field in input.fields.values() {
+                    validate_input_type(
+                        schema,
+                        &field.ty,
+                        &NamedPath {
+                            kind: "Field",
+                            type_name: &input.name,
+                            name: &field.name,
+                        },
+                        errors,
+                    );
+                    if let Some(default) = &field.default_value {
+                        if let Err(error) = crate::execution::coerce::validate_default_value(
+                            schema, default, &field.ty,
+                        ) {
+                            errors.push(format!(
+                                "Default value for input field \"{}.{}\" is invalid: {}",
+                                input.name,
+                                field.name,
+                                error.message()
+                            ));
+                        }
+                    }
+                    if field.name.starts_with("__") {
+                        errors.push(format!(
+                            "Input field \"{}.{}\" must not begin with \"__\".",
+                            input.name, field.name
+                        ));
+                    }
+                    if field.deprecation_reason.is_some()
+                        && matches!(field.ty, TypeRef::NonNull(_))
+                        && field.default_value.is_none()
+                    {
+                        errors.push(format!(
+                            "Required input field \"{}.{}\" cannot be deprecated.",
+                            input.name, field.name
+                        ));
+                    }
+                    if input.one_of {
+                        if matches!(field.ty, TypeRef::NonNull(_)) {
+                            errors.push(format!(
+                                "OneOf input field \"{}.{}\" must be nullable.",
+                                input.name, field.name
+                            ));
+                        }
+                        if field.default_value.is_some() {
+                            errors.push(format!(
+                                "OneOf input field \"{}.{}\" must not have a default value.",
+                                input.name, field.name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for directive in schema.inner.directives.values() {
+        for duplicate in &directive.duplicate_args {
+            errors.push(format!(
+                "Directive \"@{}\" defines argument \"{duplicate}\" more than once.",
+                directive.name
+            ));
+        }
+        if directive.locations.is_empty() {
+            errors.push(format!(
+                "Directive \"@{}\" must include at least one location.",
+                directive.name
+            ));
+        }
+        validate_arguments(
+            schema,
+            &directive.args,
+            &DirectiveOwner(&directive.name),
+            errors,
+        );
+    }
+
+    if let Some(mutation) = &schema.inner.mutation {
+        if &schema.inner.query == mutation {
+            errors.push("The query and mutation root types must be different.".to_owned());
+        }
+    }
+    if let Some(subscription) = &schema.inner.subscription {
+        if subscription == &schema.inner.query
+            || schema.inner.mutation.as_ref() == Some(subscription)
+        {
+            errors.push(
+                "The subscription root type must be different from the other roots.".to_owned(),
+            );
+        }
+    }
+
+    // Root types must be objects. This is checked after the type loop so that missing types are
+    // reported once above.
+    for (kind, name) in [
+        ("query", Some(&schema.inner.query)),
+        ("mutation", schema.inner.mutation.as_ref()),
+        ("subscription", schema.inner.subscription.as_ref()),
+    ] {
+        let Some(name) = name else { continue };
+        match schema.get_type(name) {
+            Some(Type::Object(_)) => {}
+            Some(ty) => errors.push(format!(
+                "The {kind} root type \"{name}\" must be an object, but it is {}.",
+                ty.kind()
+            )),
+            None => {}
+        }
+    }
+
+    detect_input_cycles(schema, errors);
+}
+
+fn validate_field(schema: &Schema, field: &Field, owner: &str, errors: &mut SchemaError) {
+    for duplicate in &field.duplicate_args {
+        errors.push(format!(
+            "Field \"{owner}.{}\" defines argument \"{duplicate}\" more than once.",
+            field.name
+        ));
+    }
+    let field_name = field.name.as_ref();
+    validate_output_type(
+        schema,
+        &field.ty,
+        &NamedPath {
+            kind: "Field",
+            type_name: owner,
+            name: field_name,
+        },
+        errors,
+    );
+    validate_arguments(
+        schema,
+        &field.args,
+        &NamedPath {
+            kind: "field",
+            type_name: owner,
+            name: field_name,
+        },
+        errors,
+    );
+    if field.name.starts_with("__") {
+        errors.push(format!(
+            "Field \"{owner}.{}\" must not begin with \"__\".",
+            field.name
+        ));
+    }
+    for argument in field.args.values() {
+        if matches!(argument.ty, TypeRef::NonNull(_)) && argument.default_value.is_none() {
+            // This is legal, but introspection and validation both care about the distinction.
+        }
+    }
+}
+
+/// Output type covariance, as required for interface fields and for schema evolution checks.
+#[must_use]
+pub fn is_output_subtype(schema: &Schema, sub: &TypeRef, sup: &TypeRef) -> bool {
+    match (sub, sup) {
+        // A non-null type may appear where a nullable type is expected: `ID!` is a subtype of
+        // `ID`, and `[Int!]!` is a subtype of `[Int!]`.
+        (_, TypeRef::NonNull(sup_inner)) => match sub {
+            TypeRef::NonNull(sub_inner) => is_output_subtype(schema, sub_inner, sup_inner),
+            _ => false,
+        },
+        (TypeRef::NonNull(sub_inner), _) => is_output_subtype(schema, sub_inner, sup),
+        (TypeRef::List(sub), TypeRef::List(sup)) => is_output_subtype(schema, sub, sup),
+        (TypeRef::List(_), _) | (_, TypeRef::List(_)) => false,
+        (TypeRef::Named(sub), TypeRef::Named(sup)) => {
+            if sub == sup {
+                return true;
+            }
+            let Some(sub_ty) = schema.get_type(sub) else {
+                return false;
+            };
+            let Some(sup_ty) = schema.get_type(sup) else {
+                return false;
+            };
+            match (sub_ty, sup_ty) {
+                (Type::Object(object), Type::Interface(_)) => schema.object_implements(object, sup),
+                (Type::Object(object), Type::Union(union)) => {
+                    union.types.iter().any(|ty| ty == &object.name)
+                }
+                (Type::Interface(sub_interface), Type::Interface(_)) => {
+                    let mut stack = sub_interface.interfaces.clone();
+                    while let Some(name) = stack.pop() {
+                        if name.as_ref() == sup.as_ref() {
+                            return true;
+                        }
+                        if let Some(parent) = schema.interface_type(&name) {
+                            stack.extend(parent.interfaces.iter().cloned());
+                        }
+                    }
+                    false
+                }
+                _ => false,
+            }
+        }
+    }
+}
+
+/// Whether a field is a non-null, non-list reference. Only those edges can make an input cycle
+/// impossible to satisfy; a list can be empty and a nullable field can be null.
+fn is_non_null_singular(ty: &TypeRef) -> bool {
+    match ty {
+        TypeRef::NonNull(inner) => !inner.is_list(),
+        _ => false,
+    }
+}
+
+fn detect_input_cycles(schema: &Schema, errors: &mut SchemaError) {
+    // A cycle is only invalid when every edge in it is a non-null, non-list field. Nullable and
+    // list fields provide an escape hatch, so they break the cycle.
+    fn visit(schema: &Schema, name: &str, path: &mut Vec<Name>, errors: &mut SchemaError) {
+        if path.iter().any(|item| &**item == name) {
+            let cycle = path
+                .iter()
+                .map(|item| item.to_string())
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            errors.push(format!(
+                "Input object cycle detected: {cycle} -> {name}. Add a nullable or list field to break the cycle."
+            ));
+            return;
+        }
+        let Some(input) = schema.input_object_type(name) else {
+            return;
+        };
+        path.push(input.name.clone());
+        for field in input.fields.values() {
+            if is_non_null_singular(&field.ty) {
+                visit(schema, field.ty.named_type(), path, errors);
+            }
+        }
+        path.pop();
+    }
+
+    for (name, ty) in &schema.inner.types {
+        if matches!(ty, Type::InputObject(_)) {
+            visit(schema, name, &mut Vec::new(), errors);
+        }
+    }
+}
+
+/// A schema difference that can break existing clients.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SchemaChange {
+    /// A type was removed.
+    TypeRemoved {
+        /// The type name.
+        name: String,
+    },
+    /// A type changed kind, for example object to scalar.
+    TypeKindChanged {
+        /// The type name.
+        name: String,
+        /// The old kind.
+        from: TypeKind,
+        /// The new kind.
+        to: TypeKind,
+    },
+    /// A field was removed from an object or interface.
+    FieldRemoved {
+        /// The type name.
+        type_name: String,
+        /// The field name.
+        field_name: String,
+    },
+    /// A field's type changed in a way existing queries may not handle.
+    FieldTypeChanged {
+        /// The type name.
+        type_name: String,
+        /// The field name.
+        field_name: String,
+        /// The old type.
+        from: TypeRef,
+        /// The new type.
+        to: TypeRef,
+    },
+    /// A required argument was added without a default value.
+    RequiredArgumentAdded {
+        /// The type name.
+        type_name: String,
+        /// The field name.
+        field_name: String,
+        /// The argument name.
+        argument_name: String,
+    },
+    /// An argument was removed.
+    ArgumentRemoved {
+        /// The type name.
+        type_name: String,
+        /// The field name.
+        field_name: String,
+        /// The argument name.
+        argument_name: String,
+    },
+    /// An argument's type changed.
+    ArgumentTypeChanged {
+        /// The type name.
+        type_name: String,
+        /// The field name.
+        field_name: String,
+        /// The argument name.
+        argument_name: String,
+        /// The old type.
+        from: TypeRef,
+        /// The new type.
+        to: TypeRef,
+    },
+    /// An enum value was removed.
+    EnumValueRemoved {
+        /// The enum name.
+        enum_name: String,
+        /// The value.
+        value: String,
+    },
+    /// An interface was removed from an object's implemented interfaces.
+    InterfaceRemoved {
+        /// The object name.
+        object_name: String,
+        /// The interface name.
+        interface_name: String,
+    },
+    /// A union member was removed.
+    UnionMemberRemoved {
+        /// The union name.
+        union_name: String,
+        /// The member type name.
+        member: String,
+    },
+    /// An input object field was removed.
+    InputFieldRemoved {
+        /// The input object name.
+        input_name: String,
+        /// The field name.
+        field_name: String,
+    },
+    /// A required input field became required, or a new required field was added.
+    InputFieldBecameRequired {
+        /// The input object name.
+        input_name: String,
+        /// The field name.
+        field_name: String,
+    },
+    /// A directive was removed.
+    DirectiveRemoved {
+        /// The directive name.
+        name: String,
+    },
+    /// A directive location was removed.
+    DirectiveLocationRemoved {
+        /// The directive name.
+        name: String,
+        /// The location.
+        location: &'static str,
+    },
+    /// An argument was removed from a directive definition.
+    DirectiveArgumentRemoved {
+        /// The directive name.
+        directive: String,
+        /// The argument name.
+        argument: String,
+    },
+    /// A directive argument's type changed.
+    DirectiveArgumentTypeChanged {
+        /// The directive name.
+        directive: String,
+        /// The argument name.
+        argument: String,
+        /// The old type.
+        from: TypeRef,
+        /// The new type.
+        to: TypeRef,
+    },
+    /// An interface stopped implementing another interface.
+    InterfaceImplementationRemoved {
+        /// The interface name.
+        interface_name: String,
+        /// The interface it no longer implements.
+        implemented: String,
+    },
+}
+
+impl fmt::Display for SchemaChange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TypeRemoved { name } => write!(f, "type \"{name}\" was removed"),
+            Self::TypeKindChanged { name, from, to } => {
+                write!(f, "type \"{name}\" changed from {from} to {to}")
+            }
+            Self::FieldRemoved {
+                type_name,
+                field_name,
+            } => write!(f, "field \"{type_name}.{field_name}\" was removed"),
+            Self::FieldTypeChanged {
+                type_name,
+                field_name,
+                from,
+                to,
+            } => write!(
+                f,
+                "field \"{type_name}.{field_name}\" changed type from \"{from}\" to \"{to}\""
+            ),
+            Self::RequiredArgumentAdded {
+                type_name,
+                field_name,
+                argument_name,
+            } => write!(
+                f,
+                "required argument \"{type_name}.{field_name}({argument_name}:)\" was added"
+            ),
+            Self::ArgumentRemoved {
+                type_name,
+                field_name,
+                argument_name,
+            } => write!(
+                f,
+                "argument \"{type_name}.{field_name}({argument_name}:)\" was removed"
+            ),
+            Self::ArgumentTypeChanged {
+                type_name,
+                field_name,
+                argument_name,
+                from,
+                to,
+            } => write!(
+                f,
+                "argument \"{type_name}.{field_name}({argument_name}:)\" changed type from \"{from}\" to \"{to}\""
+            ),
+            Self::EnumValueRemoved { enum_name, value } => {
+                write!(f, "enum value \"{enum_name}.{value}\" was removed")
+            }
+            Self::InterfaceRemoved {
+                object_name,
+                interface_name,
+            } => write!(
+                f,
+                "object \"{object_name}\" no longer implements interface \"{interface_name}\""
+            ),
+            Self::UnionMemberRemoved { union_name, member } => {
+                write!(f, "union \"{union_name}\" no longer includes \"{member}\"")
+            }
+            Self::InputFieldRemoved {
+                input_name,
+                field_name,
+            } => write!(f, "input field \"{input_name}.{field_name}\" was removed"),
+            Self::InputFieldBecameRequired {
+                input_name,
+                field_name,
+            } => write!(
+                f,
+                "input field \"{input_name}.{field_name}\" became required"
+            ),
+            Self::DirectiveRemoved { name } => write!(f, "directive \"@{name}\" was removed"),
+            Self::DirectiveLocationRemoved { name, location } => {
+                write!(f, "directive \"@{name}\" no longer supports {location}")
+            }
+            Self::DirectiveArgumentRemoved {
+                directive,
+                argument,
+            } => {
+                write!(
+                    f,
+                    "directive \"@{directive}\" no longer accepts argument \"{argument}\""
+                )
+            }
+            Self::DirectiveArgumentTypeChanged {
+                directive,
+                argument,
+                from,
+                to,
+            } => write!(
+                f,
+                "directive \"@{directive}\" argument \"{argument}\" changed type from \"{from}\" to \"{to}\""
+            ),
+            Self::InterfaceImplementationRemoved {
+                interface_name,
+                implemented,
+            } => write!(
+                f,
+                "interface \"{interface_name}\" no longer implements \"{implemented}\""
+            ),
+        }
+    }
+}
+
+/// The result of comparing two schemas.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SchemaDiff {
+    /// Every breaking change, in a stable order.
+    pub changes: Vec<SchemaChange>,
+}
+
+impl SchemaDiff {
+    /// Whether the new schema is backwards compatible with the old one.
+    #[must_use]
+    pub fn is_compatible(&self) -> bool {
+        self.changes.is_empty()
+    }
+
+    /// Iterate over breaking changes.
+    pub fn changes(&self) -> impl Iterator<Item = &SchemaChange> {
+        self.changes.iter()
+    }
+}
+
+impl fmt::Display for SchemaDiff {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, change) in self.changes.iter().enumerate() {
+            if index != 0 {
+                f.write_str("\n")?;
+            }
+            write!(f, "{change}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Compare two schemas and report changes that break existing operations.
+///
+/// Additive changes (new types, new optional arguments, new enum values, new optional input
+/// fields) are compatible and deliberately not reported. This is the check a CI pipeline should
+/// run before deploying a schema change.
+#[must_use]
+pub fn diff(old: &Schema, new: &Schema) -> SchemaDiff {
+    let mut changes = Vec::new();
+
+    for (name, old_ty) in &old.inner.types {
+        if name.starts_with("__") {
+            continue;
+        }
+        match new.get_type(name) {
+            None => changes.push(SchemaChange::TypeRemoved {
+                name: name.to_string(),
+            }),
+            Some(new_ty) if new_ty.kind() != old_ty.kind() => {
+                changes.push(SchemaChange::TypeKindChanged {
+                    name: name.to_string(),
+                    from: old_ty.kind(),
+                    to: new_ty.kind(),
+                });
+            }
+            Some(new_ty) => diff_type(name, old_ty, new_ty, &mut changes),
+        }
+    }
+
+    for (name, old_directive) in &old.inner.directives {
+        match new.get_directive(name) {
+            None => changes.push(SchemaChange::DirectiveRemoved {
+                name: name.to_string(),
+            }),
+            Some(new_directive) => {
+                for location in &old_directive.locations {
+                    if !new_directive.locations.contains(location) {
+                        changes.push(SchemaChange::DirectiveLocationRemoved {
+                            name: name.to_string(),
+                            location: location.as_str(),
+                        });
+                    }
+                }
+                for (argument, old_arg) in &old_directive.args {
+                    match new_directive.args.get(argument) {
+                        None => changes.push(SchemaChange::DirectiveArgumentRemoved {
+                            directive: name.to_string(),
+                            argument: argument.to_string(),
+                        }),
+                        Some(new_arg) => {
+                            if !is_input_compatible(&old_arg.ty, &new_arg.ty) {
+                                changes.push(SchemaChange::DirectiveArgumentTypeChanged {
+                                    directive: name.to_string(),
+                                    argument: argument.to_string(),
+                                    from: old_arg.ty.clone(),
+                                    to: new_arg.ty.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    SchemaDiff { changes }
+}
+
+fn diff_type(name: &str, old: &Type, new: &Type, changes: &mut Vec<SchemaChange>) {
+    match (old, new) {
+        (Type::Object(old), Type::Object(new)) => {
+            diff_fields(name, &old.fields, &new.fields, changes);
+            for interface in &old.interfaces {
+                if !new.interfaces.contains(interface) {
+                    changes.push(SchemaChange::InterfaceRemoved {
+                        object_name: name.to_string(),
+                        interface_name: interface.to_string(),
+                    });
+                }
+            }
+        }
+        (Type::Interface(old), Type::Interface(new)) => {
+            diff_fields(name, &old.fields, &new.fields, changes);
+            for implemented in &old.interfaces {
+                if !new.interfaces.contains(implemented) {
+                    changes.push(SchemaChange::InterfaceImplementationRemoved {
+                        interface_name: name.to_string(),
+                        implemented: implemented.to_string(),
+                    });
+                }
+            }
+        }
+        (Type::Enum(old), Type::Enum(new)) => {
+            for value in old.values.keys() {
+                if !new.values.contains_key(value) {
+                    changes.push(SchemaChange::EnumValueRemoved {
+                        enum_name: name.to_string(),
+                        value: value.to_string(),
+                    });
+                }
+            }
+        }
+        (Type::Union(old), Type::Union(new)) => {
+            for member in &old.types {
+                if !new.types.contains(member) {
+                    changes.push(SchemaChange::UnionMemberRemoved {
+                        union_name: name.to_string(),
+                        member: member.to_string(),
+                    });
+                }
+            }
+        }
+        (Type::InputObject(old), Type::InputObject(new)) => {
+            for (field_name, old_field) in &old.fields {
+                match new.fields.get(field_name) {
+                    None => changes.push(SchemaChange::InputFieldRemoved {
+                        input_name: name.to_string(),
+                        field_name: field_name.to_string(),
+                    }),
+                    Some(new_field) => {
+                        if !is_input_compatible(&old_field.ty, &new_field.ty) {
+                            changes.push(SchemaChange::FieldTypeChanged {
+                                type_name: name.to_string(),
+                                field_name: field_name.to_string(),
+                                from: old_field.ty.clone(),
+                                to: new_field.ty.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            for (field_name, new_field) in &new.fields {
+                let became_required = match old.fields.get(field_name) {
+                    None => true,
+                    Some(old_field) => {
+                        !matches!(old_field.ty, TypeRef::NonNull(_))
+                            && matches!(new_field.ty, TypeRef::NonNull(_))
+                    }
+                };
+                if became_required
+                    && matches!(new_field.ty, TypeRef::NonNull(_))
+                    && new_field.default_value.is_none()
+                {
+                    changes.push(SchemaChange::InputFieldBecameRequired {
+                        input_name: name.to_string(),
+                        field_name: field_name.to_string(),
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn diff_fields(
+    type_name: &str,
+    old_fields: &IndexMap<Name, Field>,
+    new_fields: &IndexMap<Name, Field>,
+    changes: &mut Vec<SchemaChange>,
+) {
+    for (field_name, old_field) in old_fields {
+        match new_fields.get(field_name) {
+            None => changes.push(SchemaChange::FieldRemoved {
+                type_name: type_name.to_string(),
+                field_name: field_name.to_string(),
+            }),
+            Some(new_field) => {
+                if !is_output_compatible(&old_field.ty, &new_field.ty) {
+                    changes.push(SchemaChange::FieldTypeChanged {
+                        type_name: type_name.to_string(),
+                        field_name: field_name.to_string(),
+                        from: old_field.ty.clone(),
+                        to: new_field.ty.clone(),
+                    });
+                }
+                for (arg_name, old_arg) in &old_field.args {
+                    match new_field.args.get(arg_name) {
+                        None => changes.push(SchemaChange::ArgumentRemoved {
+                            type_name: type_name.to_string(),
+                            field_name: field_name.to_string(),
+                            argument_name: arg_name.to_string(),
+                        }),
+                        Some(new_arg) => {
+                            if !is_input_compatible(&old_arg.ty, &new_arg.ty) {
+                                changes.push(SchemaChange::ArgumentTypeChanged {
+                                    type_name: type_name.to_string(),
+                                    field_name: field_name.to_string(),
+                                    argument_name: arg_name.to_string(),
+                                    from: old_arg.ty.clone(),
+                                    to: new_arg.ty.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+                for (arg_name, new_arg) in &new_field.args {
+                    if !old_field.args.contains_key(arg_name)
+                        && matches!(new_arg.ty, TypeRef::NonNull(_))
+                        && new_arg.default_value.is_none()
+                    {
+                        changes.push(SchemaChange::RequiredArgumentAdded {
+                            type_name: type_name.to_string(),
+                            field_name: field_name.to_string(),
+                            argument_name: arg_name.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn is_output_compatible(old: &TypeRef, new: &TypeRef) -> bool {
+    match (old, new) {
+        (TypeRef::NonNull(old), TypeRef::NonNull(new)) => is_output_compatible(old, new),
+        (TypeRef::NonNull(_), _) => false,
+        (old, TypeRef::NonNull(new)) => is_output_compatible(old, new),
+        (TypeRef::List(old), TypeRef::List(new)) => is_output_compatible(old, new),
+        (TypeRef::List(_), _) | (_, TypeRef::List(_)) => false,
+        (TypeRef::Named(old), TypeRef::Named(new)) => old == new,
+    }
+}
+
+fn is_input_compatible(old: &TypeRef, new: &TypeRef) -> bool {
+    match (old, new) {
+        (TypeRef::NonNull(old), TypeRef::NonNull(new)) => is_input_compatible(old, new),
+        (TypeRef::NonNull(old), new) => is_input_compatible(old, new),
+        (_, TypeRef::NonNull(_)) => false,
+        (TypeRef::List(old), TypeRef::List(new)) => is_input_compatible(old, new),
+        (TypeRef::List(_), _) | (_, TypeRef::List(_)) => false,
+        (TypeRef::Named(old), TypeRef::Named(new)) => old == new,
+    }
 }

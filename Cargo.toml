@@ -14,20 +14,32 @@ repository = "https://github.com/specta-rs/gurafi"
 gql = { path = "crates/gql", version = "0.2.0" }
 gurafi = { path = "crates/gurafi", version = "0.0.1" }
 gurafi-macros = { path = "crates/gurafi-macros", version = "0.0.1" }
-hidoki = { path = "crates/hidoki", version = "0.0.1" }
+gurafi-relay = { path = "crates/gurafi-relay", version = "0.0.1" }
 shiri = { path = "crates/shiri", version = "0.0.0" }
 suku = { path = "crates/suku", version = "0.0.1" }
 
 # External dependencies
-axum = "0.7.3"
-graphql-parser = "0.4.0"
-serde_json = "1.0.108"
-tokio = { version = "1.35.1", features = ["macros", "rt-multi-thread"] }
-tower-http = { version = "0.5.0", features = ["cors"] }
+axum = "0.8.4"
+futures = "0.3.30"
+http = "1.1.0"
+indexmap = "2.2.6"
+proc-macro2 = "1.0.86"
+quote = "1.0.36"
+rustc-hash = "2.0.0"
+self_cell = "1.3.0"
+serde = { version = "1.0.203", features = ["derive"] }
+serde_json = "1.0.117"
+smallvec = "1.13.2"
+syn = "2.0.68"
+tokio = { version = "1.38.0", features = ["macros", "rt-multi-thread", "net"] }
+tower-http = { version = "0.6.0", features = ["cors", "trace"] }
 tracing = "0.1.40"
-tracing-subscriber = "0.3.18"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 
-# For Axum 0.7 Support
-[patch.crates-io]
-async-graphql = { git = "https://github.com/async-graphql/async-graphql", rev = "44ae98335413a11e1acbc6c48135f452996e8a0b" }
-async-graphql-axum = { git = "https://github.com/async-graphql/async-graphql", rev = "44ae98335413a11e1acbc6c48135f452996e8a0b" }
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+panic = "warn"
+unwrap_used = "warn"
+expect_used = "warn"

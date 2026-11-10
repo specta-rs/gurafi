@@ -1,79 +1,76 @@
-# Gurafi Documentation
+# gurafi documentation
 
-Rust crates for building GraphQL servers.
+`gurafi` is a type-safe, code-first GraphQL stack for Rust. Rust types describe the schema,
+`#[derive]` macros provide the wiring, and the resulting `gql::Schema` is a normal GraphQL
+schema that can be executed directly or served over HTTP.
 
-## Contents
+The documentation follows a progressive learning path: start with a schema and a query, then add
+models, fields, arguments and context. Each concept is expressed with Rust types, builder methods
+and derives rather than with generated resolver types.
 
-- [Schema](schema/object.md)
-- [Server](server/hidoki.md)
-- [Persisted queries](server/persisted-queries.md)
+## Start here
 
-## Define a schema
+- [Getting started](guide/getting-started.md) — install the crates, build a schema, run a query
+- [Objects](guide/objects.md) — turn application data into GraphQL object types
+- [Fields](guide/fields.md) — resolvers, lists, nullability, exposure and field options
+- [Using args](guide/args.md) — typed arguments from Rust structs
+- [Using context](guide/context.md) — request state shared by every resolver
 
-```rust
-use gurafi::{expose, FieldBuilder, Schema};
+## Guide
 
-#[derive(Debug)]
-pub struct Giraffe {
-    name: String,
-    birthday: String,
-    height_in_meters: f32,
-}
+- [Enums](guide/enums.md)
+- [Scalars](guide/scalars.md)
+- [Input objects](guide/inputs.md)
+- [Queries, mutations and subscriptions](guide/operations.md)
+- [Interfaces](guide/interfaces.md)
+- [Unions](guide/unions.md)
+- [Schema builder](guide/schema-builder.md)
+- [Using plugins](guide/using-plugins.md)
+- [File layout](guide/app-layout.md)
+- [Circular references](guide/circular-references.md)
+- [Patterns](guide/patterns.md)
+- [Nullability](guide/nullability.md)
+- [Type inference](guide/type-inference.md)
+- [Using GraphiQL](guide/playground.md)
+- [Printing schemas](guide/printing-schemas.md)
+- [Generating client types](guide/client-codegen.md)
+- [Troubleshooting](guide/troubleshooting.md)
+- [Writing plugins](guide/writing-plugins.md)
+- [Integrations and non-goals](guide/non-goals.md)
 
-// The equivalent of using Pothos classes.
-// https://pothos-graphql.dev/docs/guide/objects#using-classes
-fn giraffe_schema(s: &mut Schema) {
-    s.object_type::<Giraffe>("Giraffe")
-        .description("Long necks, cool patterns, taller than you.")
-        .field("name", expose!(Giraffe:name))
-        .field(
-            "age",
-            // TODO: Rust can't infer the model type to the resolver closure. Can we trick it?
-            FieldBuilder::new(|m: &Giraffe| m.birthday.parse::<u16>().unwrap()),
-        )
-        .field("height", expose!(Giraffe:height_in_meters));
-}
+## Plugins and extensions
 
-fn schema() -> gql::Schema {
-    let mut schema = <Schema>::new().with(giraffe_schema);
+- [Add GraphQL and schema composition](plugins/add-graphql.md)
+- [Complexity](plugins/complexity.md)
+- [Dataloaders and request cache](plugins/dataloader.md)
+- [Directives](plugins/directives.md)
+- [Typed errors](plugins/errors.md)
+- [Mocks](plugins/mocks.md)
+- [Relay](plugins/relay.md)
+- [Scope auth](plugins/scope-auth.md)
+- [Simple objects](plugins/simple-objects.md)
+- [Tracing and observability](plugins/tracing.md)
+- [Validation](plugins/validation.md)
 
-    schema.query_field("giraffe", || Giraffe {
-        name: "Tony".into(),
-        birthday: 10.to_string(),
-        height_in_meters: 5.2,
-    });
+## Server
 
-    schema.build().unwrap()
-}
-```
+- [Serving over HTTP with `suku`](server/suku.md)
+- [Error formatting and masking](server/suku.md#error-formatting-and-masking)
 
-## Serve via HTTP
+## Reference
 
-You can use the [`hidoki`](https://docs.rs/hidoki) crate to hook up your schema with an [`async-graphql`](https://github.com/async-graphql/async-graphql) server.
+- [Architecture](architecture.md) — how `gql`, `gurafi`, `gurafi-relay` and `suku` fit together
+- [Schema evolution](guide/printing-schemas.md) — compatibility diffing, SDL snapshots, composition
 
-```rust
-use async_graphql::http::GraphiQLSource;
-use async_graphql_axum::GraphQL;
-use axum::{response::Html, routing::get, Router};
-use tokio::net::TcpListener;
+## Crates
 
-fn main() {
-    let schema = schema(); // Defined in the last example.
-    let schema = hidoki::build_schema(schema).unwrap();
-    let app = Router::new().route(
-        "/",
-        get(|| async move { Html(GraphiQLSource::build().endpoint("/").finish()) })
-            .post_service(GraphQL::new(schema)),
-    );
+| Crate | Role |
+| --- | --- |
+| [`gql`](../crates/gql) | GraphQL specification: parser, validation, execution, introspection |
+| [`gurafi`](../crates/gurafi) | Rust-first schema builder and type-safe DX |
+| [`gurafi-macros`](../crates/gurafi-macros) | Derives for `Object`, `Args`, `Input`, `Enum`, `Scalar`, `Union`, `ErrorUnion` |
+| [`gurafi-relay`](../crates/gurafi-relay) | Relay global IDs, `Node`, connections and mutation payloads |
+| [`suku`](../crates/suku) | GraphQL over HTTP, batching, SSE subscriptions and error masking |
 
-    println!("GraphiQL IDE: http://localhost:8000");
-    axum::serve(TcpListener::bind("[::]:8000").await.unwrap(), app)
-        .await
-        .unwrap();
-}
-```
-<!--
-## Get Access
-
-TODO: Sponsor the GitHub org
--->
+The crates are deliberately independent: `gql` knows nothing about HTTP or Rust models, `gurafi`
+builds only on the public `gql` API, and `suku` only understands `gql::Schema`.

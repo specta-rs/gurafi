@@ -1,4 +1,2 @@
 [alias]
-e-axum = "run -p gurafi-example-axum"
-e-axum2 = "run -p gurafi-example-axum2"
-e-hidoki = "run -p hidoki-example-axum"
+e-axum = "run -p example-axum"

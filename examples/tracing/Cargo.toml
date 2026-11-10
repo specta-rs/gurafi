@@ -1,0 +1,21 @@
+[package]
+name = "example-tracing"
+description = "Enable gql/gurafi's optional tracing spans and wire a subscriber"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+
+[features]
+tracing = ["gql/tracing", "gurafi/tracing"]
+
+[dependencies]
+gql.workspace = true
+gurafi.workspace = true
+futures.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[[bin]]
+name = "tracing-example"
+path = "src/main.rs"
+required-features = ["tracing"]

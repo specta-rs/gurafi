@@ -1,148 +1,96 @@
-use std::{collections::HashMap, net::Ipv6Addr, sync::Arc};
+//! Run the giraffe API at <http://127.0.0.1:3000/graphql>.
+//!
+//! Try the GraphiQL page in a browser. Public fields work without a token; `whoami` requires:
+//!
+//! ```text
+//! Authorization: Bearer secret
+//! ```
+
+mod schema;
+
+use std::{net::SocketAddr, time::Duration};
 
 use axum::{
-    http::{HeaderMap, HeaderValue, Method},
-    response::Html,
-    routing::{get, post},
-    Json, Router,
+    Router,
+    http::{Method, StatusCode, header},
 };
-use serde::Deserialize;
-use suku::{OwnedSerializer, Server};
+use suku::{
+    Context, Server,
+    axum::GraphQL,
+    http::{ContextRequest, HttpError},
+};
 use tokio::net::TcpListener;
-use tower_http::cors::CorsLayer;
-use tracing::info;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tower_http::{
+    cors::{Any, CorsLayer},
+    trace::TraceLayer,
+};
+use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
-use crate::tracing_timing::CustomLayer;
-
-mod tracing_timing;
-
-// TODO: Move this into Suku
-#[derive(Deserialize)]
-pub struct GQLRequest {
-    operation_name: Option<String>,
-    query: String,
-}
+use crate::schema::AppContext;
 
 #[tokio::main]
-async fn main() {
-    tracing_subscriber::registry::Registry::default()
-        .with(CustomLayer)
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,tower_http=debug".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let server = Arc::new(Server::new(basic_schema()).introspection(true));
+    let server = Server::new(schema::schema())
+        .introspection(true)
+        .max_depth(15)
+        .max_complexity(500)
+        .max_errors(50)
+        .max_body_bytes(1024 * 1024)
+        .max_batch_size(10)
+        .batch_concurrency(8)
+        .timeout(Duration::from_secs(15));
+
+    let graphql = GraphQL::new(server)
+        .path("/graphql")
+        .graphiql(true)
+        .with_context(|request: ContextRequest| async move {
+            let Some(value) = request.header(header::AUTHORIZATION.as_str()) else {
+                // Public fields still work without a token. Field-level auth rejects `whoami`.
+                return Ok(Context::new(AppContext::anonymous()));
+            };
+
+            let value = value.to_str().map_err(|_| {
+                HttpError::message(StatusCode::UNAUTHORIZED, "Invalid Authorization header")
+            })?;
+
+            let Some(token) = value.strip_prefix("Bearer ") else {
+                return Err(HttpError::message(
+                    StatusCode::UNAUTHORIZED,
+                    "Expected `Authorization: Bearer <token>`",
+                ));
+            };
+
+            match token.trim() {
+                "secret" => Ok(Context::new(AppContext::authenticated("Ada"))),
+                _ => Err(HttpError::message(
+                    StatusCode::UNAUTHORIZED,
+                    "Unknown bearer token",
+                )),
+            }
+        });
 
     let app = Router::new()
-        .route(
-            "/",
-            get(|| async {
-                // TODO: Bundle the static assets into a Rust crate
-                Html(include_str!("../graphiql.html"))
-            }),
-        )
-        .route(
-            "/graphql",
-            post(|Json(req): Json<GQLRequest>| async move {
-                let mut body = Vec::new();
-                let mut json = serde_json::Serializer::new(&mut body);
-                let serializer = OwnedSerializer::new(&mut json);
-
-                match server.execute(serializer, req.query).await {
-                    Ok(()) => {}
-                    Err(_) => todo!(),
-                };
-
-                let mut headers = HeaderMap::new();
-                headers.insert("Content-Type", HeaderValue::from_static("application/json"));
-                (headers, body)
-            }),
-        )
+        .merge(graphql.into_router())
         .layer(
             CorsLayer::new()
+                .allow_origin(Any)
                 .allow_methods([Method::GET, Method::POST])
-                .allow_origin(tower_http::cors::Any)
-                .allow_headers(tower_http::cors::Any),
-        );
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+        )
+        .layer(TraceLayer::new_for_http());
 
-    info!("Listening on http://[::1]:3000");
-    axum::serve(
-        TcpListener::bind((Ipv6Addr::UNSPECIFIED, 3000))
-            .await
-            .unwrap(),
-        app,
-    )
-    .await
-    .unwrap();
-}
+    let address = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let listener = TcpListener::bind(address).await?;
+    tracing::info!("GraphQL endpoint: http://{address}/graphql");
 
-use gql::*;
-pub fn basic_schema() -> Schema {
-    Schema {
-        query: ObjectType {
-            name: "Query".into(),
-            description: None,
-            fields: {
-                let mut fields = HashMap::new();
-
-                fields.insert(
-                    "hello".into(),
-                    FieldConfig {
-                        description: None,
-                        deprecation_reason: None,
-                        args: None,
-                        ty: OutputType::NonNullable(ScalarType::string().into()),
-                        resolve: Some(ResolveFn::Ptr(|_, result| {
-                            result.serialize_str("Hello World")
-                        })),
-                    },
-                );
-
-                fields.insert(
-                    "nested".into(),
-                    FieldConfig {
-                        description: None,
-                        deprecation_reason: None,
-                        args: None,
-                        ty: OutputType::NonNullable(
-                            ObjectType {
-                                name: "Nested".into(),
-                                description: None,
-                                fields: {
-                                    let mut fields = HashMap::new();
-
-                                    fields.insert(
-                                        "suku".into(),
-                                        FieldConfig {
-                                            description: None,
-                                            deprecation_reason: None,
-                                            args: None,
-                                            ty: OutputType::NonNullable(
-                                                ScalarType::string().into(),
-                                            ),
-                                            resolve: Some(ResolveFn::Ptr(|_, result| {
-                                                result.serialize_str("Hello World Suku")
-                                            })),
-                                        },
-                                    );
-
-                                    fields.into()
-                                },
-                                interfaces: None,
-                                is_type_of: None,
-                            }
-                            .into(),
-                        ),
-                        resolve: Some(ResolveFn::Ptr(|_, result| result.serialize_str("Broken"))), // TODO: This is wrong
-                    },
-                );
-
-                fields.into()
-            },
-            is_type_of: None,
-            interfaces: None,
-        },
-        mutation: None,
-        subscription: None,
-    }
+    axum::serve(listener, app).await?;
+    Ok(())
 }

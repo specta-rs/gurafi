@@ -8,6 +8,12 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+tracing = ["dep:tracing", "gql/tracing"]
+
 [dependencies]
 gql.workspace = true
 gurafi-macros.workspace = true
+futures.workspace = true
+indexmap.workspace = true
+tracing = { workspace = true, optional = true }
