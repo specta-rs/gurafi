@@ -156,7 +156,9 @@ is refused:
 | Environment | `release` |
 
 The workflow publishes the whole workspace, so each of these crates needs its
-own trusted publisher: `gurafi`, `gql`, `gurafi-macros`, `suku` and `shiri`.
+own trusted publisher: `gurafi`, `gql`, `gurafi-macros`, `gurafi-relay`, `suku` and `shiri`.
+The trusted publisher and "Require trusted publishing" setting are already configured for this
+repository; repeat the setup only when adding a new crate.
 Examples are `publish = false` and are skipped.
 
 **Cutting a release:**

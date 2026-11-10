@@ -5,8 +5,8 @@ name: release
 # this repository or in Actions secrets. See `README.md` → "Releasing" for the
 # one-time crates.io configuration.
 #
-# These four values must match the trusted publisher configured on crates.io for
-# *every* crate in the workspace, or the token exchange is refused:
+# These values must match the trusted publisher configured on crates.io for
+# *every* published crate, or the token exchange is refused:
 #   owner        specta-rs
 #   repository   gurafi
 #   workflow     release.yml
