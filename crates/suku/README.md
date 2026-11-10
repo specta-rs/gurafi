@@ -118,12 +118,16 @@ adapter are formatted too.
 * errors with `extensions.code` are left untouched (the code marks an intentionally public error);
 * request errors are left untouched (parse, validation and coercion messages describe the
   caller's document);
-* every other error's message becomes `"Internal server error"`, while source locations,
-  response path and extensions are preserved.
+* every other error becomes a fresh `"Internal server error"` with the original source
+  locations and response path; extensions are **removed**, because resolvers commonly put stack
+  traces and backend details there.
 
-A resolver that attaches an `extensions.code` to an internal error opts that message back in, so
-attach codes only to errors that are safe to expose. Use `format_error` when the default policy is
-not enough.
+`gurafi` marks its own authorization and argument-validation errors with `UNAUTHORIZED` and
+`BAD_USER_INPUT`, so those client-facing messages survive the mask.
+
+A resolver that attaches an `extensions.code` to an internal error opts that message and its
+extensions back in, so attach codes only to errors that are safe to expose. Use `format_error`
+when the default policy is not enough.
 
 Formatting runs synchronously and deterministically, once per error, in response order.
 Formatters must be `Send + Sync + 'static`. A panic is not caught: it unwinds through the

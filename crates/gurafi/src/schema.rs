@@ -550,6 +550,7 @@ impl<Ctx: 'static> Schema<Ctx> {
     /// the definitions. A different model claiming the same name is a build error.
     pub fn object_ref<M: ObjectModel>(&mut self, name: impl Into<Name>) -> ObjectRef<M> {
         let name = name.into();
+        self.validate_type_name("Object", &name);
         if self.claim_object_name::<M>(&name) {
             self.ensure_object::<M>(&name);
         }
@@ -724,6 +725,7 @@ impl<Ctx: 'static> Schema<Ctx> {
     /// reopens the same interface.
     pub fn interface_ref(&mut self, name: impl Into<Name>) -> InterfaceRef {
         let name = name.into();
+        self.validate_type_name("Interface", &name);
         if !self.interfaces.contains_key(&name) {
             self.interfaces.insert(
                 Arc::clone(&name),
@@ -821,6 +823,7 @@ impl<Ctx: 'static> Schema<Ctx> {
     /// Use [`Schema::implement_union`] to declare members.
     pub fn union_ref(&mut self, name: impl Into<Name>) -> UnionRef {
         let name = name.into();
+        self.validate_type_name("Union", &name);
         if !self.unions.contains_key(&name) {
             self.unions
                 .insert(Arc::clone(&name), gql::UnionType::new(Arc::clone(&name)));
@@ -932,6 +935,16 @@ impl<Ctx: 'static> Schema<Ctx> {
     /// [`SchemaError`].
     pub fn build(self) -> Result<gql::Schema, SchemaError> {
         self.build_with(BuildOptions::default())
+    }
+
+    /// Record a build error when a runtime type name is not a GraphQL name.
+    fn validate_type_name(&mut self, kind: &str, name: &str) {
+        if !is_valid_graphql_name(name) {
+            self.errors.push(GraphQLError::new(format!(
+                "{kind} type name \"{name}\" is not a valid GraphQL name. A name must match \
+                 [_A-Za-z][_0-9A-Za-z]*."
+            )));
+        }
     }
 
     /// Validate the schema with [`BuildOptions`] and freeze it into a [`gql::Schema`].
@@ -1722,9 +1735,10 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
 
     /// Add a synchronous field whose resolver also receives the [`gql::ResolveInfo`].
     ///
-    /// `gql::ResolveInfo` currently exposes the field name, parent type, return type, response
-    /// path and schema; it does not expose the selection AST, so a resolver cannot inspect the
-    /// requested sub-fields through it yet.
+    /// The info exposes the field name, parent type, return type, response path and schema, plus
+    /// the merged field nodes, operation, fragments, root value and coerced variables. A resolver
+    /// can therefore inspect the selected sub-fields, for example to build a projection or batch a
+    /// loader by selection.
     pub fn field_with_info<T, A, F>(
         &mut self,
         name: &'static str,
@@ -4367,4 +4381,14 @@ fn validate_checks(schema: &gql::Schema, checks: &[FieldCheck], errors: &mut Vec
 #[must_use]
 pub fn type_ref<T: OutputType>() -> TypeRef {
     T::output_type()
+}
+
+/// Whether `name` matches the GraphQL `Name` grammar: `[_A-Za-z][_0-9A-Za-z]*`.
+fn is_valid_graphql_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    match characters.next() {
+        Some(first) if first == '_' || first.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }

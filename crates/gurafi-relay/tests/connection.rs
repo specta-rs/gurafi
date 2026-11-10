@@ -192,7 +192,7 @@ fn after_and_before_slice_the_list() {
     assert_eq!(edge_titles(&response), vec!["Second", "Third"]);
     let page = page_info(&response);
     assert!(!boolean(page, "hasNextPage"));
-    assert!(boolean(page, "hasPreviousPage"));
+    assert!(!boolean(page, "hasPreviousPage"));
 
     let before = Cursor::encode("p3");
     let response = execute(
@@ -202,7 +202,7 @@ fn after_and_before_slice_the_list() {
     );
     assert!(!response.has_errors(), "{:?}", response.errors);
     assert_eq!(edge_titles(&response), vec!["First", "Second"]);
-    assert!(boolean(page_info(&response), "hasNextPage"));
+    assert!(!boolean(page_info(&response), "hasNextPage"));
 }
 
 #[test]
@@ -412,7 +412,7 @@ fn from_slice_by_index_cursors_are_deterministic() {
     let page = Connection::from_slice_by_index(&items, &args).unwrap();
     assert_eq!(page.edges[0].node, "b");
     assert!(page.page_info.has_next_page);
-    assert!(page.page_info.has_previous_page);
+    assert!(!page.page_info.has_previous_page);
 }
 
 #[test]

@@ -919,18 +919,34 @@ impl Definitions {
             builder = builder.directive(directive);
         }
         // The type system language allows the default root names to be omitted: `Query`,
-        // `Mutation` and `Subscription` are inferred when they exist.
-        let query = self
-            .query
-            .or_else(|| builder.has_type("Query").then(|| "Query".into()));
-        let mutation = self
-            .mutation
-            .or_else(|| builder.has_type("Mutation").then(|| "Mutation".into()));
-        let subscription = self.subscription.or_else(|| {
-            builder
-                .has_type("Subscription")
-                .then(|| "Subscription".into())
-        });
+        // `Mutation` and `Subscription` are inferred when they exist. That inference only applies
+        // to a document with no schema definition: an explicit `schema { ... }` block is the
+        // complete statement of which roots exist, so a default-named type in the document is an
+        // ordinary type unless the block names it as a root.
+        let (query, mutation, subscription) = if self.schema_definition_seen {
+            if self.query.is_none() {
+                errors.push(GraphQLError::new(
+                    "A schema definition must define a query root type.",
+                ));
+            }
+            (self.query, self.mutation, self.subscription)
+        } else {
+            let query = self
+                .query
+                .or_else(|| builder.has_type("Query").then(|| "Query".into()));
+            let mutation = self
+                .mutation
+                .or_else(|| builder.has_type("Mutation").then(|| "Mutation".into()));
+            let subscription = self.subscription.or_else(|| {
+                builder
+                    .has_type("Subscription")
+                    .then(|| "Subscription".into())
+            });
+            (query, mutation, subscription)
+        };
+        if !errors.is_empty() {
+            return Err(SchemaError { errors });
+        }
         if let Some(query) = query {
             builder = builder.query(query);
         }

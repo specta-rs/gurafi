@@ -183,7 +183,9 @@ impl LoaderConfig {
     /// Set the maximum number of keys queued before a flush is forced.
     ///
     /// When the queue reaches this length the loader starts batches immediately instead of
-    /// waiting for the next poll. Zero is treated as one.
+    /// waiting for the next poll. Zero is treated as one. This bounds work waiting for the batch
+    /// window; results are still cached per key for the loader's lifetime, so it is not a cap on
+    /// the number of distinct keys a request may load.
     #[must_use]
     pub const fn with_max_queue(mut self, size: usize) -> Self {
         self.max_queue = if size == 0 { 1 } else { size };

@@ -50,7 +50,16 @@ pub fn print_schema(schema: &Schema) -> String {
     }
 
     for (name, ty) in schema.types() {
-        if name.starts_with("__") || BUILT_IN_SCALARS.contains(&name.as_ref()) {
+        if name.starts_with("__") {
+            continue;
+        }
+        // The engine adds the built-in scalars only when a field references them, and a client
+        // already knows their coercion rules. A scalar the user registered explicitly (even one
+        // named `Int`) has its own behaviour, so it must be printed and parsed back rather than
+        // silently replaced by the built-in definition.
+        if BUILT_IN_SCALARS.contains(&name.as_ref())
+            && matches!(ty, Type::Scalar(scalar) if scalar.builtin)
+        {
             continue;
         }
         definitions.push(print_type(ty));
@@ -160,12 +169,21 @@ fn print_schema_definition(schema: &Schema) -> Option<String> {
     let custom_subscription = schema
         .subscription_name()
         .is_some_and(|name| name.as_ref() != "Subscription");
+    // A non-root type that happens to be named `Mutation` or `Subscription` is inferred as a root
+    // by an SDL reader when the document has no schema definition. Printing an explicit
+    // definition is what records that the type is not a root.
+    let shadowed_mutation =
+        schema.mutation_name().is_none() && schema.get_type("Mutation").is_some();
+    let shadowed_subscription =
+        schema.subscription_name().is_none() && schema.get_type("Subscription").is_some();
 
     if !(has_description
         || has_directives
         || custom_query
         || custom_mutation
-        || custom_subscription)
+        || custom_subscription
+        || shadowed_mutation
+        || shadowed_subscription)
     {
         return None;
     }

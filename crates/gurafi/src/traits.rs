@@ -307,6 +307,7 @@ pub(crate) fn coerce_args<A: InputObject>(
             "Invalid arguments for \"{parent_type}.{field_name}\": {}",
             error.message()
         ))
+        .extend("code", "BAD_USER_INPUT")
     })?;
     Ok(value)
 }
@@ -325,5 +326,6 @@ pub(crate) fn coerce_args_without_validation<A: InputObject>(
             "Invalid arguments for \"{parent_type}.{field_name}\": {}",
             error.message()
         ))
+        .extend("code", "BAD_USER_INPUT")
     })
 }

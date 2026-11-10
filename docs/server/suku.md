@@ -125,8 +125,11 @@ Coverage is deliberately complete:
 * an error with `extensions.code` is returned unchanged;
 * a request error is returned unchanged, because parse/validation/coercion messages describe the
   caller's document;
-* any other error's message becomes `"Internal server error"`, preserving `locations`, `path` and
-  `extensions`.
+* any other error becomes a fresh `"Internal server error"` preserving `locations` and `path`;
+  `extensions` are removed, since they commonly carry stack traces and backend detail.
+
+`gurafi` marks its authorization and argument-validation errors with `UNAUTHORIZED` and
+`BAD_USER_INPUT`, so those deliberate client-facing messages survive.
 
 A resolver that adds an `extensions.code` to an internal error makes that message public, so only
 attach codes to safe messages. When that policy is wrong for an application, supply a custom

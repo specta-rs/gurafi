@@ -148,7 +148,7 @@ impl<Ctx: 'static> AuthGuard<Ctx> {
                     if allowed {
                         Ok(())
                     } else {
-                        Err(GraphQLError::new(message.to_string()))
+                        Err(GraphQLError::new(message.to_string()).extend("code", "UNAUTHORIZED"))
                     }
                 })
             }
@@ -158,7 +158,7 @@ impl<Ctx: 'static> AuthGuard<Ctx> {
                     if future.await {
                         Ok(())
                     } else {
-                        Err(GraphQLError::new(message.to_string()))
+                        Err(GraphQLError::new(message.to_string()).extend("code", "UNAUTHORIZED"))
                     }
                 })
             }

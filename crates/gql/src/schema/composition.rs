@@ -12,8 +12,8 @@ use indexmap::IndexMap;
 use rustc_hash::FxHashSet;
 
 use crate::types::{
-    DirectiveDefinition, EnumType, Field, InputObjectType, InputValue, InterfaceType, Name,
-    ObjectType, ScalarType, Type, UnionType,
+    AppliedDirective, DirectiveDefinition, EnumType, Field, InputObjectType, InputValue,
+    InterfaceType, Name, ObjectType, ScalarType, Type, UnionType,
 };
 
 use super::{Schema, SchemaBuilder, SchemaError, TypeMap};
@@ -113,12 +113,19 @@ impl Schema {
     /// Types, directives, root operation types, schema-level directive applications and the
     /// schema description are combined. A name defined by both schemas is accepted only when the
     /// definitions are structurally identical; resolver functions are not part of that
-    /// comparison, and a field that has a resolver in one schema keeps it in the merged result.
-    /// Any other collision is reported as a [`SchemaError`] naming the definition.
+    /// comparison. A resolver, subscription, complexity estimator, `is_type_of`, `resolve_type`
+    /// or scalar coercion function present in only one schema is kept. If both schemas set the
+    /// same runtime slot to different implementations the merge fails rather than choosing one by
+    /// argument order, because those slots carry authorization, complexity limits and subscription
+    /// behaviour. Any other collision is reported as a [`SchemaError`] naming the definition.
+    ///
+    /// Directive applications and directive locations are compared without regard to order;
+    /// repeatable directives are compared as a multiset.
     ///
     /// # Errors
     ///
-    /// Returns merge conflicts and the ordinary validation errors a rebuild can produce.
+    /// Returns merge conflicts, including conflicting runtime implementations, and the ordinary
+    /// validation errors a rebuild can produce.
     pub fn merge(&self, other: &Schema) -> Result<Schema, SchemaError> {
         let mut builder = builder_from(self);
         builder.merge(other);
@@ -427,25 +434,27 @@ fn merge_types(name: &str, left: &Type, right: &Type) -> Result<Type, String> {
             if !scalar_equivalent(left, right) {
                 return Err(type_conflict(name));
             }
-            Ok(Type::Scalar(Arc::new(merge_scalar(left, right))))
+            Ok(Type::Scalar(Arc::new(merge_scalar(name, left, right)?)))
         }
         (Type::Object(left), Type::Object(right)) => {
             if !object_equivalent(left, right) {
                 return Err(type_conflict(name));
             }
-            Ok(Type::Object(Arc::new(merge_object(left, right))))
+            Ok(Type::Object(Arc::new(merge_object(name, left, right)?)))
         }
         (Type::Interface(left), Type::Interface(right)) => {
             if !interface_equivalent(left, right) {
                 return Err(type_conflict(name));
             }
-            Ok(Type::Interface(Arc::new(merge_interface(left, right))))
+            Ok(Type::Interface(Arc::new(merge_interface(
+                name, left, right,
+            )?)))
         }
         (Type::Union(left), Type::Union(right)) => {
             if !union_equivalent(left, right) {
                 return Err(type_conflict(name));
             }
-            Ok(Type::Union(Arc::new(merge_union(left, right))))
+            Ok(Type::Union(Arc::new(merge_union(name, left, right)?)))
         }
         (Type::Enum(left), Type::Enum(right)) => {
             if !enum_equivalent(left, right) {
@@ -475,13 +484,13 @@ fn scalar_equivalent(left: &ScalarType, right: &ScalarType) -> bool {
     left.name == right.name
         && left.description == right.description
         && left.specified_by_url == right.specified_by_url
-        && left.directives == right.directives
+        && applied_directives_equivalent(&left.directives, &right.directives)
 }
 
 fn object_equivalent(left: &ObjectType, right: &ObjectType) -> bool {
     left.name == right.name
         && left.description == right.description
-        && left.directives == right.directives
+        && applied_directives_equivalent(&left.directives, &right.directives)
         && same_names(&left.interfaces, &right.interfaces)
         && fields_equivalent(&left.fields, &right.fields)
 }
@@ -489,7 +498,7 @@ fn object_equivalent(left: &ObjectType, right: &ObjectType) -> bool {
 fn interface_equivalent(left: &InterfaceType, right: &InterfaceType) -> bool {
     left.name == right.name
         && left.description == right.description
-        && left.directives == right.directives
+        && applied_directives_equivalent(&left.directives, &right.directives)
         && same_names(&left.interfaces, &right.interfaces)
         && fields_equivalent(&left.fields, &right.fields)
 }
@@ -497,21 +506,21 @@ fn interface_equivalent(left: &InterfaceType, right: &InterfaceType) -> bool {
 fn union_equivalent(left: &UnionType, right: &UnionType) -> bool {
     left.name == right.name
         && left.description == right.description
-        && left.directives == right.directives
+        && applied_directives_equivalent(&left.directives, &right.directives)
         && same_names(&left.types, &right.types)
 }
 
 fn enum_equivalent(left: &EnumType, right: &EnumType) -> bool {
     left.name == right.name
         && left.description == right.description
-        && left.directives == right.directives
+        && applied_directives_equivalent(&left.directives, &right.directives)
         && left.values.len() == right.values.len()
         && left.values.iter().all(|(name, value)| {
             right.values.get(name).is_some_and(|other| {
                 value.name == other.name
                     && value.description == other.description
                     && value.deprecation_reason == other.deprecation_reason
-                    && value.directives == other.directives
+                    && applied_directives_equivalent(&value.directives, &other.directives)
             })
         })
 }
@@ -519,7 +528,7 @@ fn enum_equivalent(left: &EnumType, right: &EnumType) -> bool {
 fn input_object_equivalent(left: &InputObjectType, right: &InputObjectType) -> bool {
     left.name == right.name
         && left.description == right.description
-        && left.directives == right.directives
+        && applied_directives_equivalent(&left.directives, &right.directives)
         && left.one_of == right.one_of
         && left.fields.len() == right.fields.len()
         && left.fields.iter().all(|(name, value)| {
@@ -538,7 +547,7 @@ fn fields_equivalent(left: &IndexMap<Name, Field>, right: &IndexMap<Name, Field>
                     && field.description == other.description
                     && field.ty == other.ty
                     && field.deprecation_reason == other.deprecation_reason
-                    && field.directives == other.directives
+                    && applied_directives_equivalent(&field.directives, &other.directives)
                     && input_values_equivalent(&field.args, &other.args)
             })
         })
@@ -548,8 +557,8 @@ fn directive_equivalent(left: &DirectiveDefinition, right: &DirectiveDefinition)
     left.name == right.name
         && left.description == right.description
         && left.repeatable == right.repeatable
-        && left.locations == right.locations
-        && left.directives == right.directives
+        && same_slice(left.locations.as_slice(), right.locations.as_slice())
+        && applied_directives_equivalent(&left.directives, &right.directives)
         && left.deprecation_reason == right.deprecation_reason
         && input_values_equivalent(&left.args, &right.args)
 }
@@ -572,77 +581,166 @@ fn input_value_equivalent(left: &InputValue, right: &InputValue) -> bool {
         && left.ty == right.ty
         && left.default_value == right.default_value
         && left.deprecation_reason == right.deprecation_reason
-        && left.directives == right.directives
+        && applied_directives_equivalent(&left.directives, &right.directives)
+}
+
+/// Compare two applied-directive lists as multisets.
+///
+/// The order of different directives, and the argument order of one directive, carry no meaning.
+/// Repeatable directives may still be applied several times, so the comparison is a multiset one
+/// rather than a set one.
+///
+/// `@deprecated`, `@specifiedBy` and `@oneOf` are ignored: their authoritative data lives in the
+/// dedicated model fields, and a schema may record the application in the directive list, the
+/// dedicated field, or both.
+fn applied_directives_equivalent(left: &[AppliedDirective], right: &[AppliedDirective]) -> bool {
+    const DEDICATED: [&str; 3] = ["deprecated", "specifiedBy", "oneOf"];
+    let left: Vec<&AppliedDirective> = left
+        .iter()
+        .filter(|directive| !DEDICATED.contains(&directive.name.as_ref()))
+        .collect();
+    let right: Vec<&AppliedDirective> = right
+        .iter()
+        .filter(|directive| !DEDICATED.contains(&directive.name.as_ref()))
+        .collect();
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut matched = vec![false; right.len()];
+    'left: for directive in left {
+        for (index, other) in right.iter().enumerate() {
+            if !matched[index]
+                && directive.name == other.name
+                && directive.arguments == other.arguments
+            {
+                matched[index] = true;
+                continue 'left;
+            }
+        }
+        return false;
+    }
+    true
 }
 
 /// Compare two name lists as sets: GraphQL type members and interfaces have no meaningful order.
 fn same_names(left: &[Name], right: &[Name]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .all(|name| right.iter().any(|other| other == name))
+    same_slice(left, right)
 }
 
-fn merge_scalar(left: &ScalarType, right: &ScalarType) -> ScalarType {
+/// Compare two slices as sets.
+fn same_slice<T: Eq>(left: &[T], right: &[T]) -> bool {
+    left.len() == right.len() && left.iter().all(|value| right.contains(value))
+}
+
+fn merge_scalar(name: &str, left: &ScalarType, right: &ScalarType) -> Result<ScalarType, String> {
     let mut merged = left.clone();
     if merged.serialize.is_none() {
         merged.serialize = right.serialize.clone();
         merged.builtin = right.builtin;
+    } else if right.serialize.is_some() && !(left.builtin && right.builtin) {
+        return Err(runtime_conflict(name, "serialize"));
     }
     if merged.parse_value.is_none() {
         merged.parse_value = right.parse_value.clone();
+    } else if right.parse_value.is_some() && !(left.builtin && right.builtin) {
+        return Err(runtime_conflict(name, "parse_value"));
     }
     if merged.parse_literal.is_none() {
         merged.parse_literal = right.parse_literal.clone();
+    } else if right.parse_literal.is_some() && !(left.builtin && right.builtin) {
+        return Err(runtime_conflict(name, "parse_literal"));
     }
-    merged
+    Ok(merged)
 }
 
-fn merge_object(left: &ObjectType, right: &ObjectType) -> ObjectType {
+fn merge_object(name: &str, left: &ObjectType, right: &ObjectType) -> Result<ObjectType, String> {
     let mut merged = left.clone();
     if merged.is_type_of.is_none() {
         merged.is_type_of = right.is_type_of.clone();
+    } else if right.is_type_of.is_some() && !same_slot(&merged.is_type_of, &right.is_type_of) {
+        return Err(runtime_conflict(name, "is_type_of"));
     }
-    for (name, field) in &mut merged.fields {
-        if let Some(other) = right.fields.get(name) {
-            merge_field_runtime(field, other);
+    for (field_name, field) in &mut merged.fields {
+        if let Some(other) = right.fields.get(field_name) {
+            merge_field_runtime(name, field_name, field, other)?;
         }
     }
-    merged
+    Ok(merged)
 }
 
-fn merge_interface(left: &InterfaceType, right: &InterfaceType) -> InterfaceType {
+fn merge_interface(
+    name: &str,
+    left: &InterfaceType,
+    right: &InterfaceType,
+) -> Result<InterfaceType, String> {
     let mut merged = left.clone();
     if merged.resolve_type.is_none() {
         merged.resolve_type = right.resolve_type.clone();
+    } else if right.resolve_type.is_some() && !same_slot(&merged.resolve_type, &right.resolve_type)
+    {
+        return Err(runtime_conflict(name, "resolve_type"));
     }
-    for (name, field) in &mut merged.fields {
-        if let Some(other) = right.fields.get(name) {
-            merge_field_runtime(field, other);
+    for (field_name, field) in &mut merged.fields {
+        if let Some(other) = right.fields.get(field_name) {
+            merge_field_runtime(name, field_name, field, other)?;
         }
     }
-    merged
+    Ok(merged)
 }
 
-fn merge_union(left: &UnionType, right: &UnionType) -> UnionType {
+fn merge_union(name: &str, left: &UnionType, right: &UnionType) -> Result<UnionType, String> {
     let mut merged = left.clone();
     if merged.resolve_type.is_none() {
         merged.resolve_type = right.resolve_type.clone();
+    } else if right.resolve_type.is_some() && !same_slot(&merged.resolve_type, &right.resolve_type)
+    {
+        return Err(runtime_conflict(name, "resolve_type"));
     }
-    merged
+    Ok(merged)
+}
+
+/// Whether two optional function slots refer to the same implementation.
+fn same_slot<T: ?Sized>(left: &Option<Arc<T>>, right: &Option<Arc<T>>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        _ => true,
+    }
+}
+
+fn runtime_conflict(owner: &str, slot: &str) -> String {
+    format!(
+        "Cannot merge schemas: \"{owner}\" has different {slot} implementations in each schema. Runtime behaviour is never chosen by merge order; keep one definition or merge a schema that leaves the slot unset."
+    )
 }
 
 /// Fill resolver slots a field has not set from its counterpart.
-fn merge_field_runtime(target: &mut Field, source: &Field) {
+///
+/// Two different implementations are a conflict rather than a precedence rule: authorization,
+/// complexity limits and subscription behaviour all live in these slots, so silently picking the
+/// receiver's function would make the merged schema depend on argument order.
+fn merge_field_runtime(
+    owner: &str,
+    name: &str,
+    target: &mut Field,
+    source: &Field,
+) -> Result<(), String> {
+    let path = format!("{owner}.{name}");
     if target.resolve.is_none() {
         target.resolve = source.resolve.clone();
+    } else if source.resolve.is_some() && !same_slot(&target.resolve, &source.resolve) {
+        return Err(runtime_conflict(&path, "resolve"));
     }
     if target.subscribe.is_none() {
         target.subscribe = source.subscribe.clone();
+    } else if source.subscribe.is_some() && !same_slot(&target.subscribe, &source.subscribe) {
+        return Err(runtime_conflict(&path, "subscribe"));
     }
     if target.complexity.is_none() {
         target.complexity = source.complexity.clone();
+    } else if source.complexity.is_some() && !same_slot(&target.complexity, &source.complexity) {
+        return Err(runtime_conflict(&path, "complexity"));
     }
+    Ok(())
 }
 
 /// Copy runtime behaviour from an original schema onto a schema rebuilt from its SDL.
@@ -676,7 +774,7 @@ fn overlay_resolvers(source: &Schema, target: &mut Schema) {
                 }
                 for (name, field) in &mut target.fields {
                     if let Some(source) = source.fields.get(name) {
-                        merge_field_runtime(field, source);
+                        fill_field_runtime(field, source);
                     }
                 }
             }
@@ -690,7 +788,7 @@ fn overlay_resolvers(source: &Schema, target: &mut Schema) {
                 }
                 for (name, field) in &mut target.fields {
                     if let Some(source) = source.fields.get(name) {
-                        merge_field_runtime(field, source);
+                        fill_field_runtime(field, source);
                     }
                 }
             }
@@ -704,6 +802,22 @@ fn overlay_resolvers(source: &Schema, target: &mut Schema) {
             }
             Type::Enum(_) | Type::InputObject(_) => {}
         }
+    }
+}
+
+/// Fill runtime slots without checking for conflicts.
+///
+/// The target is rebuilt from SDL, so it has no runtime behaviour of its own; every slot it
+/// receives comes from `source`.
+fn fill_field_runtime(target: &mut Field, source: &Field) {
+    if target.resolve.is_none() {
+        target.resolve = source.resolve.clone();
+    }
+    if target.subscribe.is_none() {
+        target.subscribe = source.subscribe.clone();
+    }
+    if target.complexity.is_none() {
+        target.complexity = source.complexity.clone();
     }
 }
 

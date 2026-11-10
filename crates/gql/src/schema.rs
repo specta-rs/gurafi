@@ -614,6 +614,9 @@ impl SchemaBuilder {
         if self.errors.is_empty() {
             coerce_applied_directive_arguments(&mut schema, &mut self.errors);
         }
+        if self.errors.is_empty() {
+            strip_dedicated_directives(&mut schema);
+        }
 
         if self.errors.is_empty() {
             Ok(schema)
@@ -733,6 +736,138 @@ fn apply_dedicated_directives(
         apply_deprecation(&directive.directives, &mut directive.deprecation_reason);
         for argument in directive.args.values_mut() {
             apply_input_value(argument);
+        }
+    }
+}
+
+/// Remove `@deprecated`, `@specifiedBy` and `@oneOf` applications now that their authoritative
+/// model fields hold the same data.
+///
+/// SDL parsing records both forms; keeping the directive list as well would make a schema built
+/// from SDL structurally different from the identical code-first schema, and would make
+/// [`Schema::extend_sdl`](super::Schema::extend_sdl) change a schema's observable structure even
+/// when the SDL adds nothing. Validation and argument coercion run before this, so an invalid
+/// application is still reported.
+fn strip_dedicated_directives(schema: &mut Schema) {
+    const DEDICATED: [&str; 3] = ["deprecated", "specifiedBy", "oneOf"];
+
+    fn strip(directives: &mut Vec<AppliedDirective>) {
+        if directives
+            .iter()
+            .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+        {
+            directives.retain(|directive| !DEDICATED.contains(&directive.name.as_ref()));
+        }
+    }
+
+    fn strip_input_value(value: &mut InputValue) {
+        strip(&mut value.directives);
+    }
+
+    fn strip_field(field: &mut Field) {
+        strip(&mut field.directives);
+        for argument in field.args.values_mut() {
+            strip_input_value(argument);
+        }
+    }
+
+    let inner = Arc::make_mut(&mut schema.inner);
+    for ty in inner.types.values_mut() {
+        match ty {
+            Type::Scalar(scalar) => {
+                if scalar
+                    .directives
+                    .iter()
+                    .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+                {
+                    strip(&mut Arc::make_mut(scalar).directives);
+                }
+            }
+            Type::Object(object) => {
+                if object
+                    .directives
+                    .iter()
+                    .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+                    || object.fields.values().any(|field| {
+                        field
+                            .directives
+                            .iter()
+                            .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+                    })
+                {
+                    let object = Arc::make_mut(object);
+                    strip(&mut object.directives);
+                    for field in object.fields.values_mut() {
+                        strip_field(field);
+                    }
+                }
+            }
+            Type::Interface(interface) => {
+                if interface
+                    .directives
+                    .iter()
+                    .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+                    || interface.fields.values().any(|field| {
+                        field
+                            .directives
+                            .iter()
+                            .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+                    })
+                {
+                    let interface = Arc::make_mut(interface);
+                    strip(&mut interface.directives);
+                    for field in interface.fields.values_mut() {
+                        strip_field(field);
+                    }
+                }
+            }
+            Type::Union(union) => {
+                if union
+                    .directives
+                    .iter()
+                    .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+                {
+                    strip(&mut Arc::make_mut(union).directives);
+                }
+            }
+            Type::Enum(enumeration) => {
+                if enumeration
+                    .directives
+                    .iter()
+                    .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+                    || enumeration.values.values().any(|value| {
+                        value
+                            .directives
+                            .iter()
+                            .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+                    })
+                {
+                    let enumeration = Arc::make_mut(enumeration);
+                    strip(&mut enumeration.directives);
+                    for value in enumeration.values.values_mut() {
+                        strip(&mut value.directives);
+                    }
+                }
+            }
+            Type::InputObject(input) => {
+                if input
+                    .directives
+                    .iter()
+                    .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+                    || input.fields.values().any(|field| {
+                        field
+                            .directives
+                            .iter()
+                            .any(|directive| DEDICATED.contains(&directive.name.as_ref()))
+                    })
+                {
+                    let input = Arc::make_mut(input);
+                    strip(&mut input.directives);
+                    for field in input.fields.values_mut() {
+                        strip_input_value(field);
+                    }
+                }
+            }
         }
     }
 }

@@ -319,10 +319,18 @@ impl<Ctx: 'static + Sync> Relay<Ctx> {
         }
         let payload = schema.object_ref::<PayloadMarker>(name.clone());
         schema.implement(&payload, |object| {
-            object
-                .raw_field::<gurafi::Raw<T>>("result")
-                .non_null()
-                .as_dynamic(T::output_type().non_null());
+            // A nullable Rust result (`Option<T>`) produces a nullable `result`, matching the
+            // resolver's contract; everything else is non-null.
+            if T::is_optional() {
+                object
+                    .raw_field::<gurafi::Raw<T>>("result")
+                    .as_dynamic(T::output_type());
+            } else {
+                object
+                    .raw_field::<gurafi::Raw<T>>("result")
+                    .non_null()
+                    .as_dynamic(T::output_type().non_null());
+            }
             match config.client_mutation_id {
                 ClientMutationId::Omit => {}
                 ClientMutationId::Optional => {

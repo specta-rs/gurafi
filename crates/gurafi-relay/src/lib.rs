@@ -80,10 +80,12 @@
 //! - The `Node` interface and its root fields are named exactly `Node`, `node` and `nodes`.
 //! - Connection type names are explicit (`UserPostsConnection`), not generated from the field or
 //!   parent type. This is deliberate: it makes the schema stable when refactoring Rust modules.
-//! - `clientMutationId` is a sibling argument of `input`, not part of the input object, because
-//!   `gurafi` input object names are compile-time constants.
-//! - Bare local IDs are accepted by default as a migration fallback. Disable that with
-//!   [`Relay::allow_local_ids(false)`](Relay::allow_local_ids).
+//! - Bare local IDs are **rejected by default**. Opt into the migration fallback with
+//!   [`Relay::allow_local_ids(true)`](Relay::allow_local_ids); local IDs are then tried against
+//!   every registered node loader in registration order.
+//! - Relay's `clientMutationId` is a sibling argument of `input`, not a field inside the input
+//!   object, because `gurafi` input object names are compile-time constants. This is not
+//!   wire-compatible with clients that send `clientMutationId` inside `variables.input`.
 //! - The helpers live on [`Relay`] (and the object/root extension traits) rather than directly on
 //!   `Schema`. Generated shared types and root fields need schema ownership, and an explicit
 //!   registry keeps repeated registration idempotent without global state.

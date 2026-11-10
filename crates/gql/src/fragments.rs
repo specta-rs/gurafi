@@ -9,7 +9,7 @@
 //! selection set, so an inline array is cheaper than a hash map. Documents that define many
 //! fragments fall back to hashing to keep lookup cost independent of their number.
 
-use std::{collections::hash_map, fmt};
+use std::fmt;
 
 use rustc_hash::FxHashMap;
 
@@ -42,8 +42,11 @@ enum FragmentsInner<'a> {
         entries: [Option<(&'a str, &'a FragmentDefinition<'a>)>; INLINE_FRAGMENTS],
         len: u8,
     },
-    /// Many fragments, indexed by name.
-    Large(FxHashMap<&'a str, &'a FragmentDefinition<'a>>),
+    /// Many fragments: source order plus a name index.
+    Large {
+        entries: Vec<(&'a str, &'a FragmentDefinition<'a>)>,
+        index: FxHashMap<&'a str, usize>,
+    },
 }
 
 impl<'a> Fragments<'a> {
@@ -59,6 +62,10 @@ impl<'a> Fragments<'a> {
     }
 
     /// Build a fragment lookup for a parsed document.
+    ///
+    /// Fragment definitions are kept in source order. When an invalid document defines the same
+    /// name twice, the first definition wins in both representations, matching validation's
+    /// "duplicate name" error and the inline lookup's behaviour.
     #[must_use]
     pub fn new(document: &'a Document<'a>) -> Self {
         let mut entries = [None; INLINE_FRAGMENTS];
@@ -66,13 +73,35 @@ impl<'a> Fragments<'a> {
         let mut fragments = document.fragments();
         for fragment in fragments.by_ref() {
             if len == INLINE_FRAGMENTS {
-                let mut large: FxHashMap<_, _> = entries.iter().flatten().copied().collect();
-                large.insert(fragment.name, fragment);
+                let mut order: Vec<(&'a str, &'a FragmentDefinition<'a>)> =
+                    entries.iter().flatten().copied().collect();
+                let mut index = FxHashMap::with_capacity_and_hasher(
+                    document.fragments().count(),
+                    Default::default(),
+                );
+                for (position, (name, _)) in order.iter().enumerate() {
+                    index.entry(*name).or_insert(position);
+                }
+                // The fragment at the loop head has already been taken from the iterator; add it
+                // before draining the rest.
+                if let std::collections::hash_map::Entry::Vacant(entry) = index.entry(fragment.name)
+                {
+                    entry.insert(order.len());
+                    order.push((fragment.name, fragment));
+                }
                 for fragment in fragments {
-                    large.insert(fragment.name, fragment);
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        index.entry(fragment.name)
+                    {
+                        entry.insert(order.len());
+                        order.push((fragment.name, fragment));
+                    }
                 }
                 return Self {
-                    inner: FragmentsInner::Large(large),
+                    inner: FragmentsInner::Large {
+                        entries: order,
+                        index,
+                    },
                 };
             }
             entries[len] = Some((fragment.name, fragment));
@@ -95,7 +124,9 @@ impl<'a> Fragments<'a> {
                 .flatten()
                 .find(|(known, _)| *known == name)
                 .map(|(_, fragment)| *fragment),
-            FragmentsInner::Large(fragments) => fragments.get(name).copied(),
+            FragmentsInner::Large { entries, index } => {
+                index.get(name).map(|position| entries[*position].1)
+            }
         }
     }
 
@@ -110,7 +141,7 @@ impl<'a> Fragments<'a> {
     pub fn len(&self) -> usize {
         match &self.inner {
             FragmentsInner::Small { len, .. } => usize::from(*len),
-            FragmentsInner::Large(fragments) => fragments.len(),
+            FragmentsInner::Large { entries, .. } => entries.len(),
         }
     }
 
@@ -126,7 +157,7 @@ impl<'a> Fragments<'a> {
             FragmentsInner::Small { entries, len } => {
                 FragmentsIter::Small(entries[..usize::from(*len)].iter())
             }
-            FragmentsInner::Large(fragments) => FragmentsIter::Large(fragments.iter()),
+            FragmentsInner::Large { entries, .. } => FragmentsIter::Large(entries.iter()),
         }
     }
 }
@@ -158,8 +189,8 @@ impl fmt::Debug for Fragments<'_> {
 pub enum FragmentsIter<'b, 'a> {
     /// Iterating the inline lookup.
     Small(std::slice::Iter<'b, Option<(&'a str, &'a FragmentDefinition<'a>)>>),
-    /// Iterating the hashed lookup.
-    Large(hash_map::Iter<'b, &'a str, &'a FragmentDefinition<'a>>),
+    /// Iterating the ordered lookup.
+    Large(std::slice::Iter<'b, (&'a str, &'a FragmentDefinition<'a>)>),
 }
 
 impl<'a> Iterator for FragmentsIter<'_, 'a> {

@@ -239,6 +239,15 @@ impl<'a> FieldNodes<'a> {
         Self { nodes: &[] }
     }
 
+    /// Field nodes borrowed from a document.
+    ///
+    /// This is public so custom dispatchers and test helpers can build a [`ResolveInfo`]
+    /// equivalent to the one execution produces.
+    #[must_use]
+    pub const fn new(nodes: &'a [&'a Field<'a>]) -> Self {
+        Self { nodes }
+    }
+
     /// Field nodes borrowed from the execution.
     #[must_use]
     pub(crate) const fn borrowed(nodes: &'a [&'a Field<'a>]) -> Self {

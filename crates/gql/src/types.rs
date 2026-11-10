@@ -1035,6 +1035,12 @@ pub struct ResolveInfo<'a> {
     /// Duplicate selections, aliases and fields reached through fragments all contribute a node
     /// here, in document order. This is the selection information a resolver needs to implement
     /// projections, batched loaders or other selection-aware behaviour.
+    ///
+    /// The nodes are always value-correct. In ordinary execution they are the exact nodes of
+    /// [`ResolveInfo::operation`]; prepared execution compiles a plan that owns its own cloned
+    /// nodes, so there the nodes compare equal by value but are not pointer-identical to nodes
+    /// reachable from `operation`. Resolvers should compare names, arguments and locations rather
+    /// than addresses.
     pub field_nodes: ast::FieldNodes<'a>,
     /// The operation definition being executed.
     ///

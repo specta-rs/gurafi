@@ -6,10 +6,13 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, PoisonError, RwLock},
+    sync::{
+        Arc, Mutex, PoisonError, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
-use futures::future::join_all;
+use futures::StreamExt;
 use gurafi::{
     BoxFuture, ID, Input, InterfaceRef, NoArgs, ObjectModel, OutputType, RequestCache, Schema,
     gql::{GraphQLError, TypeRef, Value},
@@ -37,6 +40,9 @@ type LoadManyValue<Ctx> = Arc<
 >;
 type CacheAccessor<Ctx> = Arc<dyn Fn(&Ctx) -> RequestCache + Send + Sync + 'static>;
 type NodeIdGetter<M> = Arc<dyn Fn(&M) -> String + Send + Sync>;
+
+/// Maximum concurrent `load_one` calls used when a node type has no `load_many`.
+const MAX_NODE_FANOUT: usize = 16;
 
 struct NodeTypeEntry<Ctx> {
     typename: String,
@@ -237,10 +243,21 @@ impl<M: ObjectModel, Ctx: 'static + Sync> NodeBuilder<M, Ctx> {
             Arc::new(move |ids, ctx| {
                 let loader = Arc::clone(&loader);
                 Box::pin(async move {
-                    let futures = ids.into_iter().map(|id| loader(id, ctx));
-                    join_all(futures)
-                        .await
+                    // A type may configure only `load_one`. Fanning out unbounded would let one
+                    // `nodes(ids:)` request issue an arbitrary number of backend calls, so run a
+                    // bounded stream and restore the requested order afterwards.
+                    let mut results =
+                        futures::stream::iter(ids.into_iter().enumerate().map(|(index, id)| {
+                            let loader = Arc::clone(&loader);
+                            async move { (index, loader(id, ctx).await) }
+                        }))
+                        .buffer_unordered(MAX_NODE_FANOUT)
+                        .collect::<Vec<_>>()
+                        .await;
+                    results.sort_by_key(|(index, _)| *index);
+                    results
                         .into_iter()
+                        .map(|(_, result)| result)
                         .collect::<Result<Vec<_>, _>>()
                 })
             })
@@ -258,13 +275,16 @@ impl<M: ObjectModel, Ctx: 'static + Sync> NodeBuilder<M, Ctx> {
 }
 
 /// Per-request Node result cache.
+///
+/// Loader failures are cached too: retrying a failing backend once per selection would multiply
+/// the damage during an outage.
 #[derive(Default)]
 struct NodeResultCache {
-    entries: Mutex<HashMap<String, Option<Value>>>,
+    entries: Mutex<HashMap<String, Result<Option<Value>, GraphQLError>>>,
 }
 
 impl NodeResultCache {
-    fn get(&self, key: &str) -> Option<Option<Value>> {
+    fn get(&self, key: &str) -> Option<Result<Option<Value>, GraphQLError>> {
         self.entries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -272,7 +292,7 @@ impl NodeResultCache {
             .cloned()
     }
 
-    fn insert(&self, key: String, value: Option<Value>) {
+    fn insert(&self, key: String, value: Result<Option<Value>, GraphQLError>) {
         self.entries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -306,7 +326,7 @@ pub struct Relay<Ctx: 'static> {
     node_root: bool,
     node_types: Arc<RwLock<Vec<NodeTypeEntry<Ctx>>>>,
     cache_accessor: Option<CacheAccessor<Ctx>>,
-    allow_local_ids: bool,
+    allow_local_ids: Arc<AtomicBool>,
     pub(crate) page_info: bool,
     pub(crate) connection_names: Vec<String>,
     pub(crate) payload_names: Vec<String>,
@@ -327,7 +347,7 @@ impl<Ctx: 'static + Sync> Relay<Ctx> {
             node_root: false,
             node_types: Arc::new(RwLock::new(Vec::new())),
             cache_accessor: None,
-            allow_local_ids: true,
+            allow_local_ids: Arc::new(AtomicBool::new(false)),
             page_info: false,
             connection_names: Vec::new(),
             payload_names: Vec::new(),
@@ -354,11 +374,15 @@ impl<Ctx: 'static + Sync> Relay<Ctx> {
 
     /// Whether bare local IDs are accepted when a value is not a valid global ID.
     ///
-    /// Enabled by default. This is a migration aid for clients that have not moved to global
-    /// IDs; local IDs are tried against every registered node loader in registration order.
+    /// Disabled by default: a Relay client sends global IDs, and accepting bare local IDs lets a
+    /// client fetch a node type it did not name and costs one loader call per registered type.
+    /// Enable this only as a migration aid, and only for the period clients need it.
+    ///
+    /// The setting is shared with the already-installed `node`/`nodes` fields, so it can be
+    /// changed after registration.
     #[must_use]
-    pub fn allow_local_ids(mut self, allow: bool) -> Self {
-        self.allow_local_ids = allow;
+    pub fn allow_local_ids(self, allow: bool) -> Self {
+        self.allow_local_ids.store(allow, Ordering::Relaxed);
         self
     }
 
@@ -439,20 +463,28 @@ impl<Ctx: 'static + Sync> Relay<Ctx> {
 
         let types = Arc::clone(&self.node_types);
         let cache = self.cache_accessor.clone();
-        let allow_local = self.allow_local_ids;
+        let allow_local = Arc::clone(&self.allow_local_ids);
         schema.query(|query| {
             let one_types = Arc::clone(&types);
             let one_cache = cache.clone();
+            let one_allow_local = Arc::clone(&allow_local);
             query.field_result_async("node", move |args: NodeArgs, ctx: &Ctx| {
                 let types = Arc::clone(&one_types);
                 let cache = one_cache.clone();
+                let allow_local = Arc::clone(&one_allow_local);
                 Box::pin(async move {
                     let entries = snapshot(&types);
                     let cache = cache
                         .as_ref()
                         .map(|accessor| accessor(ctx).get_or_insert_with(NodeResultCache::default));
-                    let value =
-                        resolve_one(&entries, cache.as_ref(), ctx, args.id.0, allow_local).await?;
+                    let value = resolve_one(
+                        &entries,
+                        cache.as_ref(),
+                        ctx,
+                        args.id.0,
+                        allow_local.load(Ordering::Relaxed),
+                    )
+                    .await?;
                     Ok(value.map(gurafi::Raw::<NodeValue>::from))
                 })
             });
@@ -460,13 +492,20 @@ impl<Ctx: 'static + Sync> Relay<Ctx> {
             query.field_result_async("nodes", move |args: NodesArgs, ctx: &Ctx| {
                 let types = Arc::clone(&types);
                 let cache = cache.clone();
+                let allow_local = Arc::clone(&allow_local);
                 Box::pin(async move {
                     let entries = snapshot(&types);
                     let cache = cache
                         .as_ref()
                         .map(|accessor| accessor(ctx).get_or_insert_with(NodeResultCache::default));
-                    let values =
-                        resolve_many(&entries, cache.as_ref(), ctx, &args.ids, allow_local).await?;
+                    let values = resolve_many(
+                        &entries,
+                        cache.as_ref(),
+                        ctx,
+                        &args.ids,
+                        allow_local.load(Ordering::Relaxed),
+                    )
+                    .await?;
                     Ok(values
                         .into_iter()
                         .map(|value| value.map(gurafi::Raw::<NodeValue>::from))
@@ -505,13 +544,13 @@ async fn resolve_one<Ctx: 'static>(
             };
             let key = cache_key(&entry.typename, &decoded.local_id);
             if let Some(cached) = cache.and_then(|cache| cache.get(&key)) {
-                return Ok(cached);
+                return cached;
             }
-            let value = (entry.load_one)(decoded.local_id, ctx).await?;
+            let value = (entry.load_one)(decoded.local_id, ctx).await;
             if let Some(cache) = cache {
                 cache.insert(key, value.clone());
             }
-            Ok(value)
+            value
         }
         Err(error) => {
             if !allow_local {
@@ -520,17 +559,20 @@ async fn resolve_one<Ctx: 'static>(
             for entry in entries {
                 let key = cache_key(&entry.typename, &raw);
                 if let Some(cached) = cache.and_then(|cache| cache.get(&key)) {
-                    if cached.is_some() {
-                        return Ok(cached);
+                    match cached {
+                        Ok(Some(value)) => return Ok(Some(value)),
+                        Ok(None) => continue,
+                        Err(error) => return Err(error),
                     }
-                    continue;
                 }
-                let value = (entry.load_one)(raw.clone(), ctx).await?;
+                let value = (entry.load_one)(raw.clone(), ctx).await;
                 if let Some(cache) = cache {
                     cache.insert(key, value.clone());
                 }
-                if value.is_some() {
-                    return Ok(value);
+                match value {
+                    Ok(Some(value)) => return Ok(Some(value)),
+                    Ok(None) => {}
+                    Err(error) => return Err(error),
                 }
             }
             Ok(None)
@@ -557,15 +599,20 @@ async fn resolve_many<Ctx: 'static>(
                     .iter()
                     .find(|entry| entry.typename == decoded.typename)
                 else {
-                    return Err(GraphQLError::new(format!(
-                        "Global ID names unknown node type `{}`.",
-                        decoded.typename
-                    )));
+                    // A list of nullable nodes can report one unusable item without nulling the
+                    // whole field. There is no per-item GraphQL error channel from a resolver, so
+                    // the slot stays `null`; singular `node` still reports the unknown type.
+                    continue;
                 };
                 let key = cache_key(&entry.typename, &decoded.local_id);
                 if let Some(cached) = cache.and_then(|cache| cache.get(&key)) {
-                    results[index] = cached;
-                    resolved[index] = true;
+                    match cached {
+                        Ok(value) => {
+                            results[index] = value;
+                            resolved[index] = true;
+                        }
+                        Err(error) => return Err(error),
+                    }
                 } else if let Some((_, requested)) = global
                     .iter_mut()
                     .find(|(typename, _)| *typename == entry.typename)
@@ -575,9 +622,10 @@ async fn resolve_many<Ctx: 'static>(
                     global.push((entry.typename.as_str(), vec![(index, decoded.local_id)]));
                 }
             }
-            Err(error) => {
+            Err(_) => {
                 if !allow_local {
-                    return Err(error);
+                    // As above: a malformed ID is one bad list item, not a whole-field failure.
+                    continue;
                 }
                 local.push((index, id.0.clone()));
             }
@@ -605,7 +653,7 @@ async fn resolve_many<Ctx: 'static>(
                 .get(local_id.as_str())
                 .and_then(|value| (*value).clone());
             if let Some(cache) = cache {
-                cache.insert(cache_key(typename, &local_id), value.clone());
+                cache.insert(cache_key(typename, &local_id), Ok(value.clone()));
             }
             results[index] = value;
             resolved[index] = true;
@@ -635,9 +683,13 @@ async fn resolve_many<Ctx: 'static>(
                 }
                 let key = cache_key(&entry.typename, local_id);
                 if let Some(cached) = cache.and_then(|cache| cache.get(&key)) {
-                    if cached.is_some() {
-                        results[*index] = cached;
-                        resolved[*index] = true;
+                    match cached {
+                        Ok(Some(value)) => {
+                            results[*index] = Some(value);
+                            resolved[*index] = true;
+                        }
+                        Ok(None) => {}
+                        Err(error) => return Err(error),
                     }
                     continue;
                 }
@@ -658,7 +710,7 @@ async fn resolve_many<Ctx: 'static>(
                     .and_then(Clone::clone);
                 if value.is_some() {
                     if let Some(cache) = cache {
-                        cache.insert(cache_key(&entry.typename, local_id), value.clone());
+                        cache.insert(cache_key(&entry.typename, local_id), Ok(value.clone()));
                     }
                     results[*index] = value;
                     resolved[*index] = true;

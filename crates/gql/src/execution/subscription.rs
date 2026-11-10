@@ -256,7 +256,7 @@ where
         .map_err(Response::error)?;
 
     let path = vec![PathSegment::field(response_key)];
-    let field_nodes = [node];
+    let field_nodes = group.nodes.field_node_refs();
     let info = ResolveInfo {
         field_name: field.name.as_ref(),
         parent_type: subscription_type.name.as_ref(),

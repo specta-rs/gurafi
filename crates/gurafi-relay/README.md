@@ -112,13 +112,17 @@ request. Without one, `nodes` still deduplicates IDs inside a single call.
 
 ### Local IDs
 
-Bare local IDs are accepted by default when the value is not valid global-ID Base64. They are
-tried against every registered node loader in registration order. This is a migration aid; use
-`Relay::allow_local_ids(false)` to require global IDs:
+Bare local IDs are **rejected by default**. Global IDs are the only accepted form; a value that
+is not valid global-ID Base64 is an `Invalid global ID` error. For a migration period you can opt
+in to a fallback that tries the value against every registered node loader in registration order:
 
 ```rust
-let relay = Relay::<Ctx>::new().allow_local_ids(false);
+let relay = Relay::<Ctx>::new().allow_local_ids(true);
 ```
+
+The fallback lets a client resolve a node type it did not name and costs one loader call per
+registered type, so enable it only while clients still send local IDs. The setting is shared with
+the installed root fields, so it can also be changed after a node is registered.
 
 An ID that *is* valid global-ID Base64 but names an unregistered type is an error; it does not
 silently fall back to a local ID.
@@ -299,7 +303,8 @@ MutationConfig::new().client_mutation_id(ClientMutationId::Required);
 - Connection names are explicit, not generated from parent/field names. This keeps schema names
   stable across Rust refactors but differs from Pothos' automatic naming.
 - `clientMutationId` is a sibling argument of `input`, not a member of the input object, because
-  `gurafi` input object names are compile-time constants. The response shape still matches Relay.
+  `gurafi` input object names are compile-time constants. The response shape matches Relay, but a
+  Relay client that puts `clientMutationId` inside `variables.input` is not wire-compatible.
 - Connections require the node type to be a concrete `ObjectModel` registered in the schema.
 - Node and connection node types use their derived `ObjectModel::NAME`; ``Schema::object_ref``
   runtime names are used for the generated connection/payload types, not for node identity.

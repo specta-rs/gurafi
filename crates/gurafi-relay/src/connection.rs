@@ -184,6 +184,14 @@ impl<T> Connection<T> {
             start = end;
         }
 
+        // The Relay specification computes the page flags from the edges left after applying
+        // `after`/`before`, before `first`/`last` trims the window.
+        let filtered_len = end.saturating_sub(start);
+        let has_next_page = args
+            .first
+            .is_some_and(|first| filtered_len > first as usize);
+        let has_previous_page = args.last.is_some_and(|last| filtered_len > last as usize);
+
         if let Some(first) = args.first {
             end = end.min(start.saturating_add(first as usize));
         }
@@ -199,8 +207,8 @@ impl<T> Connection<T> {
             .collect::<Vec<_>>();
 
         let page_info = PageInfo {
-            has_next_page: end < items.len(),
-            has_previous_page: start > 0,
+            has_next_page,
+            has_previous_page,
             start_cursor: edges.first().map(|edge| edge.cursor.clone()),
             end_cursor: edges.last().map(|edge| edge.cursor.clone()),
         };
@@ -276,6 +284,11 @@ impl<T> Connection<T> {
         if start > end {
             start = end;
         }
+        let filtered_len = end.saturating_sub(start);
+        let has_next_page = args
+            .first
+            .is_some_and(|first| filtered_len > first as usize);
+        let has_previous_page = args.last.is_some_and(|last| filtered_len > last as usize);
         if let Some(first) = args.first {
             end = end.min(start.saturating_add(first as usize));
         }
@@ -290,8 +303,8 @@ impl<T> Connection<T> {
             })
             .collect::<Vec<_>>();
         let page_info = PageInfo {
-            has_next_page: end < items.len(),
-            has_previous_page: start > 0,
+            has_next_page,
+            has_previous_page,
             start_cursor: edges.first().map(|edge| edge.cursor.clone()),
             end_cursor: edges.last().map(|edge| edge.cursor.clone()),
         };
@@ -584,6 +597,7 @@ impl<Ctx: 'static + Sync> Relay<Ctx> {
             + 'static,
     {
         let connection = self.connection::<T>(schema, name)?;
+        validate_field_name(field)?;
         Ok(schema.object::<M>(|object| {
             object.connection(&connection, field, resolver);
         }))
@@ -610,6 +624,7 @@ impl<Ctx: 'static + Sync> Relay<Ctx> {
             + 'static,
     {
         let connection = self.connection::<T>(schema, name)?;
+        validate_field_name(field)?;
         Ok(schema.object::<M>(|object| {
             object.connection_async(&connection, field, resolver);
         }))
@@ -628,6 +643,7 @@ impl<Ctx: 'static + Sync> Relay<Ctx> {
         F: Fn(ConnectionArgs, &Ctx) -> Result<Connection<T>, GraphQLError> + Send + Sync + 'static,
     {
         let connection = self.connection::<T>(schema, name)?;
+        validate_field_name(field)?;
         schema.query(|query| {
             query.connection(&connection, field, resolver);
         });
@@ -648,6 +664,12 @@ pub(crate) fn validate_name(name: &str) -> Result<(), RelayError> {
         )));
     }
     Ok(())
+}
+
+/// Validate a GraphQL field name, which follows the same grammar as a type name.
+pub(crate) fn validate_field_name(name: &str) -> Result<(), RelayError> {
+    validate_name(name)
+        .map_err(|_| RelayError::new(format!("`{name}` is not a valid GraphQL field name")))
 }
 
 // ---------------------------------------------------------------------------

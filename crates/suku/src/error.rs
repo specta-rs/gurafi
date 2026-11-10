@@ -177,13 +177,15 @@ where
 ///   for clients to branch on.
 /// * A request error ([`ErrorContext::is_request`]) is left untouched. Parse, validation and
 ///   variable-coercion messages describe the caller's document, not server internals.
-/// * Any other error (an execution error without a code) has its message replaced with
-///   [`INTERNAL_ERROR_MESSAGE`]. Source locations, response path and extensions are preserved, so
-///   clients still see *where* a field failed and any structured metadata the resolver attached.
+/// * Any other error (an execution error without a code) is replaced by a fresh error with the
+///   message [`INTERNAL_ERROR_MESSAGE`]. Source locations and the response path are preserved.
+///   Extensions are **removed**: resolvers commonly put stack traces, backend hostnames or other
+///   diagnostics there, and preserving them would defeat the mask.
 ///
 /// This is a conservative default, not a complete security policy: a resolver that attaches an
-/// `extensions.code` to an internal error opts that message back in. Prefer attaching codes only
-/// to errors that are intentionally safe to expose.
+/// `extensions.code` to an internal error opts that message (and its extensions) back in. Prefer
+/// attaching codes only to errors that are intentionally safe to expose. `gurafi` attaches
+/// `UNAUTHORIZED` and `BAD_USER_INPUT` to its own client-facing errors, so those survive.
 ///
 /// ```no_run
 /// use suku::{Server, mask_internal};
@@ -198,7 +200,14 @@ pub fn mask_internal(error: &GraphQLError, context: &ErrorContext<'_>) -> GraphQ
     if context.is_request() || has_code(error) {
         return error.clone();
     }
-    error.clone().with_message(INTERNAL_ERROR_MESSAGE)
+    let mut masked = GraphQLError::new(INTERNAL_ERROR_MESSAGE);
+    for location in error.locations() {
+        masked = masked.at(*location);
+    }
+    if let Some(path) = error.path() {
+        masked = masked.with_path(path.to_vec());
+    }
+    masked
 }
 
 fn has_code(error: &GraphQLError) -> bool {

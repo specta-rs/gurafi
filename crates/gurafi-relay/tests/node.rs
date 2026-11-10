@@ -96,8 +96,14 @@ fn data(response: &gql::Response) -> &gql::Object {
 }
 
 fn node_schema() -> gql::Schema {
+    node_schema_with_local_ids(false)
+}
+
+fn node_schema_with_local_ids(allow_local_ids: bool) -> gql::Schema {
     let mut schema = Schema::<Ctx>::new();
-    let mut relay = Relay::<Ctx>::new().with_request_cache(|ctx: &Ctx| ctx.cache.clone());
+    let mut relay = Relay::<Ctx>::new()
+        .with_request_cache(|ctx: &Ctx| ctx.cache.clone())
+        .allow_local_ids(allow_local_ids);
 
     relay
         .node::<User>(&mut schema, |n| {
@@ -209,7 +215,7 @@ fn node_and_nodes_dispatch_global_ids() {
 
 #[test]
 fn missing_nodes_are_null_and_local_ids_are_accepted() {
-    let schema = node_schema();
+    let schema = node_schema_with_local_ids(true);
 
     let missing = execute(
         &schema,
@@ -330,7 +336,7 @@ fn duplicate_node_registration_is_rejected() {
 #[test]
 fn an_existing_id_field_is_preserved() {
     let mut schema = Schema::<Ctx>::new();
-    let mut relay = Relay::<Ctx>::new();
+    let mut relay = Relay::<Ctx>::new().allow_local_ids(true);
     schema.object::<Legacy>(|o| {
         o.field("id", |legacy: &Legacy, _: NoArgs, _: &Ctx| {
             gurafi::ID::new(legacy.id.clone())
