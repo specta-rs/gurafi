@@ -8,6 +8,7 @@
 pub(crate) mod coerce;
 mod collect;
 mod executor;
+mod plan;
 mod prepared;
 mod selection;
 pub(crate) mod subscription;

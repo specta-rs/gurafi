@@ -192,12 +192,16 @@ where
     };
 
     let fragments = executor::FragmentMap::new(document);
-    let collected = collect::collect_fields(
+    let plan = prepared.as_ref().map(|prepared| prepared.plan);
+    let selection_sets = [&operation.selection_set];
+    let selections = collect::Selections::new(&selection_sets, plan.and_then(|plan| plan.root()));
+    let collected = collect::collect_fields_multi(
         schema,
         &fragments,
         &context.variables,
         &subscription_type,
-        &operation.selection_set,
+        &selections,
+        plan,
     )
     .map_err(Response::error)?;
 
@@ -211,12 +215,13 @@ where
             "A subscription must select exactly one root field.",
         )));
     }
-    let Some((response_key, nodes, _)) = collected.first() else {
+    let Some(group) = collected.view(0, &context.variables, &subscription_type) else {
         return Err(Response::error(GraphQLError::new(
             "A subscription selected no root fields; it must select exactly one.",
         )));
     };
-    let Some(node) = nodes.first().copied() else {
+    let response_key = group.response_key;
+    let Some(node) = group.nodes.first() else {
         return Err(Response::error(GraphQLError::new(
             "A subscription root field has no field node.",
         )));
@@ -250,7 +255,7 @@ where
     let args = coerce::coerce_argument_values(schema, field, node, &context.variables)
         .map_err(Response::error)?;
 
-    let path = vec![PathSegment::field(*response_key)];
+    let path = vec![PathSegment::field(response_key)];
     let info = ResolveInfo {
         field_name: field.name.as_ref(),
         parent_type: subscription_type.name.as_ref(),
@@ -285,7 +290,7 @@ where
 
     let field_ty = field.ty.clone();
     let location = node.location;
-    let response_key: Arc<str> = Arc::from(*response_key);
+    let response_key: Arc<str> = Arc::from(response_key);
     // Each event gets its own deadline: a subscription is long-lived, so one absolute deadline
     // would kill the stream after the first timeout window.
     let context = Arc::new(context);

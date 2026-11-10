@@ -33,7 +33,11 @@ use crate::{
     validation::{self, ValidationOptions},
 };
 
-use super::{AuthorizationContext, ExecutionContext, ExecutionOptions, Request, coerce, collect};
+use super::{
+    AuthorizationContext, ExecutionContext, ExecutionOptions, Request, coerce,
+    collect::{self, CollectedFields, Selections},
+    plan::{self, GroupView, PreparedPlan},
+};
 
 /// How many nested selection-set levels the synchronous default-completion path may enter.
 ///
@@ -206,6 +210,7 @@ pub(crate) async fn execute_operation<'doc>(
         document,
         operation,
         operation.name.map(Arc::from),
+        None,
         root_type,
         variables.values,
         options,
@@ -225,6 +230,7 @@ pub(crate) async fn execute_prepared_operation<'doc>(
     document: &'doc ast::Document<'doc>,
     operation: &'doc ast::OperationDefinition<'doc>,
     operation_name: Option<Arc<str>>,
+    plan: &'doc PreparedPlan<'doc>,
     root_type: &'doc ObjectType,
     static_complexity: Option<&StaticComplexity>,
     compiled_variables: Option<&coerce::CompiledVariables>,
@@ -278,6 +284,7 @@ pub(crate) async fn execute_prepared_operation<'doc>(
         document,
         operation,
         operation_name,
+        Some(plan),
         root_type,
         variables.values,
         options,
@@ -313,6 +320,7 @@ async fn finish_operation<'doc>(
     document: &'doc ast::Document<'doc>,
     operation: &'doc ast::OperationDefinition<'doc>,
     operation_name: Option<Arc<str>>,
+    plan: Option<&'doc PreparedPlan<'doc>>,
     root_type: &'doc ObjectType,
     variables: Object,
     options: &ExecutionOptions,
@@ -334,6 +342,7 @@ async fn finish_operation<'doc>(
     run_operation(
         &context,
         fragments,
+        plan,
         root_type,
         &operation.selection_set,
         options.root_value.clone(),
@@ -378,6 +387,7 @@ pub(crate) fn select_operation<'a>(
 pub(crate) async fn run_operation<'doc>(
     context: &'doc ExecutionContext,
     fragments: FragmentMap<'doc>,
+    plan: Option<&'doc PreparedPlan<'doc>>,
     root_type: &'doc ObjectType,
     selection_set: &'doc ast::SelectionSet<'doc>,
     parent: Value,
@@ -388,31 +398,26 @@ pub(crate) async fn run_operation<'doc>(
     let executor = Executor {
         context,
         fragments,
+        plans: plan,
         deadline,
         parallel,
         skip_root_authorization,
     };
     let mut path = Path::new();
     let mut errors = Vec::new();
-    let selection_sets = std::slice::from_ref(&selection_set);
+    let selection_sets = [selection_set];
+    let selections = Selections::new(&selection_sets, plan.and_then(PreparedPlan::root));
     let result = match executor.try_execute_fields_sync(
         root_type,
         &parent,
-        selection_sets,
+        &selections,
         &mut path,
         &mut errors,
         0,
     ) {
         Some(result) => result,
         None => executor
-            .execute_fields_inner(
-                root_type,
-                &parent,
-                selection_sets,
-                &mut path,
-                &mut errors,
-                0,
-            )
+            .execute_fields_inner(root_type, &parent, &selections, &mut path, &mut errors, 0)
             .await
             .map(Arc::new),
     };
@@ -469,6 +474,7 @@ pub(crate) async fn execute_subscription_event(
     run_operation(
         context,
         fragments,
+        None,
         root_type,
         &operation.selection_set,
         event,
@@ -482,6 +488,8 @@ pub(crate) async fn execute_subscription_event(
 struct Executor<'doc> {
     context: &'doc ExecutionContext,
     fragments: FragmentMap<'doc>,
+    /// The precompiled collection plan of a prepared operation, when there is one.
+    plans: Option<&'doc PreparedPlan<'doc>>,
     deadline: Option<Instant>,
     /// Whether sibling fields at this level may resolve concurrently.
     parallel: bool,
@@ -503,7 +511,7 @@ impl<'doc> Executor<'doc> {
         &'s self,
         object_type: &'doc ObjectType,
         parent: &'s Value,
-        selection_sets: &'s [&'doc ast::SelectionSet<'doc>],
+        selections: &'s Selections<'_, 'doc>,
         path: &'s mut Path,
         errors: &'s mut Vec<GraphQLError>,
         depth: usize,
@@ -511,12 +519,13 @@ impl<'doc> Executor<'doc> {
     where
         'doc: 's,
     {
-        let mut collected = collect::collect_fields_multi(
+        let collected = collect::collect_fields_multi(
             &self.context.schema,
             &self.fragments,
             &self.context.variables,
             object_type,
-            selection_sets,
+            selections,
+            self.plans,
         )?;
         let mut result = Object::with_capacity(collected.len());
         if self.parallel
@@ -524,7 +533,7 @@ impl<'doc> Executor<'doc> {
             && self.try_execute_all_leaves(
                 object_type,
                 parent,
-                &mut collected,
+                &collected,
                 path,
                 errors,
                 &mut result,
@@ -536,7 +545,11 @@ impl<'doc> Executor<'doc> {
             // The batch lives on the heap so the boxed future below stays small enough to
             // recurse safely.
             let mut futures = Vec::with_capacity(collected.len());
-            for (response_key, nodes, field) in collected {
+            for index in 0..collected.len() {
+                let Some(group) = collected.view(index, &self.context.variables, object_type)
+                else {
+                    continue;
+                };
                 if self.expired() {
                     return Err(GraphQLError::new(
                         "The operation timed out before it could finish.",
@@ -547,15 +560,8 @@ impl<'doc> Executor<'doc> {
                 // them in the same ordered batch as the asynchronous fields without boxing
                 // a future or cloning the path for each one.
                 let mut field_errors = Vec::new();
-                let inline = self.try_execute_leaf(
-                    object_type,
-                    parent,
-                    response_key,
-                    &nodes,
-                    field,
-                    path,
-                    &mut field_errors,
-                );
+                let inline =
+                    self.try_execute_leaf(object_type, parent, &group, path, &mut field_errors);
                 let future = match inline {
                     Some((response_key, outcome)) => {
                         Either::Left(ready((response_key, outcome, field_errors)))
@@ -567,9 +573,7 @@ impl<'doc> Executor<'doc> {
                                 .execute_field(
                                     object_type,
                                     parent,
-                                    response_key,
-                                    &nodes,
-                                    field,
+                                    &group,
                                     &mut field_path,
                                     &mut field_errors,
                                     depth,
@@ -608,7 +612,10 @@ impl<'doc> Executor<'doc> {
             }
             return Ok(result);
         }
-        for (response_key, nodes, field) in collected {
+        for index in 0..collected.len() {
+            let Some(group) = collected.view(index, &self.context.variables, object_type) else {
+                continue;
+            };
             // Mutations must keep document order, and a single field has no concurrency to
             // gain.
             if self.expired() {
@@ -617,30 +624,14 @@ impl<'doc> Executor<'doc> {
                         .with_path(path.to_vec()),
                 );
             }
-            let (response_key, outcome) = match self.try_execute_leaf(
-                object_type,
-                parent,
-                response_key,
-                &nodes,
-                field,
-                path,
-                errors,
-            ) {
-                Some(done) => done,
-                None => {
-                    self.execute_field(
-                        object_type,
-                        parent,
-                        response_key,
-                        &nodes,
-                        field,
-                        path,
-                        errors,
-                        depth,
-                    )
-                    .await
-                }
-            };
+            let (response_key, outcome) =
+                match self.try_execute_leaf(object_type, parent, &group, path, errors) {
+                    Some(done) => done,
+                    None => {
+                        self.execute_field(object_type, parent, &group, path, errors, depth)
+                            .await
+                    }
+                };
             match outcome {
                 Ok(value) => {
                     result.push_unchecked(response_key, value);
@@ -660,7 +651,7 @@ impl<'doc> Executor<'doc> {
         &'s self,
         object_type: &'doc ObjectType,
         parent: &'s Value,
-        selection_sets: &'s [&'doc ast::SelectionSet<'doc>],
+        selections: &'s Selections<'_, 'doc>,
         path: &'s mut Path,
         errors: &'s mut Vec<GraphQLError>,
         depth: usize,
@@ -668,7 +659,7 @@ impl<'doc> Executor<'doc> {
     where
         'doc: 's,
     {
-        self.execute_fields_inner(object_type, parent, selection_sets, path, errors, depth)
+        self.execute_fields_inner(object_type, parent, selections, path, errors, depth)
             .boxed()
     }
 
@@ -679,36 +670,34 @@ impl<'doc> Executor<'doc> {
     /// [`Self::execute_fields`] frame.
     fn try_execute_all_leaves(
         &self,
-        object_type: &ObjectType,
+        object_type: &'doc ObjectType,
         parent: &Value,
-        collected: &mut collect::CollectedFields<'doc>,
+        collected: &CollectedFields<'doc>,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
         result: &mut Object,
     ) -> Result<bool, GraphQLError> {
-        if !collected
-            .iter()
-            .all(|(_, nodes, field)| self.can_execute_leaf_inline(object_type, nodes, *field))
-        {
-            return Ok(false);
+        for index in 0..collected.len() {
+            let Some(group) = collected.view(index, &self.context.variables, object_type) else {
+                continue;
+            };
+            if !self.can_execute_leaf_inline(object_type, &group) {
+                return Ok(false);
+            }
         }
-        for (response_key, nodes, field) in collected.drain(..) {
-            if self.expired() {
+        let check_deadline = self.deadline.is_some();
+        for index in 0..collected.len() {
+            let Some(group) = collected.view(index, &self.context.variables, object_type) else {
+                continue;
+            };
+            if check_deadline && self.expired() {
                 return Err(
                     GraphQLError::new("The operation timed out before it could finish.")
                         .with_path(path.to_vec()),
                 );
             }
             let (response_key, outcome) = self
-                .try_execute_leaf(
-                    object_type,
-                    parent,
-                    response_key,
-                    &nodes,
-                    field,
-                    path,
-                    errors,
-                )
+                .try_execute_leaf(object_type, parent, &group, path, errors)
                 .expect("the inline predicate and the fast path agree");
             result.push_unchecked(response_key, outcome?);
         }
@@ -719,12 +708,12 @@ impl<'doc> Executor<'doc> {
     fn can_execute_leaf_inline(
         &self,
         object_type: &ObjectType,
-        nodes: &[&'doc ast::Field<'doc>],
-        field: Option<&crate::types::Field>,
+        group: &GroupView<'_, 'doc>,
     ) -> bool {
-        nodes
+        group
+            .nodes
             .first()
-            .is_some_and(|first| self.leaf_field(object_type, first, field).is_some())
+            .is_some_and(|first| self.leaf_field(object_type, first, group.field).is_some())
     }
 
     /// The schema field for a selection that the synchronous leaf path can complete.
@@ -764,24 +753,19 @@ impl<'doc> Executor<'doc> {
         &'s self,
         object_type: &ObjectType,
         parent: &Value,
-        response_key: &'doc str,
-        nodes: &'s [&'doc ast::Field<'doc>],
-        hint: Option<&'doc crate::types::Field>,
+        group: &GroupView<'_, 'doc>,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
     ) -> Option<(Arc<str>, Result<Value, GraphQLError>)>
     where
         'doc: 's,
     {
-        let first = nodes.first().copied()?;
-        let field = self.leaf_field(object_type, first, hint)?;
+        let first = group.nodes.first()?;
+        let field = self.leaf_field(object_type, first, group.field)?;
 
         // An unaliased field's response key is the schema field's interned name, so the
         // response object and the error path can share that `Arc`.
-        let key: Arc<str> = match first.alias {
-            Some(_) => Arc::from(response_key),
-            None => field.name.clone(),
-        };
+        let key = group.key_arc(first, Some(field));
         let location = first.location;
         // The path takes ownership of the key and hands it back on the way out: cloning it for
         // the path would add a refcount round trip to every completed field.
@@ -790,7 +774,7 @@ impl<'doc> Executor<'doc> {
             let error = GraphQLError::new("The operation timed out before it could finish.")
                 .with_path(path.to_vec());
             path.pop();
-            return Some((Arc::from(response_key), Err(error)));
+            return Some((Arc::from(group.response_key), Err(error)));
         }
 
         let label = FieldLabel {
@@ -826,9 +810,7 @@ impl<'doc> Executor<'doc> {
         &'s self,
         object_type: &'doc ObjectType,
         parent: &'s Value,
-        response_key: &'doc str,
-        nodes: &'s [&'doc ast::Field<'doc>],
-        hint: Option<&'doc crate::types::Field>,
+        group: &'s GroupView<'_, 'doc>,
         path: &'s mut Path,
         errors: &'s mut Vec<GraphQLError>,
         depth: usize,
@@ -837,38 +819,23 @@ impl<'doc> Executor<'doc> {
         'doc: 's,
     {
         async move {
-            let Some(first) = nodes.first().copied() else {
+            let Some(first) = group.nodes.first() else {
                 return (
-                    Arc::from(response_key),
+                    Arc::from(group.response_key),
                     Err(GraphQLError::new(format!(
-                        "No field node was provided for response key \"{response_key}\"."
+                        "No field node was provided for response key \"{}\".",
+                        group.response_key
                     ))),
                 );
             };
 
             // An unaliased field's response key is exactly the schema field's interned name, so the
             // response object and the error path can share that `Arc` instead of allocating one.
-            let field = match hint {
-                Some(field) => Some(field),
-                None => object_type.get_field(first.name),
-            };
-            let key: Arc<str> = match (field, first.alias) {
-                (Some(field), None) => field.name.clone(),
-                _ => Arc::from(response_key),
-            };
+            let key = group.key_arc(first, group.field);
             path.push(PathSegment::Field(key));
 
             let outcome = self
-                .execute_field_inner(
-                    object_type,
-                    field,
-                    parent,
-                    first,
-                    nodes,
-                    path,
-                    errors,
-                    depth,
-                )
+                .execute_field_inner(object_type, group, parent, path, errors, depth)
                 .await;
             (pop_field_key(path), outcome)
         }
@@ -879,24 +846,30 @@ impl<'doc> Executor<'doc> {
     async fn execute_field_inner(
         &self,
         object_type: &ObjectType,
-        field: Option<&crate::types::Field>,
+        group: &GroupView<'_, 'doc>,
         parent: &Value,
-        first: &ast::Field<'_>,
-        nodes: &[&'doc ast::Field<'doc>],
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
         depth: usize,
     ) -> Result<Value, GraphQLError> {
-        let location = first.location;
-        // A single leaf node collects no selection sets, which is the majority of fields and
-        // does not need to build (or even walk) the list.
-        let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 2]> = match nodes {
-            [only] if only.selection_set.is_none() => SmallVec::new(),
-            _ => nodes
-                .iter()
-                .filter_map(|node| node.selection_set.as_ref())
-                .collect(),
+        let Some(first) = group.nodes.first() else {
+            return Err(GraphQLError::new(format!(
+                "No field node was provided for response key \"{}\".",
+                group.response_key
+            )));
         };
+        let location = first.location;
+        // The completion path takes the merged selection sets. They are built here in document
+        // order; the buffer stays inline for the usual one or two nodes.
+        let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 2]> = match group.nodes.first()
+        {
+            Some(only) if only.selection_set.is_none() => SmallVec::new(),
+            _ => group.nodes.selection_sets(),
+        };
+        let selections = Selections::new(
+            &selection_sets,
+            group.child.filter(|_| self.plans.is_some()),
+        );
 
         if self.expired() {
             return Err(
@@ -946,7 +919,7 @@ impl<'doc> Executor<'doc> {
                                 &value,
                                 &ty,
                                 label,
-                                &selection_sets,
+                                &selections,
                                 location,
                                 path,
                                 errors,
@@ -958,7 +931,7 @@ impl<'doc> Executor<'doc> {
                                         &value,
                                         &ty,
                                         label,
-                                        &selection_sets,
+                                        &selections,
                                         location,
                                         path,
                                         errors,
@@ -982,7 +955,7 @@ impl<'doc> Executor<'doc> {
             );
         }
 
-        let Some(field) = field else {
+        let Some(field) = group.field else {
             let error = GraphQLError::new(format!(
                 "Cannot query field \"{}\" on type \"{}\".",
                 first.name, object_type.name
@@ -1005,23 +978,15 @@ impl<'doc> Executor<'doc> {
         // Coercing an empty argument list cannot fail, and most fields take no arguments, so the
         // common case skips the work instead of building an object nothing reads.
         let mut args = Object::with_capacity(field.args.len());
-        if !(first.arguments.is_empty() && field.args.is_empty()) {
-            if let Err(error) = coerce::coerce_argument_values_into(
-                &self.context.schema,
-                field,
-                first,
-                &self.context.variables,
-                &mut args,
-            ) {
-                return finish_field(
-                    Err(error),
-                    Some(&field.ty),
-                    path,
-                    location,
-                    errors,
-                    self.context.max_errors,
-                );
-            }
+        if let Err(error) = self.field_arguments(group, first, field, &mut args) {
+            return finish_field(
+                Err(error),
+                Some(&field.ty),
+                path,
+                location,
+                errors,
+                self.context.max_errors,
+            );
         }
         let args = &args;
 
@@ -1080,7 +1045,7 @@ impl<'doc> Executor<'doc> {
                         &value,
                         &field.ty,
                         label,
-                        &selection_sets,
+                        &selections,
                         location,
                         path,
                         errors,
@@ -1092,7 +1057,7 @@ impl<'doc> Executor<'doc> {
                                 &value,
                                 &field.ty,
                                 label,
-                                &selection_sets,
+                                &selections,
                                 location,
                                 path,
                                 errors,
@@ -1112,6 +1077,29 @@ impl<'doc> Executor<'doc> {
             location,
             errors,
             self.context.max_errors,
+        )
+    }
+
+    /// Coerce a field's arguments, using the plan's template when there is one.
+    fn field_arguments(
+        &self,
+        group: &GroupView<'_, 'doc>,
+        first: &ast::Field<'_>,
+        field: &crate::types::Field,
+        args: &mut Object,
+    ) -> Result<(), GraphQLError> {
+        if let Some(template) = group.args {
+            return template.fill(&self.context.variables, args);
+        }
+        if first.arguments.is_empty() && field.args.is_empty() {
+            return Ok(());
+        }
+        coerce::coerce_argument_values_into(
+            &self.context.schema,
+            field,
+            first,
+            &self.context.variables,
+            args,
         )
     }
 
@@ -1270,7 +1258,7 @@ impl<'doc> Executor<'doc> {
         value: &Value,
         ty: &TypeRef,
         label: FieldLabel<'_>,
-        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        selections: &Selections<'_, 'doc>,
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
@@ -1280,14 +1268,7 @@ impl<'doc> Executor<'doc> {
             if let Some(object) = self.plain_object(ty) {
                 return self
                     .complete_object(
-                        object,
-                        value,
-                        label,
-                        selection_sets,
-                        location,
-                        path,
-                        errors,
-                        depth,
+                        object, value, label, selections, location, path, errors, depth,
                     )
                     .await;
             }
@@ -1298,7 +1279,7 @@ impl<'doc> Executor<'doc> {
                         items_non_null,
                         value,
                         label,
-                        selection_sets,
+                        selections,
                         location,
                         path,
                         errors,
@@ -1307,17 +1288,8 @@ impl<'doc> Executor<'doc> {
                     .await;
             }
         }
-        self.complete_value(
-            value,
-            ty,
-            label,
-            selection_sets,
-            location,
-            path,
-            errors,
-            depth,
-        )
-        .await
+        self.complete_value(value, ty, label, selections, location, path, errors, depth)
+            .await
     }
 
     /// The object type a list's items complete as, when every item is a plain object.
@@ -1357,7 +1329,7 @@ impl<'doc> Executor<'doc> {
         items_non_null: bool,
         value: &Value,
         label: FieldLabel<'_>,
-        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        selections: &Selections<'_, 'doc>,
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
@@ -1388,14 +1360,7 @@ impl<'doc> Executor<'doc> {
                 }
             } else {
                 self.complete_object(
-                    object,
-                    item,
-                    label,
-                    selection_sets,
-                    location,
-                    path,
-                    errors,
-                    depth,
+                    object, item, label, selections, location, path, errors, depth,
                 )
                 .await
             };
@@ -1430,7 +1395,7 @@ impl<'doc> Executor<'doc> {
         value: &'s Value,
         ty: &'s TypeRef,
         label: FieldLabel<'s>,
-        selection_sets: &'s [&'doc ast::SelectionSet<'doc>],
+        selections: &'s Selections<'_, 'doc>,
         location: Location,
         path: &'s mut Path,
         errors: &'s mut Vec<GraphQLError>,
@@ -1439,17 +1404,8 @@ impl<'doc> Executor<'doc> {
     where
         'doc: 's,
     {
-        self.complete_value_inner(
-            value,
-            ty,
-            label,
-            selection_sets,
-            location,
-            path,
-            errors,
-            depth,
-        )
-        .boxed()
+        self.complete_value_inner(value, ty, label, selections, location, path, errors, depth)
+            .boxed()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1458,7 +1414,7 @@ impl<'doc> Executor<'doc> {
         value: &Value,
         ty: &TypeRef,
         label: FieldLabel<'_>,
-        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        selections: &Selections<'_, 'doc>,
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
@@ -1485,27 +1441,13 @@ impl<'doc> Executor<'doc> {
         let completed = match current {
             TypeRef::List(inner) => {
                 self.complete_list(
-                    value,
-                    inner,
-                    label,
-                    selection_sets,
-                    location,
-                    path,
-                    errors,
-                    depth,
+                    value, inner, label, selections, location, path, errors, depth,
                 )
                 .await?
             }
             TypeRef::Named(name) => {
                 self.complete_named(
-                    value,
-                    name,
-                    label,
-                    selection_sets,
-                    location,
-                    path,
-                    errors,
-                    depth,
+                    value, name, label, selections, location, path, errors, depth,
                 )
                 .await?
             }
@@ -1537,7 +1479,7 @@ impl<'doc> Executor<'doc> {
         item: &Value,
         inner: &TypeRef,
         label: FieldLabel<'_>,
-        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        selections: &Selections<'_, 'doc>,
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
@@ -1566,29 +1508,13 @@ impl<'doc> Executor<'doc> {
             TypeRef::List(_) => {
                 return self
                     .complete_value(
-                        item,
-                        inner,
-                        label,
-                        selection_sets,
-                        location,
-                        path,
-                        errors,
-                        depth,
+                        item, inner, label, selections, location, path, errors, depth,
                     )
                     .await;
             }
             TypeRef::Named(name) => {
-                self.complete_named(
-                    item,
-                    name,
-                    label,
-                    selection_sets,
-                    location,
-                    path,
-                    errors,
-                    depth,
-                )
-                .await?
+                self.complete_named(item, name, label, selections, location, path, errors, depth)
+                    .await?
             }
             TypeRef::NonNull(_) => {
                 return Err(located(
@@ -1614,7 +1540,7 @@ impl<'doc> Executor<'doc> {
         value: &Value,
         inner: &TypeRef,
         label: FieldLabel<'_>,
-        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        selections: &Selections<'_, 'doc>,
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
@@ -1638,27 +1564,13 @@ impl<'doc> Executor<'doc> {
             let outcome = match &object {
                 Some(object) if !item.is_null() => {
                     self.complete_object(
-                        object,
-                        item,
-                        label,
-                        selection_sets,
-                        location,
-                        path,
-                        errors,
-                        depth,
+                        object, item, label, selections, location, path, errors, depth,
                     )
                     .await
                 }
                 _ => {
                     self.complete_item(
-                        item,
-                        inner,
-                        label,
-                        selection_sets,
-                        location,
-                        path,
-                        errors,
-                        depth,
+                        item, inner, label, selections, location, path, errors, depth,
                     )
                     .await
                 }
@@ -1684,7 +1596,7 @@ impl<'doc> Executor<'doc> {
         value: &Value,
         name: &crate::types::Name,
         label: FieldLabel<'_>,
-        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        selections: &Selections<'_, 'doc>,
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
@@ -1750,14 +1662,7 @@ impl<'doc> Executor<'doc> {
             },
             Type::Object(object) => {
                 self.complete_object(
-                    object,
-                    value,
-                    label,
-                    selection_sets,
-                    location,
-                    path,
-                    errors,
-                    depth,
+                    object, value, label, selections, location, path, errors, depth,
                 )
                 .await
             }
@@ -1777,14 +1682,7 @@ impl<'doc> Executor<'doc> {
                     .resolve_abstract_type(name.as_ref(), value)
                     .map_err(|error| locate(error, path, location))?;
                 self.complete_object(
-                    object,
-                    value,
-                    label,
-                    selection_sets,
-                    location,
-                    path,
-                    errors,
-                    depth,
+                    object, value, label, selections, location, path, errors, depth,
                 )
                 .await
             }
@@ -1802,7 +1700,7 @@ impl<'doc> Executor<'doc> {
         object: &'doc ObjectType,
         value: &Value,
         label: FieldLabel<'_>,
-        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        selections: &Selections<'_, 'doc>,
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
@@ -1819,7 +1717,7 @@ impl<'doc> Executor<'doc> {
                 location,
             ));
         }
-        if selection_sets.is_empty() {
+        if selections.is_empty() {
             return Err(located(
                 format!(
                     "Field {label} of type \"{}\" must have a selection set.",
@@ -1833,7 +1731,7 @@ impl<'doc> Executor<'doc> {
         // [`Self::try_complete_field_value_sync`]); reaching here means the subtree needs the
         // asynchronous path somewhere.
         let completed = self
-            .execute_fields(object, value, selection_sets, path, errors, depth)
+            .execute_fields(object, value, selections, path, errors, depth)
             .await?;
         Ok(Value::Object(Arc::new(completed)))
     }
@@ -1849,17 +1747,12 @@ impl<'doc> Executor<'doc> {
         &self,
         object_type: &'doc ObjectType,
         parent: &Value,
-        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        selections: &Selections<'_, 'doc>,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
         depth: usize,
     ) -> Option<Result<Arc<Object>, GraphQLError>> {
-        if depth >= SYNC_DEPTH_LIMIT
-            || object_type
-                .fields
-                .values()
-                .any(|field| field.resolve.is_some())
-        {
+        if depth >= SYNC_DEPTH_LIMIT || self.type_has_resolvers(selections.source, object_type) {
             return None;
         }
         let collected = match collect::collect_fields_multi(
@@ -1867,14 +1760,23 @@ impl<'doc> Executor<'doc> {
             &self.fragments,
             &self.context.variables,
             object_type,
-            selection_sets,
+            selections,
+            self.plans,
         ) {
             Ok(collected) => collected,
             Err(error) => return Some(Err(error)),
         };
 
         let mut records = Vec::new();
-        match self.execute_fields_sync(object_type, parent, &collected, path, &mut records, depth) {
+        let outcome = match &collected {
+            CollectedFields::Planned(plan) => {
+                self.planned_fields_sync(plan, object_type, parent, path, &mut records, depth)
+            }
+            CollectedFields::Dynamic(fields) => {
+                self.execute_fields_sync(fields, object_type, parent, path, &mut records, depth)
+            }
+        };
+        match outcome {
             Ok(Ok(object)) => {
                 append_errors(errors, records, self.context.max_errors);
                 Some(Ok(object))
@@ -1899,7 +1801,7 @@ impl<'doc> Executor<'doc> {
         value: &Value,
         ty: &TypeRef,
         label: FieldLabel<'_>,
-        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        selections: &Selections<'_, 'doc>,
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
@@ -1910,7 +1812,7 @@ impl<'doc> Executor<'doc> {
             value,
             ty,
             label,
-            selection_sets,
+            selections,
             location,
             path,
             &mut records,
@@ -1925,23 +1827,87 @@ impl<'doc> Executor<'doc> {
     /// Every construct that could touch caller code is refused rather than approximated:
     /// resolvers, authorizers, meta fields, abstract types and custom scalar serializers all
     /// hand the work back so the async path handles them with the exact same semantics.
-    fn execute_fields_sync(
+    /// Fill a response object from a precompiled field plan.
+    ///
+    /// The plan already resolved every group's schema field, response key, argument template and
+    /// built-in scalar shape, so the common scalar property needs no lookup and no checks beyond
+    /// reading the parent value.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn planned_fields_sync(
         &self,
+        plan: &'doc crate::execution::plan::FieldPlan<'doc>,
         object_type: &'doc ObjectType,
         parent: &Value,
-        collected: &collect::CollectedFields<'doc>,
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> Result<Result<Arc<Object>, ()>, GraphQLError> {
+        // The response object is the one allocation this path needs, filled in place.
+        let mut result = Arc::new(Object::with_capacity(plan.len()));
+        let object = Arc::get_mut(&mut result).expect("a fresh Arc is uniquely owned");
+        // An authorizer is caller code and must observe every field, so the scalar shortcut is
+        // only safe when none is configured.
+        let parent_object = match parent {
+            Value::Object(parent) if self.context.authorizer.is_none() => Some(parent),
+            _ => None,
+        };
+        let check_deadline = self.deadline.is_some();
+        for group in plan.groups() {
+            let Some(variant) = group.variant(&self.context.variables) else {
+                continue;
+            };
+            // A variable condition can exclude every node of the group.
+            if variant.nodes.is_empty() {
+                continue;
+            }
+            if check_deadline && self.expired() {
+                return Err(
+                    GraphQLError::new("The operation timed out before it could finish.")
+                        .with_path(path.to_vec()),
+                );
+            }
+            if let (Some(property), Some(parent_object)) = (&group.property, parent_object) {
+                if let Some(value) = parent_object
+                    .get(property.name.as_ref())
+                    .and_then(|value| scalar_shape(property.kind, value))
+                {
+                    object.push_unchecked(property.key.clone(), value);
+                    continue;
+                }
+            }
+            let Some((response_key, outcome)) =
+                self.planned_field_sync(object_type, parent, group, variant, path, errors, depth)
+            else {
+                return Ok(Err(()));
+            };
+            object.push_unchecked(response_key, outcome?);
+        }
+        Ok(Ok(result))
+    }
+
+    /// Complete fields that were already collected, without awaiting.
+    ///
+    /// This is the pre-plan executor loop verbatim: it runs for queries that are not prepared,
+    /// where the plan's extra layers would only cost time.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_fields_sync(
+        &self,
+        fields: &collect::DynamicFields<'doc>,
+        object_type: &'doc ObjectType,
+        parent: &Value,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
         depth: usize,
     ) -> Result<Result<Arc<Object>, ()>, GraphQLError> {
         // The response object is the one allocation it needs, so it is created up front and
         // filled in place; that saves copying the whole object into the `Arc` afterwards.
-        let mut result = Arc::new(Object::with_capacity(collected.len()));
+        let mut result = Arc::new(Object::with_capacity(fields.len()));
         let object = Arc::get_mut(&mut result).expect("a fresh Arc is uniquely owned");
-        let mut index = 0;
-        while index < collected.len() {
-            let (response_key, nodes, field) = &collected[index];
-            if self.expired() {
+        let check_deadline = self.deadline.is_some();
+        for (response_key, nodes, field) in fields {
+            let response_key: &'doc str = response_key;
+            if check_deadline && self.expired() {
                 return Err(
                     GraphQLError::new("The operation timed out before it could finish.")
                         .with_path(path.to_vec()),
@@ -1955,12 +1921,11 @@ impl<'doc> Executor<'doc> {
                 if nodes.first().is_some_and(|first| first.alias.is_none()) {
                     if let Some((key, value)) = self.scalar_property(field, parent) {
                         object.push_unchecked(key, value);
-                        index += 1;
                         continue;
                     }
                 }
             }
-            let Some((response_key, outcome)) = self.execute_field_sync(
+            let Some((response_key, outcome)) = self.execute_field_dynamic_sync(
                 object_type,
                 parent,
                 response_key,
@@ -1973,9 +1938,156 @@ impl<'doc> Executor<'doc> {
                 return Ok(Err(()));
             };
             object.push_unchecked(response_key, outcome?);
-            index += 1;
         }
         Ok(Ok(result))
+    }
+
+    /// Complete one dynamically collected field without awaiting.
+    ///
+    /// This mirrors the pre-plan implementation; the planned path has its own
+    /// [`Self::planned_field_sync`], which can read the plan's resolved field and arguments.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_field_dynamic_sync(
+        &self,
+        object_type: &'doc ObjectType,
+        parent: &Value,
+        response_key: &'doc str,
+        nodes: &[&'doc ast::Field<'doc>],
+        hint: Option<&'doc crate::types::Field>,
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> Option<(Arc<str>, Result<Value, GraphQLError>)> {
+        let Some(first) = nodes.first().copied() else {
+            return Some((
+                Arc::from(response_key),
+                Err(GraphQLError::new(format!(
+                    "No field node was provided for response key \"{response_key}\"."
+                ))),
+            ));
+        };
+        if meta_return_type(first.name).is_some() {
+            return None;
+        }
+        let key: Arc<str> = match (hint, first.alias) {
+            (Some(field), None) => field.name.clone(),
+            _ => Arc::from(response_key),
+        };
+        path.push(PathSegment::Field(key));
+        let outcome = self.execute_field_inner_dynamic_sync(
+            object_type,
+            hint,
+            parent,
+            first,
+            nodes,
+            path,
+            errors,
+            depth,
+        );
+        Some((pop_field_key(path), outcome?))
+    }
+
+    /// [`Self::execute_field_dynamic_sync`] with the path segment already pushed.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_field_inner_dynamic_sync(
+        &self,
+        object_type: &ObjectType,
+        field: Option<&crate::types::Field>,
+        parent: &Value,
+        first: &'doc ast::Field<'doc>,
+        nodes: &[&'doc ast::Field<'doc>],
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> Option<Result<Value, GraphQLError>> {
+        let location = first.location;
+        let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 2]> = match nodes {
+            [only] if only.selection_set.is_none() => SmallVec::new(),
+            _ => nodes
+                .iter()
+                .copied()
+                .filter_map(|node| node.selection_set.as_ref())
+                .collect(),
+        };
+        let selections = Selections::new(&selection_sets, None);
+        if self.expired() {
+            return Some(Err(GraphQLError::new(
+                "The operation timed out before it could finish.",
+            )
+            .with_path(path.to_vec())
+            .at(location)));
+        }
+
+        let Some(field) = field else {
+            let error = GraphQLError::new(format!(
+                "Cannot query field \"{}\" on type \"{}\".",
+                first.name, object_type.name
+            ))
+            .at(location);
+            return Some(finish_field(
+                Err(error),
+                None,
+                path,
+                location,
+                errors,
+                self.context.max_errors,
+            ));
+        };
+
+        if field.resolve.is_some() || self.context.authorizer.is_some() {
+            return None;
+        }
+
+        let label = FieldLabel {
+            parent: object_type.name.as_ref(),
+            name: field.name.as_ref(),
+        };
+        if !(first.arguments.is_empty() && field.args.is_empty()) {
+            let mut args = Object::with_capacity(field.args.len());
+            if let Err(error) = coerce::coerce_argument_values_into(
+                &self.context.schema,
+                field,
+                first,
+                &self.context.variables,
+                &mut args,
+            ) {
+                return Some(finish_field(
+                    Err(error),
+                    Some(&field.ty),
+                    path,
+                    location,
+                    errors,
+                    self.context.max_errors,
+                ));
+            }
+        }
+
+        let definition = field
+            .type_index
+            .and_then(|index| self.context.schema.type_at(index));
+        let outcome = match default_property(label, field.name.as_ref(), parent).map(property_value)
+        {
+            Ok(value) => self.complete_field_value_typed_sync(
+                &value,
+                &field.ty,
+                definition,
+                label,
+                &selections,
+                location,
+                path,
+                errors,
+                depth,
+            )?,
+            Err(error) => Err(error),
+        };
+        Some(finish_field(
+            outcome,
+            Some(&field.ty),
+            path,
+            location,
+            errors,
+            self.context.max_errors,
+        ))
     }
 
     /// Complete an unaliased built-in scalar property, when the field is one.
@@ -2003,23 +2115,23 @@ impl<'doc> Executor<'doc> {
         Some((field.name.clone(), serialized))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn execute_field_sync(
+    /// Complete one planned field without awaiting.
+    fn planned_field_sync(
         &self,
         object_type: &'doc ObjectType,
         parent: &Value,
-        response_key: &'doc str,
-        nodes: &[&'doc ast::Field<'doc>],
-        hint: Option<&'doc crate::types::Field>,
+        group: &'doc plan::FieldGroup<'doc>,
+        variant: &'doc plan::Variant<'doc>,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
         depth: usize,
     ) -> Option<(Arc<str>, Result<Value, GraphQLError>)> {
-        let Some(first) = nodes.first().copied() else {
+        let Some(first) = variant.nodes.first() else {
             return Some((
-                Arc::from(response_key),
+                Arc::from(group.response_key()),
                 Err(GraphQLError::new(format!(
-                    "No field node was provided for response key \"{response_key}\"."
+                    "No field node was provided for response key \"{}\".",
+                    group.response_key()
                 ))),
             ));
         };
@@ -2027,50 +2139,29 @@ impl<'doc> Executor<'doc> {
         if meta_return_type(first.name).is_some() {
             return None;
         }
-        let field = match hint {
-            Some(field) => Some(field),
-            None => object_type.get_field(first.name),
-        };
-        let key: Arc<str> = match (field, first.alias) {
-            (Some(field), None) => field.name.clone(),
-            _ => Arc::from(response_key),
-        };
+        let field = group.field(object_type);
+        let key = group.key(field);
         path.push(PathSegment::Field(key));
-        let outcome = self.execute_field_inner_sync(
-            object_type,
-            field,
-            parent,
-            first,
-            nodes,
-            path,
-            errors,
-            depth,
-        );
+        let outcome =
+            self.planned_field_inner_sync(object_type, group, variant, parent, path, errors, depth);
         Some((pop_field_key(path), outcome?))
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn execute_field_inner_sync(
+    fn planned_field_inner_sync(
         &self,
         object_type: &ObjectType,
-        field: Option<&crate::types::Field>,
+        group: &plan::FieldGroup<'doc>,
+        variant: &'doc plan::Variant<'doc>,
         parent: &Value,
-        first: &ast::Field<'_>,
-        nodes: &[&'doc ast::Field<'doc>],
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
         depth: usize,
     ) -> Option<Result<Value, GraphQLError>> {
+        let first = variant.nodes.first()?;
         let location = first.location;
-        // A single leaf node collects no selection sets, which is the majority of fields and
-        // does not need to build (or even walk) the list.
-        let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 2]> = match nodes {
-            [only] if only.selection_set.is_none() => SmallVec::new(),
-            _ => nodes
-                .iter()
-                .filter_map(|node| node.selection_set.as_ref())
-                .collect(),
-        };
+        let selection_sets = variant.selection_sets();
+        let selections = Selections::new(&selection_sets, variant.child);
 
         if self.expired() {
             return Some(Err(GraphQLError::new(
@@ -2080,7 +2171,7 @@ impl<'doc> Executor<'doc> {
             .at(location)));
         }
 
-        let Some(field) = field else {
+        let Some(field) = group.field(object_type) else {
             let error = GraphQLError::new(format!(
                 "Cannot query field \"{}\" on type \"{}\".",
                 first.name, object_type.name
@@ -2107,26 +2198,17 @@ impl<'doc> Executor<'doc> {
             name: field.name.as_ref(),
         };
         // The default resolver ignores arguments, but they are coerced so that a field with
-        // arguments reports exactly the errors the async path would. An empty argument list cannot
-        // fail, so the common case skips building an object nothing reads.
-        if !(first.arguments.is_empty() && field.args.is_empty()) {
-            let mut args = Object::with_capacity(field.args.len());
-            if let Err(error) = coerce::coerce_argument_values_into(
-                &self.context.schema,
-                field,
-                first,
-                &self.context.variables,
-                &mut args,
-            ) {
-                return Some(finish_field(
-                    Err(error),
-                    Some(&field.ty),
-                    path,
-                    location,
-                    errors,
-                    self.context.max_errors,
-                ));
-            }
+        // arguments reports exactly the errors the async path would.
+        let mut args = Object::with_capacity(field.args.len());
+        if let Err(error) = self.planned_field_arguments(group, first, field, &mut args) {
+            return Some(finish_field(
+                Err(error),
+                Some(&field.ty),
+                path,
+                location,
+                errors,
+                self.context.max_errors,
+            ));
         }
 
         // The schema resolved this field's output type when it was built, so completing the field
@@ -2136,22 +2218,17 @@ impl<'doc> Executor<'doc> {
             .and_then(|index| self.context.schema.type_at(index));
         let outcome = match default_property(label, field.name.as_ref(), parent).map(property_value)
         {
-            Ok(value) => {
-                // `?` on the typed path only propagates "needs the asynchronous path", which
-                // abandons the attempt. The completion result itself is returned to `finish_field`
-                // below so null propagation and error recording stay identical to the async path.
-                self.complete_field_value_typed_sync(
-                    &value,
-                    &field.ty,
-                    definition,
-                    label,
-                    &selection_sets,
-                    location,
-                    path,
-                    errors,
-                    depth,
-                )?
-            }
+            Ok(value) => self.complete_field_value_typed_sync(
+                &value,
+                &field.ty,
+                definition,
+                label,
+                &selections,
+                location,
+                path,
+                errors,
+                depth,
+            )?,
             Err(error) => Err(error),
         };
         Some(finish_field(
@@ -2162,6 +2239,29 @@ impl<'doc> Executor<'doc> {
             errors,
             self.context.max_errors,
         ))
+    }
+
+    /// Coerce a planned field's arguments from its compiled template.
+    fn planned_field_arguments(
+        &self,
+        group: &plan::FieldGroup<'doc>,
+        first: &ast::Field<'_>,
+        field: &crate::types::Field,
+        args: &mut Object,
+    ) -> Result<(), GraphQLError> {
+        if let Some(template) = group.args() {
+            return template.fill(&self.context.variables, args);
+        }
+        if first.arguments.is_empty() && field.args.is_empty() {
+            return Ok(());
+        }
+        coerce::coerce_argument_values_into(
+            &self.context.schema,
+            field,
+            first,
+            &self.context.variables,
+            args,
+        )
     }
 
     /// [`Self::complete_field_value_sync`] with the field's named output type already resolved.
@@ -2177,7 +2277,7 @@ impl<'doc> Executor<'doc> {
         ty: &TypeRef,
         definition: Option<&'doc Type>,
         label: FieldLabel<'_>,
-        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        selections: &Selections<'_, 'doc>,
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
@@ -2185,14 +2285,7 @@ impl<'doc> Executor<'doc> {
     ) -> Option<Result<Value, GraphQLError>> {
         let Some(definition) = definition else {
             return self.complete_field_value_sync(
-                value,
-                ty,
-                label,
-                selection_sets,
-                location,
-                path,
-                errors,
-                depth,
+                value, ty, label, selections, location, path, errors, depth,
             );
         };
         let mut current = ty;
@@ -2202,16 +2295,8 @@ impl<'doc> Executor<'doc> {
             current = inner;
         }
         if value.is_null() {
-            return self.complete_value_sync(
-                value,
-                ty,
-                label,
-                selection_sets,
-                location,
-                path,
-                errors,
-                depth,
-            );
+            return self
+                .complete_value_sync(value, ty, label, selections, location, path, errors, depth);
         }
         match (definition, current) {
             // The built-in scalars are the overwhelming majority of leaves, and their value needs
@@ -2231,7 +2316,7 @@ impl<'doc> Executor<'doc> {
                 object,
                 value,
                 label,
-                selection_sets,
+                selections,
                 location,
                 path,
                 errors,
@@ -2244,14 +2329,7 @@ impl<'doc> Executor<'doc> {
                 };
                 if !matches!(element, TypeRef::Named(_)) {
                     return self.complete_value_sync(
-                        value,
-                        ty,
-                        label,
-                        selection_sets,
-                        location,
-                        path,
-                        errors,
-                        depth,
+                        value, ty, label, selections, location, path, errors, depth,
                     );
                 }
                 self.complete_object_list_sync(
@@ -2259,23 +2337,15 @@ impl<'doc> Executor<'doc> {
                     items_non_null,
                     value,
                     label,
-                    selection_sets,
+                    selections,
                     location,
                     path,
                     errors,
                     depth + 1,
                 )
             }
-            _ => self.complete_value_sync(
-                value,
-                ty,
-                label,
-                selection_sets,
-                location,
-                path,
-                errors,
-                depth,
-            ),
+            _ => self
+                .complete_value_sync(value, ty, label, selections, location, path, errors, depth),
         }
     }
 
@@ -2286,7 +2356,7 @@ impl<'doc> Executor<'doc> {
         value: &Value,
         ty: &TypeRef,
         label: FieldLabel<'_>,
-        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        selections: &Selections<'_, 'doc>,
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
@@ -2298,7 +2368,7 @@ impl<'doc> Executor<'doc> {
                     object,
                     value,
                     label,
-                    selection_sets,
+                    selections,
                     location,
                     path,
                     errors,
@@ -2311,7 +2381,7 @@ impl<'doc> Executor<'doc> {
                     items_non_null,
                     value,
                     label,
-                    selection_sets,
+                    selections,
                     location,
                     path,
                     errors,
@@ -2319,16 +2389,7 @@ impl<'doc> Executor<'doc> {
                 );
             }
         }
-        self.complete_value_sync(
-            value,
-            ty,
-            label,
-            selection_sets,
-            location,
-            path,
-            errors,
-            depth,
-        )
+        self.complete_value_sync(value, ty, label, selections, location, path, errors, depth)
     }
 
     /// [`Self::complete_value`] without awaiting.
@@ -2341,7 +2402,7 @@ impl<'doc> Executor<'doc> {
         value: &Value,
         ty: &TypeRef,
         label: FieldLabel<'_>,
-        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        selections: &Selections<'_, 'doc>,
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
@@ -2366,28 +2427,14 @@ impl<'doc> Executor<'doc> {
         }
         let completed = match current {
             TypeRef::List(inner) => match self.complete_list_sync(
-                value,
-                inner,
-                label,
-                selection_sets,
-                location,
-                path,
-                errors,
-                depth,
+                value, inner, label, selections, location, path, errors, depth,
             ) {
                 Some(Ok(value)) => value,
                 Some(Err(error)) => return Some(Err(error)),
                 None => return None,
             },
             TypeRef::Named(name) => match self.complete_named_sync(
-                value,
-                name,
-                label,
-                selection_sets,
-                location,
-                path,
-                errors,
-                depth,
+                value, name, label, selections, location, path, errors, depth,
             ) {
                 Some(Ok(value)) => value,
                 Some(Err(error)) => return Some(Err(error)),
@@ -2419,7 +2466,7 @@ impl<'doc> Executor<'doc> {
         items_non_null: bool,
         value: &Value,
         label: FieldLabel<'_>,
-        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        selections: &Selections<'_, 'doc>,
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
@@ -2440,10 +2487,10 @@ impl<'doc> Executor<'doc> {
         // which reports exactly the error (or null item) it reported before; a collection failure
         // (only reachable for a document that was never validated) is reported once for the field
         // rather than once per item.
-        let collected = if selection_sets.is_empty() {
+        let collected = if selections.is_empty() {
             None
         } else {
-            match self.collect_object_sync(object, label, selection_sets, location, path, depth)? {
+            match self.collect_object_sync(object, label, selections, location, path, depth)? {
                 Ok(collected) => Some(collected),
                 Err(error) => return Some(Err(error)),
             }
@@ -2467,14 +2514,7 @@ impl<'doc> Executor<'doc> {
                         object, item, label, collected, location, path, errors, depth,
                     ),
                     None => self.complete_object_sync(
-                        object,
-                        item,
-                        label,
-                        selection_sets,
-                        location,
-                        path,
-                        errors,
-                        depth,
+                        object, item, label, selections, location, path, errors, depth,
                     ),
                 };
                 match done {
@@ -2509,16 +2549,15 @@ impl<'doc> Executor<'doc> {
         &self,
         object: &'doc ObjectType,
         label: FieldLabel<'_>,
-        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        selections: &Selections<'_, 'doc>,
         location: Location,
         path: &mut Path,
         depth: usize,
     ) -> Option<Result<collect::CollectedFields<'doc>, GraphQLError>> {
-        if depth >= SYNC_DEPTH_LIMIT || object.fields.values().any(|field| field.resolve.is_some())
-        {
+        if depth >= SYNC_DEPTH_LIMIT || self.type_has_resolvers(selections.source, object) {
             return None;
         }
-        if selection_sets.is_empty() {
+        if selections.is_empty() {
             return Some(Err(located(
                 format!(
                     "Field {label} of type \"{}\" must have a selection set.",
@@ -2528,13 +2567,42 @@ impl<'doc> Executor<'doc> {
                 location,
             )));
         }
+        if self.plans.is_none() {
+            return Some(
+                collect::collect_dynamic(
+                    &self.context.schema,
+                    &self.fragments,
+                    &self.context.variables,
+                    object,
+                    selections.sets,
+                )
+                .map(CollectedFields::Dynamic),
+            );
+        }
         Some(collect::collect_fields_multi(
             &self.context.schema,
             &self.fragments,
             &self.context.variables,
             object,
-            selection_sets,
+            selections,
+            self.plans,
         ))
+    }
+
+    /// Whether a type defines any resolver, which forces the asynchronous completion path.
+    ///
+    /// A planned source already recorded the answer at preparation, so the common case avoids
+    /// scanning the object type's field map for every completed object.
+    fn type_has_resolvers(&self, source: Option<u32>, object_type: &ObjectType) -> bool {
+        if let (Some(plan), Some(source)) = (self.plans, source) {
+            if let Some(field_plan) = plan.field_plan(source, object_type) {
+                return field_plan.has_resolvers;
+            }
+        }
+        object_type
+            .fields
+            .values()
+            .any(|field| field.resolve.is_some())
     }
 
     /// [`Self::complete_object`] without awaiting.
@@ -2546,14 +2614,14 @@ impl<'doc> Executor<'doc> {
         object: &'doc ObjectType,
         value: &Value,
         label: FieldLabel<'_>,
-        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        selections: &Selections<'_, 'doc>,
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
         depth: usize,
     ) -> Option<Result<Value, GraphQLError>> {
         let collected =
-            match self.collect_object_sync(object, label, selection_sets, location, path, depth)? {
+            match self.collect_object_sync(object, label, selections, location, path, depth)? {
                 Ok(collected) => collected,
                 Err(error) => return Some(Err(error)),
             };
@@ -2590,7 +2658,15 @@ impl<'doc> Executor<'doc> {
                 location,
             )));
         }
-        match self.execute_fields_sync(object, value, collected, path, errors, depth) {
+        let outcome = match collected {
+            CollectedFields::Planned(plan) => {
+                self.planned_fields_sync(plan, object, value, path, errors, depth)
+            }
+            CollectedFields::Dynamic(fields) => {
+                self.execute_fields_sync(fields, object, value, path, errors, depth)
+            }
+        };
+        match outcome {
             Ok(Ok(completed)) => Some(Ok(Value::Object(completed))),
             Ok(Err(_)) => None,
             Err(error) => Some(Err(error)),
@@ -2604,7 +2680,7 @@ impl<'doc> Executor<'doc> {
         value: &Value,
         inner: &TypeRef,
         label: FieldLabel<'_>,
-        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        selections: &Selections<'_, 'doc>,
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
@@ -2629,7 +2705,7 @@ impl<'doc> Executor<'doc> {
                     object,
                     item,
                     label,
-                    selection_sets,
+                    selections,
                     location,
                     path,
                     errors,
@@ -2642,14 +2718,7 @@ impl<'doc> Executor<'doc> {
                     }
                 },
                 _ => match self.complete_item_sync(
-                    item,
-                    inner,
-                    label,
-                    selection_sets,
-                    location,
-                    path,
-                    errors,
-                    depth,
+                    item, inner, label, selections, location, path, errors, depth,
                 ) {
                     Some(outcome) => outcome,
                     None => {
@@ -2680,7 +2749,7 @@ impl<'doc> Executor<'doc> {
         item: &Value,
         inner: &TypeRef,
         label: FieldLabel<'_>,
-        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        selections: &Selections<'_, 'doc>,
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
@@ -2707,16 +2776,9 @@ impl<'doc> Executor<'doc> {
             // A list inside a list goes back through the boxed algorithm, which is what keeps
             // the completion future's size finite.
             TypeRef::List(_) => return None,
-            TypeRef::Named(name) => match self.complete_named_sync(
-                item,
-                name,
-                label,
-                selection_sets,
-                location,
-                path,
-                errors,
-                depth,
-            ) {
+            TypeRef::Named(name) => match self
+                .complete_named_sync(item, name, label, selections, location, path, errors, depth)
+            {
                 Some(Ok(value)) => value,
                 Some(Err(error)) => return Some(Err(error)),
                 None => return None,
@@ -2746,7 +2808,7 @@ impl<'doc> Executor<'doc> {
         value: &Value,
         name: &crate::types::Name,
         label: FieldLabel<'_>,
-        selection_sets: &[&'doc ast::SelectionSet<'doc>],
+        selections: &Selections<'_, 'doc>,
         location: Location,
         path: &mut Path,
         errors: &mut Vec<GraphQLError>,
@@ -2807,7 +2869,7 @@ impl<'doc> Executor<'doc> {
                 object,
                 value,
                 label,
-                selection_sets,
+                selections,
                 location,
                 path,
                 errors,
@@ -3042,6 +3104,20 @@ fn default_property<'v>(
 /// borrowed so completion reads the parent's value in place.
 fn property_value<'v>(value: Option<&'v Value>) -> Cow<'v, Value> {
     value.map_or(Cow::Owned(Value::Null), Cow::Borrowed)
+}
+
+/// The value a planned scalar property passes through unchanged.
+///
+/// This is [`builtin_scalar_passthrough`] with the scalar already identified at preparation, so a
+/// scalar leaf costs one shape check and a clone.
+fn scalar_shape(kind: plan::ScalarKind, value: &Value) -> Option<Value> {
+    let matches = match kind {
+        plan::ScalarKind::String => matches!(value, Value::String(_)),
+        plan::ScalarKind::Int => matches!(value, Value::Int(_)),
+        plan::ScalarKind::Boolean => matches!(value, Value::Boolean(_)),
+        plan::ScalarKind::Float => matches!(value, Value::Float(number) if number.is_finite()),
+    };
+    matches.then(|| value.clone())
 }
 
 /// A value a built-in scalar serialises to itself.

@@ -18,6 +18,7 @@ use crate::{
 
 use super::{
     ExecutionContext, ExecutionOptions, coerce, executor,
+    plan::{self, PreparedPlan},
     subscription::{EventHandler, subscribe_document},
 };
 
@@ -40,6 +41,8 @@ pub(crate) struct PreparedDocument<'a> {
     /// The selected operation's variable definitions, compiled once. `None` when they could not be
     /// compiled, in which case the general per-request coercion path is used.
     pub(crate) variables: Option<coerce::CompiledVariables>,
+    /// The precompiled field collection plan for the selected operation.
+    pub(crate) plan: PreparedPlan<'a>,
 }
 
 impl<'a> PreparedDocument<'a> {
@@ -57,11 +60,11 @@ impl<'a> PreparedDocument<'a> {
 }
 
 /// Execute a prepared document through the normal execution tail.
-pub(crate) async fn execute(
-    schema: &Schema,
-    prepared: &PreparedDocument<'_>,
+pub(crate) async fn execute<'a>(
+    schema: &'a Schema,
+    prepared: &'a PreparedDocument<'a>,
     operation_name: Option<Arc<str>>,
-    root_type: &ObjectType,
+    root_type: &'a ObjectType,
     request_variables: Option<&crate::Object>,
     options: &ExecutionOptions,
 ) -> Response {
@@ -78,6 +81,7 @@ pub(crate) async fn execute(
         &prepared.document,
         operation,
         operation_name,
+        &prepared.plan,
         root_type,
         prepared.static_complexity.as_ref(),
         prepared.variables.as_ref(),
@@ -88,9 +92,9 @@ pub(crate) async fn execute(
 }
 
 /// Execute one subscription event against the prepared document.
-pub(crate) async fn execute_event(
-    context: &ExecutionContext,
-    prepared: &PreparedDocument<'_>,
+pub(crate) async fn execute_event<'a>(
+    context: &'a ExecutionContext,
+    prepared: &'a PreparedDocument<'a>,
     event: Value,
     deadline: Option<Instant>,
 ) -> Response {
@@ -108,6 +112,7 @@ pub(crate) async fn execute_event(
     executor::run_operation(
         context,
         fragments,
+        Some(&prepared.plan),
         root_type,
         &operation.selection_set,
         event,
@@ -182,6 +187,18 @@ pub(crate) fn build<'a>(
         _ => None,
     };
 
+    // The document is fixed, so the field collection it implies (fragment expansion, directive
+    // conditions, merged selections and resolved schema fields) is computed once here. Anything
+    // the plan cannot model exactly stays unplanned and execution falls back to dynamic
+    // collection for it.
+    let plan = match document.definitions.get(operation_index) {
+        Some(ast::Definition::Operation(operation)) => match root_type(schema, operation.kind) {
+            Ok(root) => plan::build(schema, &document, operation, &root),
+            Err(_) => plan::build_empty(),
+        },
+        _ => plan::build_empty(),
+    };
+
     let introspection_error = if uses_introspection(&document) {
         validation::validate(
             schema,
@@ -204,6 +221,7 @@ pub(crate) fn build<'a>(
         introspection_error,
         static_complexity,
         variables,
+        plan,
     })
 }
 
@@ -299,13 +317,15 @@ pub(crate) struct PreparedExecution<'a> {
     pub(crate) static_complexity: Option<&'a StaticComplexity>,
     /// The selected operation's compiled variable definitions.
     pub(crate) variables: Option<&'a coerce::CompiledVariables>,
+    /// The precompiled field collection plan.
+    pub(crate) plan: &'a PreparedPlan<'a>,
 }
 
 /// Start a subscription from a prepared document.
 #[allow(clippy::result_large_err)]
-pub(crate) async fn subscribe(
-    schema: &Schema,
-    prepared: &PreparedDocument<'_>,
+pub(crate) async fn subscribe<'a>(
+    schema: &'a Schema,
+    prepared: &'a PreparedDocument<'a>,
     operation_name: Option<Arc<str>>,
     request_variables: Option<&crate::Object>,
     options: &ExecutionOptions,
@@ -323,6 +343,7 @@ pub(crate) async fn subscribe(
         operation_name,
         static_complexity: prepared.static_complexity.as_ref(),
         variables: prepared.variables.as_ref(),
+        plan: &prepared.plan,
     };
     subscribe_document(
         schema,
