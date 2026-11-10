@@ -96,7 +96,14 @@ fn plain(query: &str) -> Complexity {
 
 #[test]
 fn uses_field_estimators() {
-    assert_eq!(plain("{ ping }"), Complexity { cost: 5, depth: 1 });
+    assert_eq!(
+        plain("{ ping }"),
+        Complexity {
+            cost: 5,
+            depth: 1,
+            breadth: 1
+        }
+    );
 }
 
 #[test]
@@ -106,7 +113,8 @@ fn estimators_receive_coerced_arguments() {
         plain("{ users { friends(first: 5) { name } } }"),
         Complexity {
             cost: 171,
-            depth: 3
+            depth: 3,
+            breadth: 1
         }
     );
 }
@@ -115,7 +123,11 @@ fn estimators_receive_coerced_arguments() {
 fn multiplies_list_fields() {
     assert_eq!(
         plain("{ users { name } }"),
-        Complexity { cost: 11, depth: 2 }
+        Complexity {
+            cost: 11,
+            depth: 2,
+            breadth: 1
+        }
     );
 }
 
@@ -123,66 +135,126 @@ fn multiplies_list_fields() {
 fn multiplies_every_list_nesting_level() {
     assert_eq!(
         plain("{ matrix }"),
-        Complexity { cost: 1, depth: 1 },
+        Complexity {
+            cost: 1,
+            depth: 1,
+            breadth: 1
+        },
         "a leaf list field only costs its base cost"
     );
     assert_eq!(
         plain("{ users { friends { name } } }"),
         Complexity {
             cost: 121,
-            depth: 3
+            depth: 3,
+            breadth: 1
         }
     );
 }
 
 #[test]
 fn merges_duplicate_response_keys() {
-    assert_eq!(plain("{ ping ping }"), Complexity { cost: 5, depth: 1 });
+    assert_eq!(
+        plain("{ ping ping }"),
+        Complexity {
+            cost: 5,
+            depth: 1,
+            breadth: 1
+        }
+    );
     assert_eq!(
         plain("{ a: ping a: ping }"),
-        Complexity { cost: 5, depth: 1 }
+        Complexity {
+            cost: 5,
+            depth: 1,
+            breadth: 1
+        }
     );
     assert_eq!(
         plain("{ a: ping b: ping }"),
-        Complexity { cost: 10, depth: 1 }
+        Complexity {
+            cost: 10,
+            depth: 1,
+            breadth: 2
+        }
     );
 }
 
 #[test]
 fn expands_fragments_without_adding_depth() {
     let fragment = "query { user(id: \"1\") { ...F } } fragment F on User { name }";
-    assert_eq!(plain(fragment), Complexity { cost: 2, depth: 2 });
+    assert_eq!(
+        plain(fragment),
+        Complexity {
+            cost: 2,
+            depth: 2,
+            breadth: 1
+        }
+    );
 }
 
 #[test]
 fn survives_fragment_cycles() {
     let cycle = "{ ...A } fragment A on Query { ping ...B } fragment B on Query { ...A }";
-    assert_eq!(plain(cycle), Complexity { cost: 5, depth: 1 });
+    assert_eq!(
+        plain(cycle),
+        Complexity {
+            cost: 5,
+            depth: 1,
+            breadth: 1
+        }
+    );
 }
 
 #[test]
 fn applies_type_conditions() {
     let union = "{ search { ... on User { name } ... on Post { title } } }";
-    assert_eq!(plain(union), Complexity { cost: 21, depth: 2 });
+    assert_eq!(
+        plain(union),
+        Complexity {
+            cost: 21,
+            depth: 2,
+            breadth: 2
+        }
+    );
 
     // `User` and `Post` never overlap, so this fragment cannot contribute a field.
     let impossible = "{ user(id: \"1\") { ... on Post { title } } }";
-    assert_eq!(plain(impossible), Complexity { cost: 1, depth: 2 });
+    assert_eq!(
+        plain(impossible),
+        Complexity {
+            cost: 1,
+            depth: 2,
+            breadth: 1
+        }
+    );
 }
 
 #[test]
 fn honours_skip_and_include_literals() {
     assert_eq!(
         plain("{ ping @skip(if: true) users { name } }"),
-        Complexity { cost: 11, depth: 2 }
+        Complexity {
+            cost: 11,
+            depth: 2,
+            breadth: 1
+        }
     );
     assert_eq!(
         plain("{ ping @include(if: false) }"),
-        Complexity { cost: 0, depth: 1 }
+        Complexity {
+            cost: 0,
+            depth: 1,
+            breadth: 0
+        }
     );
     assert_eq!(
         plain("{ ping @include(if: true) }"),
-        Complexity { cost: 5, depth: 1 }
+        Complexity {
+            cost: 5,
+            depth: 1,
+            breadth: 1
+        }
     );
 }
 
@@ -198,7 +270,11 @@ fn honours_skip_and_include_variables() {
             options
         )
         .unwrap(),
-        Complexity { cost: 0, depth: 1 }
+        Complexity {
+            cost: 0,
+            depth: 1,
+            breadth: 0
+        }
     );
 
     let included = Object::from_fields([("v", Value::from(false))]);
@@ -210,7 +286,11 @@ fn honours_skip_and_include_variables() {
             options
         )
         .unwrap(),
-        Complexity { cost: 5, depth: 1 }
+        Complexity {
+            cost: 5,
+            depth: 1,
+            breadth: 1
+        }
     );
 
     // A missing variable is treated as `false`.
@@ -222,7 +302,11 @@ fn honours_skip_and_include_variables() {
             options
         )
         .unwrap(),
-        Complexity { cost: 5, depth: 1 }
+        Complexity {
+            cost: 5,
+            depth: 1,
+            breadth: 1
+        }
     );
     assert_eq!(
         analyze(
@@ -232,7 +316,11 @@ fn honours_skip_and_include_variables() {
             options
         )
         .unwrap(),
-        Complexity { cost: 0, depth: 1 }
+        Complexity {
+            cost: 0,
+            depth: 1,
+            breadth: 0
+        }
     );
 }
 
@@ -262,6 +350,43 @@ fn enforces_complexity_limits() {
     let error = analyze("{ ping }", None, Object::new(), options).unwrap_err();
     assert!(error.message().contains('5'), "{}", error.message());
     assert!(error.message().contains('4'), "{}", error.message());
+}
+
+#[test]
+fn enforces_breadth_limits() {
+    let options = ComplexityOptions {
+        max_breadth: 2,
+        ..ComplexityOptions::default()
+    };
+    // Three distinct response keys in one selection set exceed a breadth of two.
+    let error = analyze("{ a: ping b: ping c: ping }", None, Object::new(), options).unwrap_err();
+    assert!(error.message().contains("breadth 3"), "{}", error.message());
+    assert!(
+        error.message().contains("maximum allowed breadth of 2"),
+        "{}",
+        error.message()
+    );
+
+    // Duplicate response keys merge and do not count towards breadth.
+    assert_eq!(
+        analyze("{ a: ping a: ping b: ping }", None, Object::new(), options)
+            .unwrap()
+            .breadth,
+        2
+    );
+
+    // Breadth is the widest selection set, not just the root.
+    assert_eq!(
+        analyze(
+            "{ users { name friends { name } } }",
+            None,
+            Object::new(),
+            options
+        )
+        .unwrap()
+        .breadth,
+        2
+    );
 }
 
 #[test]
@@ -296,7 +421,14 @@ fn rejects_unknown_and_ambiguous_operations() {
         options,
     )
     .unwrap();
-    assert_eq!(selected, Complexity { cost: 11, depth: 2 });
+    assert_eq!(
+        selected,
+        Complexity {
+            cost: 11,
+            depth: 2,
+            breadth: 1
+        }
+    );
 }
 
 #[test]

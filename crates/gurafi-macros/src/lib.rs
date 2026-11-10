@@ -3,7 +3,10 @@
 //! These macros let Rust types drive the GraphQL type system:
 //!
 //! - [`macro@Object`] registers a Rust struct as a GraphQL object type.
-//! - [`macro@Input`] registers a Rust struct as an input object (and as a field's arguments).
+//! - [`macro@Input`] registers a Rust struct as a field's arguments, or as a named input object
+//!   when it carries `#[graphql(name = "...")]`.
+//! - [`macro@Args`] is an alias for [`macro@Input`] that says the type is only a field's
+//!   arguments.
 //! - [`macro@Enum`] registers a Rust enum as a GraphQL enum.
 //! - [`macro@Scalar`] registers a newtype as a custom scalar delegating to its inner type.
 //! - [`macro@Union`] registers a Rust enum as a GraphQL union of object types.
@@ -54,18 +57,16 @@ pub fn derive_object(input: TokenStream) -> TokenStream {
         .into()
 }
 
-/// Derive a GraphQL input object.
+/// Derive a GraphQL input type.
 ///
-/// The type can be used as a field's arguments (`A: InputObject`) or nested inside another
-/// input type. Attribute support:
+/// # Arguments by default
 ///
-/// - `#[graphql(name = "...")]` renames the type or one of its fields.
-/// - `#[graphql(description = "...")]` (or a doc comment) sets a description.
-/// - `#[graphql(default = expr)]` sets a default value, typed as the field's Rust type.
-/// - `#[graphql(default_with = "path")]` computes the default by calling `path()`.
-/// - `#[graphql(deprecated)]` / `#[graphql(deprecated = "reason")]` deprecates a field.
+/// Without a name, the type is **args-only**: its fields become a field's arguments
+/// (`A: InputObject`) and no input object is registered in the schema. This is what an
+/// arguments struct should be — `friends(limit: 10, after: "...")` rather than a leaked
+/// `FriendsArgs` input type.
 ///
-/// `Option<T>` fields are optional; every other field without a default is required.
+/// A type that is also used nested inside another input object must be named:
 ///
 /// ```ignore
 /// use gurafi::Input;
@@ -76,9 +77,49 @@ pub fn derive_object(input: TokenStream) -> TokenStream {
 ///     limit: i32,
 ///     after: Option<String>,
 /// }
+///
+/// #[derive(Input)]
+/// #[graphql(name = "FilterInput")]
+/// struct Filter {
+///     prefix: Option<String>,
+/// }
+///
+/// #[derive(Input)]
+/// struct SearchArgs {
+///     filter: Option<Filter>, // requires FilterInput to exist
+/// }
 /// ```
+///
+/// Attribute support:
+///
+/// - `#[graphql(name = "...")]` makes the type a reusable named input object, or renames one of
+///   its fields.
+/// - `#[graphql(description = "...")]` (or a doc comment) sets a description.
+/// - `#[graphql(default = expr)]` sets a default value, typed as the field's Rust type.
+/// - `#[graphql(default_with = "path")]` computes the default by calling `path()`.
+/// - `#[graphql(deprecated)]` / `#[graphql(deprecated = "reason")]` deprecates a field.
+/// - `#[graphql(validate = "path")]` runs `path(&value)` after coercion. On the type it receives
+///   `&Self`; on a field it receives `&FieldType`. The function returns
+///   `Result<(), gql::GraphQLError>` and its error becomes a field error.
+/// - `#[graphql(one_of)]` marks a named input as a `@oneOf` input. Every field must be
+///   `Option<T>` and no field may have a default.
+///
+/// `Option<T>` fields are optional; every other field without a default is required.
 #[proc_macro_derive(Input, attributes(graphql))]
 pub fn derive_input(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    input::expand(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Derive a field's arguments type.
+///
+/// This is an alias for [`macro@Input`] in its default, args-only form. It exists to make the
+/// intent obvious at the declaration site; if the type later needs to be a reusable named input
+/// object, add `#[graphql(name = "...")]` and the behaviour is identical to [`macro@Input`].
+#[proc_macro_derive(Args, attributes(graphql))]
+pub fn derive_args(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     input::expand(input)
         .unwrap_or_else(syn::Error::into_compile_error)

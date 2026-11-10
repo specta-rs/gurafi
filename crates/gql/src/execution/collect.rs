@@ -117,7 +117,7 @@ fn collect_into<'a>(
                 "The query expands to too many fields to execute safely.",
             ));
         }
-        if !should_include(selection.directives(), variables)? {
+        if !should_include(selection.directives(), variables) {
             continue;
         }
         match selection {
@@ -269,49 +269,41 @@ impl<'a> VisitedFragments<'a> {
 }
 
 /// Evaluate `@skip` and `@include` for a selection.
-pub(crate) fn should_include(
-    directives: &[ast::Directive<'_>],
-    variables: &Object,
-) -> Result<bool, GraphQLError> {
+///
+/// A missing, null or non-boolean `if` value is treated as `false`, matching the complexity
+/// analyser and the reference implementation's `getDirectiveValues` behaviour. Validation reports
+/// malformed directive arguments before execution starts, so this only decides inclusion.
+pub(crate) fn should_include(directives: &[ast::Directive<'_>], variables: &Object) -> bool {
     for directive in directives {
         match directive.name {
-            "skip" | "include" => {
-                let Some(argument) = directive.argument("if") else {
-                    return Err(GraphQLError::new(format!(
-                        "Directive \"@{}\" requires an \"if\" argument.",
-                        directive.name
-                    ))
-                    .at(directive.location));
-                };
-                let value = boolean_value(&argument.value, variables).map_err(|message| {
-                    GraphQLError::new(format!("Directive \"@{}\": {message}", directive.name))
-                        .at(argument.location)
-                })?;
-                if directive.name == "skip" && value {
-                    return Ok(false);
-                }
-                if directive.name == "include" && !value {
-                    return Ok(false);
-                }
+            "skip"
+                if directive
+                    .argument("if")
+                    .is_some_and(|argument| boolean_value(&argument.value, variables)) =>
+            {
+                return false;
+            }
+            "include"
+                if directive
+                    .argument("if")
+                    .is_some_and(|argument| !boolean_value(&argument.value, variables)) =>
+            {
+                return false;
             }
             // Unknown directives are a validation concern; execution ignores them.
             _ => {}
         }
     }
-    Ok(true)
+    true
 }
 
-fn boolean_value(value: &ast::Value<'_>, variables: &crate::Object) -> Result<bool, String> {
+fn boolean_value(value: &ast::Value<'_>, variables: &crate::Object) -> bool {
     match value {
-        ast::Value::Boolean(value) => Ok(*value),
-        ast::Value::Variable(name) => match variables.get(name) {
-            Some(Value::Boolean(value)) => Ok(*value),
-            Some(value) => Err(format!(
-                "variable \"${name}\" must be a Boolean, but it is a {}.",
-                value.kind()
-            )),
-            None => Err(format!("variable \"${name}\" was not provided.")),
-        },
-        _ => Err("\"if\" must be a Boolean.".to_owned()),
+        ast::Value::Boolean(value) => *value,
+        ast::Value::Variable(name) => variables
+            .get(name)
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        _ => false,
     }
 }

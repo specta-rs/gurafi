@@ -4,6 +4,11 @@
 //! are coerced by [`coerce_variable_values`], while field arguments are literals in the document
 //! and are coerced by [`coerce_argument_values`]. Both funnel into the same type-directed rules so
 //! custom scalars, enums and nested input objects behave identically everywhere.
+//!
+//! Document literals can carry integers up to `i128` (see [`crate::ast::Value::Int`]), which lets
+//! custom scalars receive values beyond the 32-bit `Int` range. JSON variable conversion happens
+//! in the transport layer (for example `suku`), outside this crate; those transports must stop
+//! narrowing JSON integers to `i32` before a custom scalar can receive a larger variable value.
 
 use std::sync::Arc;
 

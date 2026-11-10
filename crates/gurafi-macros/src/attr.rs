@@ -13,6 +13,10 @@ pub struct TypeAttrs {
     pub description: Option<LitStr>,
     /// `#[graphql(specified_by = "...")]`, only meaningful on scalars.
     pub specified_by: Option<LitStr>,
+    /// `#[graphql(one_of)]`, only meaningful on input objects.
+    pub one_of: bool,
+    /// `#[graphql(validate = "path")]`, only meaningful on input objects.
+    pub validate: Option<Path>,
 }
 
 /// Attributes accepted on an input field or enum variant.
@@ -29,6 +33,25 @@ pub struct FieldAttrs {
     /// Deprecation reason. `None` means not deprecated, `Some(None)` means deprecated with
     /// the default reason.
     pub deprecated: Option<Option<LitStr>>,
+    /// `#[graphql(validate = "path")]`, only meaningful on input fields.
+    pub validate: Option<Path>,
+}
+
+/// Reject attributes that only make sense on an input object.
+pub fn reject_input_only(attrs: &TypeAttrs, spanned: impl quote::ToTokens) -> syn::Result<()> {
+    if attrs.one_of {
+        return Err(syn::Error::new_spanned(
+            spanned,
+            "`one_of` only applies to `#[derive(Input)]`",
+        ));
+    }
+    if attrs.validate.is_some() {
+        return Err(syn::Error::new_spanned(
+            spanned,
+            "`validate` only applies to `#[derive(Input)]`",
+        ));
+    }
+    Ok(())
 }
 
 /// Parse the type-level attributes of a derive input.
@@ -48,10 +71,16 @@ pub fn parse_type_attrs(attrs: &[Attribute]) -> syn::Result<TypeAttrs> {
             } else if meta.path.is_ident("specified_by") {
                 parsed.specified_by = Some(parse_lit_str(&meta)?);
                 Ok(())
+            } else if meta.path.is_ident("one_of") {
+                parsed.one_of = true;
+                Ok(())
+            } else if meta.path.is_ident("validate") {
+                parsed.validate = Some(parse_path(&meta)?);
+                Ok(())
             } else {
                 Err(meta.error(
-                    "unsupported `#[graphql]` attribute here; expected `name`, `description` \
-                     or `specified_by`",
+                    "unsupported `#[graphql]` attribute here; expected `name`, `description`, \
+                     `specified_by`, `one_of` or `validate`",
                 ))
             }
         })?;
@@ -98,10 +127,13 @@ pub fn parse_field_attrs(attrs: &[Attribute]) -> syn::Result<FieldAttrs> {
                     parsed.deprecated = Some(None);
                 }
                 Ok(())
+            } else if meta.path.is_ident("validate") {
+                parsed.validate = Some(parse_path(&meta)?);
+                Ok(())
             } else {
                 Err(meta.error(
                     "unsupported `#[graphql]` attribute here; expected `name`, `description`, \
-                     `default`, `default_with` or `deprecated`",
+                     `default`, `default_with`, `deprecated` or `validate`",
                 ))
             }
         })?;
@@ -130,4 +162,11 @@ pub fn deprecation_reason(deprecated: &Option<Option<LitStr>>) -> Option<LitStr>
 
 fn parse_lit_str(meta: &ParseNestedMeta<'_>) -> syn::Result<LitStr> {
     meta.value()?.parse()
+}
+
+/// Parse `= "path::to::function"` into a path.
+fn parse_path(meta: &ParseNestedMeta<'_>) -> syn::Result<Path> {
+    let lit = parse_lit_str(meta)?;
+    lit.parse::<Path>()
+        .map_err(|error| syn::Error::new(lit.span(), format!("expected a function path: {error}")))
 }

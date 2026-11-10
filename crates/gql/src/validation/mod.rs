@@ -285,6 +285,26 @@ fn collect_spreads<'a>(selection_set: &'a SelectionSet<'a>, out: &mut SmallVec<[
     }
 }
 
+/// Whether constant `@skip`/`@include` directives remove a selection.
+///
+/// October 2021 5.2.3.1 counts root fields after evaluating `@skip`/`@include`. Validation has no
+/// runtime variables, so only literal booleans can remove a selection; a variable reference is
+/// treated as included (it may be true or false at execution time).
+fn excluded_by_constant_directives(directives: &[crate::ast::Directive<'_>]) -> bool {
+    fn constant_if(directive: &crate::ast::Directive<'_>) -> Option<bool> {
+        match &directive.argument("if")?.value {
+            crate::ast::Value::Boolean(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    directives.iter().any(|directive| match directive.name {
+        "skip" => constant_if(directive) == Some(true),
+        "include" => constant_if(directive) == Some(false),
+        _ => false,
+    })
+}
+
 fn collect_top_level_fields<'a>(
     fragments: &HashMap<&'a str, &'a FragmentDefinition<'a>>,
     selection_set: &'a SelectionSet<'a>,
@@ -292,6 +312,9 @@ fn collect_top_level_fields<'a>(
     out: &mut Vec<&'a Field<'a>>,
 ) {
     for selection in &selection_set.items {
+        if excluded_by_constant_directives(selection.directives()) {
+            continue;
+        }
         match selection {
             Selection::Field(field) => out.push(field),
             Selection::InlineFragment(fragment) => {

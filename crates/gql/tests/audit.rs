@@ -1763,15 +1763,49 @@ fn coverage_overlapping_fields_recurse_into_sub_selections() {
 }
 
 #[test]
-fn coverage_overlapping_fields_ignore_mutually_exclusive_object_types() {
+fn spec_overlapping_fields_still_check_response_shape_across_mutually_exclusive_objects() {
+    // October 2021 5.3.2: parentFieldsAreMutuallyExclusive only exempts the field *name* and
+    // *arguments* checks. SameResponseShape applies to every pair, because a client receives one
+    // response shape regardless of which object type is returned at runtime.
     let schema = sdl(r#"
-        type A { v: Int }
-        type B { v: String }
+        type A { v: Int, other: Int }
+        type B { v: String, other: Int }
         union Search = A | B
         type Query { search: Search }
         "#);
 
-    assert_valid(&schema, "{ search { ... on A { v } ... on B { v } } }");
+    assert_invalid(
+        &schema,
+        "{ search { ... on A { v } ... on B { v } } }",
+        "conflicting types",
+    );
+    // The same response key with different field names is still allowed on disjoint objects.
+    assert_valid(
+        &schema,
+        "{ search { ... on A { x: v } ... on B { x: other } } }",
+    );
+}
+
+#[test]
+fn spec_overlapping_fields_reject_alias_shape_conflicts_across_mutually_exclusive_objects() {
+    let schema = sdl(r#"
+        type Dog { nickname: String }
+        type Cat { meowVolume: Int }
+        union Pet = Dog | Cat
+        type Query { pet: Pet }
+        "#);
+
+    assert_invalid(
+        &schema,
+        "{ pet { ... on Dog { x: nickname } ... on Cat { x: meowVolume } } }",
+        "conflicting types",
+    );
+    // `__typename` is a String, so it conflicts with an Int field of the same response key.
+    assert_invalid(
+        &schema,
+        "{ pet { ... on Dog { x: __typename } ... on Cat { x: meowVolume } } }",
+        "conflicting types",
+    );
 }
 
 #[test]
@@ -1825,16 +1859,12 @@ fn coverage_variables_in_allowed_position() {
 }
 
 #[test]
-fn spec_argument_default_does_not_cover_a_list_item_variable() {
-    // October 2021 5.8.5 IsVariableUsageAllowed: HasLocationDefaultValue only considers the
-    // Argument or ObjectField where the variable is located. A variable inside a ListValue entry
-    // has no location default, so an argument default must not make `Int` acceptable at `Int!`.
+fn spec_argument_default_covers_a_variable_inside_a_list_literal() {
+    // graphql-js keeps the enclosing argument/input-field definition while it descends into list
+    // elements, so `g(xs: [$x])` sees the `[1]` default on `xs` and accepts a nullable `Int`
+    // variable where the list item type is `Int!`. This follows the reference implementation.
     let schema = sdl(r#"type Query { g(xs: [Int!] = [1]): String }"#);
-    assert_invalid(
-        &schema,
-        "query Q($x: Int) { g(xs: [$x]) }",
-        "used in position expecting type \"Int!\"",
-    );
+    assert_valid(&schema, "query Q($x: Int) { g(xs: [$x]) }");
 }
 
 #[test]
@@ -2821,8 +2851,11 @@ fn subscription_schema() -> Schema {
                 .field(Field::new("event", TypeRef::named("Event")).subscribe(|_| {
                     Box::pin(async {
                         Ok(futures::stream::iter(vec![
-                            Ok::<Value, GraphQLError>(object([("value", Value::from("ok"))])),
-                            Ok(Value::object(Object::new())),
+                            Ok::<Value, GraphQLError>(object([(
+                                "event",
+                                object([("value", Value::from("ok"))]),
+                            )])),
+                            Ok(object([("event", Value::object(Object::new()))])),
                         ])
                         .boxed())
                     })
@@ -2834,15 +2867,17 @@ fn subscription_schema() -> Schema {
                     )
                     .subscribe(|_| {
                         Box::pin(async {
+                            let event = object([(
+                                "events",
+                                Value::List(vec![
+                                    object([("value", Value::from("a"))]),
+                                    Value::object(Object::new()),
+                                    object([("value", Value::from("c"))]),
+                                ]),
+                            )]);
                             Ok(
-                                futures::stream::iter(vec![Ok::<Value, GraphQLError>(
-                                    Value::List(vec![
-                                        object([("value", Value::from("a"))]),
-                                        Value::object(Object::new()),
-                                        object([("value", Value::from("c"))]),
-                                    ]),
-                                )])
-                                .boxed(),
+                                futures::stream::iter(vec![Ok::<Value, GraphQLError>(event)])
+                                    .boxed(),
                             )
                         })
                     }),
@@ -2851,8 +2886,11 @@ fn subscription_schema() -> Schema {
                     Field::new("strict", TypeRef::named("Event").non_null()).subscribe(|_| {
                         Box::pin(async {
                             Ok(
-                                futures::stream::iter(vec![Ok::<Value, GraphQLError>(Value::Null)])
-                                    .boxed(),
+                                futures::stream::iter(vec![Ok::<Value, GraphQLError>(object([(
+                                    "strict",
+                                    Value::Null,
+                                )]))])
+                                .boxed(),
                             )
                         })
                     }),
@@ -2979,8 +3017,8 @@ fn coverage_subscription_events_resolve_abstract_types() {
                 Box::pin(async {
                     Ok(
                         futures::stream::iter(vec![Ok::<Value, GraphQLError>(object([(
-                            "id",
-                            Value::from("1"),
+                            "node",
+                            object([("id", Value::from("1"))]),
                         )]))])
                         .boxed(),
                     )

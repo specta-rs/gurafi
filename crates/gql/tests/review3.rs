@@ -90,6 +90,7 @@ fn complexity_undercounts_merged_cross_scope_field() {
             field_cost: 1,
             list_factor: 10,
             max_depth: 0,
+            max_breadth: 0,
         },
     );
     assert!(

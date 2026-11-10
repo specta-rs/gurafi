@@ -7,7 +7,7 @@
 
 use std::{borrow::Cow, sync::Arc};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use crate::{
@@ -29,6 +29,10 @@ pub struct ComplexityOptions {
     pub max_complexity: u32,
     /// Maximum selection depth. Zero disables the limit.
     pub max_depth: usize,
+    /// Maximum number of distinct fields in any one selection set after fragment expansion.
+    ///
+    /// This bounds wide, heavily aliased queries that stay shallow. Zero disables the limit.
+    pub max_breadth: usize,
 }
 
 impl Default for ComplexityOptions {
@@ -38,6 +42,7 @@ impl Default for ComplexityOptions {
             field_cost: 1,
             max_complexity: 0,
             max_depth: 0,
+            max_breadth: 0,
         }
     }
 }
@@ -49,6 +54,8 @@ pub struct Complexity {
     pub cost: u32,
     /// Selection-set depth.
     pub depth: usize,
+    /// The largest number of distinct response keys in any one selection set.
+    pub breadth: usize,
 }
 
 /// Estimate the cost of the selected operation.
@@ -73,6 +80,7 @@ pub fn analyze(
         options,
         fragment_cache: FragmentCache::new(),
         work: 0,
+        breadth: 0,
     };
     let mut active_fragments = SmallVec::new();
     let (cost, depth) = analyzer.analyze_selection(
@@ -81,6 +89,7 @@ pub fn analyze(
         1,
         &mut active_fragments,
     )?;
+    let breadth = analyzer.breadth;
 
     if options.max_complexity != 0 && cost > options.max_complexity {
         return Err(GraphQLError::new(format!(
@@ -94,8 +103,18 @@ pub fn analyze(
             options.max_depth
         )));
     }
+    if options.max_breadth != 0 && breadth > options.max_breadth {
+        return Err(GraphQLError::new(format!(
+            "Query breadth {breadth} exceeds the maximum allowed breadth of {}.",
+            options.max_breadth
+        )));
+    }
 
-    Ok(Complexity { cost, depth })
+    Ok(Complexity {
+        cost,
+        depth,
+        breadth,
+    })
 }
 
 /// Select the operation the caller asked for, using the same rules as execution.
@@ -234,6 +253,7 @@ struct Analyzer<'a, 'document, 'source> {
     options: &'a ComplexityOptions,
     fragment_cache: FragmentCache<'source, 'document>,
     work: u64,
+    breadth: usize,
 }
 
 impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
@@ -251,6 +271,7 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
         let mut collected: CollectedFields<'source, 'document> = SmallVec::new();
         let mut index = FieldIndex::new();
         self.collect_fields(items, scope, active_fragments, &mut collected, &mut index)?;
+        self.breadth = self.breadth.max(distinct_response_keys(&collected));
 
         // Every field in the set is looked up on the same parent type, so it is resolved once for
         // the set instead of once per field. A field merged from a fragment with a narrower scope
@@ -458,6 +479,30 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
         }
         true
     }
+}
+
+/// The number of distinct response keys in one collected selection set.
+///
+/// `collected` keeps one entry per (response key, fragment scope) so cost accounting stays
+/// conservative, but breadth counts response keys: a field selected again through a narrower
+/// fragment does not make the set wider.
+fn distinct_response_keys(fields: &[CollectedField<'_, '_>]) -> usize {
+    let mut small: SmallVec<[&str; 16]> = SmallVec::new();
+    let mut large: Option<FxHashSet<&str>> = None;
+    for field in fields {
+        if let Some(large) = &mut large {
+            large.insert(field.response_key);
+            continue;
+        }
+        if small.contains(&field.response_key) {
+            continue;
+        }
+        small.push(field.response_key);
+        if small.len() > 16 {
+            large = Some(small.iter().copied().collect());
+        }
+    }
+    large.map_or(small.len(), |large| large.len())
 }
 
 /// The response-key index for one collected selection set.

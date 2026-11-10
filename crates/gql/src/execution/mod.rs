@@ -13,7 +13,7 @@ mod subscription;
 
 use std::{any::Any, fmt, sync::Arc, time::Duration};
 
-use futures::stream::BoxStream;
+use futures::{FutureExt, future::BoxFuture, stream::BoxStream};
 
 use crate::{
     Object, Value,
@@ -45,6 +45,11 @@ pub struct ExecutionOptions {
     pub max_depth: usize,
     /// Reject operations whose estimated cost exceeds this value.
     pub max_complexity: u32,
+    /// Reject operations with more than this many distinct fields in any one selection set.
+    ///
+    /// This complements [`Self::max_depth`] by bounding wide, shallow queries. Zero disables the
+    /// limit.
+    pub max_breadth: usize,
     /// Multiplier applied to list fields while estimating complexity.
     pub list_complexity: u32,
     /// Maximum number of errors reported before execution stops reporting further errors.
@@ -66,6 +71,7 @@ impl fmt::Debug for ExecutionOptions {
             .field("authorizer", &self.authorizer.is_some())
             .field("max_depth", &self.max_depth)
             .field("max_complexity", &self.max_complexity)
+            .field("max_breadth", &self.max_breadth)
             .field("list_complexity", &self.list_complexity)
             .field("max_errors", &self.max_errors)
             .field("max_concurrency", &self.max_concurrency)
@@ -83,6 +89,7 @@ impl Default for ExecutionOptions {
             authorizer: None,
             max_depth: 0,
             max_complexity: 0,
+            max_breadth: 0,
             list_complexity: 10,
             max_errors: 100,
             max_concurrency: 16,
@@ -140,6 +147,15 @@ impl ExecutionOptions {
     #[must_use]
     pub const fn max_complexity(mut self, complexity: u32) -> Self {
         self.max_complexity = complexity;
+        self
+    }
+
+    /// Limit the number of distinct fields in any one selection set.
+    ///
+    /// Zero disables the limit.
+    #[must_use]
+    pub const fn max_breadth(mut self, breadth: usize) -> Self {
+        self.max_breadth = breadth;
         self
     }
 
@@ -254,13 +270,36 @@ impl fmt::Debug for AuthorizationContext<'_> {
 /// caller may see this field) is enforced here, immediately before a resolver runs, so a denied
 /// field behaves like a resolver error: it is nulled in the response and reported in `errors`.
 pub trait Authorizer: Send + Sync {
-    /// Decide whether a field may be resolved.
+    /// Decide whether a field may be resolved, synchronously.
+    ///
+    /// This is the easy implementation path and the default `authorize_async` wraps it in a
+    /// ready future. Override [`Authorizer::authorize_async`] when the decision needs to wait on
+    /// I/O (for example, an object-level permission lookup).
     ///
     /// # Errors
     ///
     /// Return an error to deny access. The error message is exposed to the client, so avoid
     /// leaking sensitive details.
-    fn authorize(&self, context: &AuthorizationContext<'_>) -> Result<(), GraphQLError>;
+    fn authorize(&self, context: &AuthorizationContext<'_>) -> Result<(), GraphQLError> {
+        let _ = context;
+        Ok(())
+    }
+
+    /// Decide whether a field may be resolved, asynchronously.
+    ///
+    /// The executor awaits this immediately before resolving the field. The default forwards to
+    /// [`Authorizer::authorize`], so synchronous authorizers only need to implement that method.
+    ///
+    /// # Errors
+    ///
+    /// Return an error to deny access. The error message is exposed to the client, so avoid
+    /// leaking sensitive details.
+    fn authorize_async<'a>(
+        &'a self,
+        context: &'a AuthorizationContext<'a>,
+    ) -> BoxFuture<'a, Result<(), GraphQLError>> {
+        futures::future::ready(self.authorize(context)).boxed()
+    }
 }
 
 /// A GraphQL request.

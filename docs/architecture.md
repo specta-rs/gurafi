@@ -80,14 +80,20 @@ writing Rust, not like describing a schema:
 
 - Rust types infer GraphQL types (`String` → `String!`, `Option<T>` → nullable,
   `Vec<T>` → list, `Result<T, E>` in fallible resolvers).
-- `#[derive(Object)]`, `#[derive(Input)]`, `#[derive(Enum)]` and
-  `#[derive(Scalar)]` connect Rust models to the engine.
+- `#[derive(Object)]`, `#[derive(Input)]`/`#[derive(Args)]`, `#[derive(Enum)]`,
+  `#[derive(Scalar)]` and `#[derive(Union)]` connect Rust models to the engine.
 - `expose!(Model::field)` creates a field from a Rust field with its name and
   type inferred.
 - Field args are derived from a typed input struct; argument declarations are
-  not duplicated.
-- `.auth(...)`, `.complexity(...)`, `.description(...)` and `.deprecated(...)`
-  attach the same metadata Pothos exposes through field options.
+  not duplicated. An input is args-only unless it is explicitly named, so no
+  `FriendsArgs` type leaks into the schema.
+- Types and roots can be reopened across modules (`object_fields`,
+  `interface_fields`, `query_fields`, ...), so declarations merge naturally.
+- `.auth(...)`, `.complexity(...)`, `.description(...)`, `.deprecated(...)`,
+  `.nullable()`, `.non_null()` and `.as_type::<T>()` attach the same metadata
+  Pothos exposes through field options, with build-time checks.
+- Object- and interface-level authorization, validation hooks, one-of inputs and
+  resolver info are first-class.
 - Interfaces, unions, enums, custom scalars and subscriptions are first-class.
 
 Everything `gurafi` produces is a normal `gql::Schema`; `suku` (or any other

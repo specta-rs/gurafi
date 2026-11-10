@@ -30,6 +30,16 @@ pub trait OutputType {
     /// The GraphQL type of values produced by this Rust type.
     fn output_type() -> TypeRef;
 
+    /// Whether the Rust type is an `Option`.
+    ///
+    /// This is what lets [`crate::FieldConfig::non_null`] reject an override that claims a field
+    /// is non-null while its resolver can still return `None`. It is hidden from the docs because
+    /// it is an implementation detail of the builder, not something a schema author writes.
+    #[doc(hidden)]
+    fn is_optional() -> bool {
+        false
+    }
+
     /// Register every named type this type depends on with the schema being built.
     #[doc(hidden)]
     fn register_output(registry: &mut TypeRegistry) {
@@ -179,11 +189,40 @@ pub trait ScalarValue: Sized + Send + Sync + 'static {
 /// take no arguments.
 pub trait InputObject: Sized + Send + 'static {
     /// The GraphQL input object name, or `None` when the type only describes arguments.
+    ///
+    /// `#[derive(Input)]` deliberately produces `None` unless the type carries
+    /// `#[graphql(name = "...")]`. An args type is not a named input object: its fields become
+    /// the field's arguments, and no `FilterInput` type leaks into the schema on its own. Add a
+    /// name when the type is also used nested inside another input object (or by several
+    /// fields), so it becomes a reusable GraphQL input object.
     const NAME: Option<&'static str>;
 
     /// The type's description, if any.
     fn description() -> Option<&'static str> {
         None
+    }
+
+    /// Whether this input object is a `@oneOf` input.
+    ///
+    /// A one-of input has only nullable fields, no defaults, and requires callers to provide
+    /// exactly one non-null field. Set it with `#[graphql(one_of)]` (which also requires a
+    /// GraphQL name, because the type must exist in the schema to carry the directive).
+    fn one_of() -> bool {
+        false
+    }
+
+    /// Validate coerced input after every field has been read.
+    ///
+    /// Called by the schema builder after [`InputObject::from_object`] and before the resolver.
+    /// Implementations can check cross-field rules that individual field coercion cannot express.
+    /// The default accepts every value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value is invalid. The error becomes a normal GraphQL field
+    /// error with the input type and field path attached.
+    fn validate(&self) -> Result<(), GraphQLError> {
+        Ok(())
     }
 
     /// The input fields, with descriptions, defaults and deprecations applied.
@@ -254,10 +293,17 @@ pub(crate) fn coerce_args<A: InputObject>(
     parent_type: &str,
     field_name: &str,
 ) -> Result<A, GraphQLError> {
-    A::from_object(args).map_err(|error| {
+    let value = A::from_object(args).map_err(|error| {
         GraphQLError::new(format!(
             "Invalid arguments for \"{parent_type}.{field_name}\": {}",
             error.message()
         ))
-    })
+    })?;
+    value.validate().map_err(|error| {
+        GraphQLError::new(format!(
+            "Invalid arguments for \"{parent_type}.{field_name}\": {}",
+            error.message()
+        ))
+    })?;
+    Ok(value)
 }

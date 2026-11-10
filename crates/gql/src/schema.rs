@@ -4,7 +4,7 @@ use core::fmt;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
-use rustc_hash::FxBuildHasher;
+use rustc_hash::{FxBuildHasher, FxHashSet};
 
 use crate::{
     error::GraphQLError,
@@ -338,21 +338,12 @@ impl Default for SchemaBuilder {
 }
 
 impl SchemaBuilder {
-    /// Create a builder pre-populated with the built-in scalars and directives.
+    /// Create a builder pre-populated with the built-in directives.
+    ///
+    /// Built-in scalars are added during [`SchemaBuilder::build`] only when something in the
+    /// schema references them, matching the reference implementation's introspection output.
     #[must_use]
     pub fn new() -> Self {
-        let mut types = TypeMap::default();
-        for scalar in [
-            ScalarType::string(),
-            ScalarType::int(),
-            ScalarType::float(),
-            ScalarType::boolean(),
-            ScalarType::id(),
-        ] {
-            let name = scalar.name.clone();
-            types.insert(name, Type::Scalar(Arc::new(scalar)));
-        }
-
         let mut directives = TypeMap::default();
         for directive in [
             DirectiveDefinition::skip(),
@@ -365,7 +356,7 @@ impl SchemaBuilder {
         }
 
         Self {
-            types,
+            types: TypeMap::default(),
             query: None,
             mutation: None,
             subscription: None,
@@ -556,6 +547,8 @@ impl SchemaBuilder {
             }
         }
 
+        add_referenced_builtin_scalars(&mut self.types, &self.directives);
+
         resolve_field_type_indices(&mut self.types);
 
         let inner = SchemaInner {
@@ -578,6 +571,79 @@ impl SchemaBuilder {
             Err(self.errors)
         }
     }
+}
+
+/// Add the built-in scalars the schema actually references.
+///
+/// The October 2021 specification's introspection model includes only types reachable from the
+/// schema's roots, directives and definitions (graphql-js behaves the same way). Registering all
+/// five built-ins up front made `__schema.types` and `__type(name: "Float")` disagree with that
+/// model. A user who explicitly registers a built-in scalar keeps their definition; only missing,
+/// unreferenced built-ins are skipped.
+fn add_referenced_builtin_scalars(
+    types: &mut TypeMap<Type>,
+    directives: &TypeMap<DirectiveDefinition>,
+) {
+    let mut referenced: FxHashSet<Name> = FxHashSet::default();
+
+    fn add_type_ref(ty: &TypeRef, referenced: &mut FxHashSet<Name>) {
+        referenced.insert(ty.named_type().clone());
+    }
+
+    fn add_fields<'a>(fields: impl Iterator<Item = &'a Field>, referenced: &mut FxHashSet<Name>) {
+        for field in fields {
+            add_type_ref(&field.ty, referenced);
+            for argument in field.args.values() {
+                add_type_ref(&argument.ty, referenced);
+            }
+        }
+    }
+
+    for ty in types.values() {
+        match ty {
+            Type::Object(object) => add_fields(object.fields.values(), &mut referenced),
+            Type::Interface(interface) => add_fields(interface.fields.values(), &mut referenced),
+            Type::InputObject(input) => {
+                for field in input.fields.values() {
+                    add_type_ref(&field.ty, &mut referenced);
+                }
+            }
+            // Enums and scalars reference no other type; unions and interfaces name object types.
+            Type::Union(_) | Type::Enum(_) | Type::Scalar(_) => {}
+        }
+    }
+    for directive in directives.values() {
+        for argument in directive.args.values() {
+            add_type_ref(&argument.ty, &mut referenced);
+        }
+    }
+
+    let missing: Vec<ScalarType> = [
+        ScalarType::string(),
+        ScalarType::int(),
+        ScalarType::float(),
+        ScalarType::boolean(),
+        ScalarType::id(),
+    ]
+    .into_iter()
+    .filter(|scalar| referenced.contains(&scalar.name) && !types.contains_key(&scalar.name))
+    .collect();
+
+    if missing.is_empty() {
+        return;
+    }
+
+    // Built-ins keep their canonical position at the front of the type map, which preserves the
+    // stable introspection order existing clients rely on.
+    let mut ordered = TypeMap::default();
+    ordered.reserve(types.len().saturating_add(missing.len()));
+    for scalar in missing {
+        ordered.insert(scalar.name.clone(), Type::Scalar(Arc::new(scalar)));
+    }
+    for (name, ty) in types.drain(..) {
+        ordered.insert(name, ty);
+    }
+    *types = ordered;
 }
 
 /// Record where each field's output type lives in the schema's type map.
@@ -966,6 +1032,12 @@ fn validate_schema(schema: &Schema, errors: &mut SchemaError) {
                     ));
                 }
                 for value in enumeration.values.values() {
+                    if matches!(&*value.name, "true" | "false" | "null") {
+                        errors.push(format!(
+                            "Enum value \"{}.{}\" must not be \"true\", \"false\" or \"null\".",
+                            enumeration.name, value.name
+                        ));
+                    }
                     if value.name.starts_with("__") {
                         errors.push(format!(
                             "Enum value \"{}.{}\" must not begin with \"__\".",

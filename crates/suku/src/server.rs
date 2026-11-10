@@ -112,6 +112,7 @@ struct ServerInner {
     introspection: bool,
     max_depth: usize,
     max_complexity: u32,
+    max_breadth: usize,
     list_complexity: u32,
     max_errors: usize,
     max_concurrency: usize,
@@ -135,6 +136,7 @@ impl fmt::Debug for Server {
             .field("introspection", &self.inner.introspection)
             .field("max_depth", &self.inner.max_depth)
             .field("max_complexity", &self.inner.max_complexity)
+            .field("max_breadth", &self.inner.max_breadth)
             .field("max_errors", &self.inner.max_errors)
             .field("max_concurrency", &self.inner.max_concurrency)
             .field("max_body_bytes", &self.inner.max_body_bytes)
@@ -160,6 +162,7 @@ impl Server {
                 introspection: true,
                 max_depth: 32,
                 max_complexity: 100_000,
+                max_breadth: 1_000,
                 list_complexity: 10,
                 max_errors: 100,
                 max_concurrency: 16,
@@ -209,6 +212,13 @@ impl Server {
     #[must_use]
     pub fn max_concurrency(mut self, concurrency: usize) -> Self {
         self.inner_mut().max_concurrency = concurrency;
+        self
+    }
+
+    /// Limit the number of distinct fields in any one selection set. `0` disables the limit.
+    #[must_use]
+    pub fn max_breadth(mut self, breadth: usize) -> Self {
+        self.inner_mut().max_breadth = breadth;
         self
     }
 
@@ -264,6 +274,9 @@ impl Server {
         }
         if config.max_complexity != 0 {
             inner.max_complexity = config.max_complexity;
+        }
+        if config.max_breadth != 0 {
+            inner.max_breadth = config.max_breadth;
         }
         self
     }
@@ -369,6 +382,7 @@ impl Server {
             authorizer: inner.authorizer.clone(),
             max_depth: inner.max_depth,
             max_complexity: inner.max_complexity,
+            max_breadth: inner.max_breadth,
             list_complexity: inner.list_complexity,
             max_errors: inner.max_errors,
             max_concurrency: inner.max_concurrency,

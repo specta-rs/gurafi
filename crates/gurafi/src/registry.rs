@@ -22,7 +22,7 @@ use crate::{
 /// A schema owns one registry. Every field, argument and expose declaration registers the types
 /// it mentions; duplicate registrations of the same name are ignored, so a type can be used by
 /// any number of fields without extra bookkeeping in user code.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct TypeRegistry {
     types: IndexMap<String, Type>,
     /// Object names referenced by fields but registered separately by `schema.object`.
@@ -37,6 +37,8 @@ pub struct TypeRegistry {
     type_ids: HashMap<String, TypeId>,
     /// Names for which a collision has already been reported.
     conflicts: HashSet<String>,
+    /// Args-only Rust types that were used in a nested input position, reported once each.
+    unnamed_inputs: HashSet<TypeId>,
     errors: Vec<GraphQLError>,
 }
 
@@ -139,6 +141,9 @@ impl TypeRegistry {
         if let Some(description) = T::description() {
             input = input.description(description);
         }
+        if T::one_of() {
+            input = input.one_of();
+        }
         for field in fields {
             input.insert_field(field);
         }
@@ -167,6 +172,24 @@ impl TypeRegistry {
         true
     }
 
+    /// Report an args-only [`crate::InputObject`] used where a named input type is required.
+    #[doc(hidden)]
+    pub fn unnamed_input<T: InputObject>(&mut self) {
+        if !self.unnamed_inputs.insert(TypeId::of::<T>()) {
+            return;
+        }
+        self.errors.push(GraphQLError::new(format!(
+            "`{}` is used as a nested input type, but it has no GraphQL name. Add \
+             `#[graphql(name = \"{}\")]` to make it a reusable input object, or move its fields \
+             into the outer input type.",
+            std::any::type_name::<T>(),
+            std::any::type_name::<T>()
+                .rsplit("::")
+                .next()
+                .unwrap_or("Input"),
+        )));
+    }
+
     /// Register a field or argument's input type, and the types nested inside it.
     #[doc(hidden)]
     pub fn register_input<T: InputType>(&mut self) {
@@ -181,6 +204,11 @@ impl TypeRegistry {
     /// Every error recorded while registering types.
     pub(crate) fn take_errors(&mut self) -> Vec<GraphQLError> {
         std::mem::take(&mut self.errors)
+    }
+
+    /// Whether an args-only input was used in a nested input position.
+    pub(crate) fn has_unnamed_input(&self) -> bool {
+        !self.unnamed_inputs.is_empty()
     }
 
     /// The names of object types referenced by output positions.

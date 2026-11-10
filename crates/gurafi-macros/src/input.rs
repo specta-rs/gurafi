@@ -1,8 +1,8 @@
-//! `#[derive(Input)]`.
+//! `#[derive(Input)]` and its args-only alias `#[derive(Args)]`.
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{Data, DeriveInput, Fields, LitStr, Type};
+use syn::{Data, DeriveInput, Fields, LitStr, Path, Type};
 
 use crate::{
     attr::{deprecation_reason, parse_field_attrs},
@@ -17,6 +17,18 @@ struct InputField {
     default: TokenStream,
     missing: TokenStream,
     deprecation: Option<LitStr>,
+    validate: Option<Path>,
+}
+
+/// Whether `ty` is spelled `Option<...>` (possibly through a full path).
+fn is_option(ty: &Type) -> bool {
+    let Type::Path(path) = ty else {
+        return false;
+    };
+    path.path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "Option")
 }
 
 pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
@@ -66,11 +78,24 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         .name
         .as_ref()
         .map_or_else(|| ident.to_string(), LitStr::value);
-    let type_name_literal = attrs
-        .name
-        .clone()
-        .unwrap_or_else(|| LitStr::new(&graphql_type_name, ident.span()));
-    validate_graphql_name(&graphql_type_name, type_name_literal.span())?;
+    // Without an explicit name the type is args-only: its fields become a field's arguments, but
+    // no named input object is registered. This is the difference between
+    // `#[derive(Input)] struct FriendsArgs` (arguments) and
+    // `#[derive(Input)] #[graphql(name = "FilterInput")] struct Filter` (a reusable input).
+    let type_name = match &attrs.name {
+        Some(name) => quote!(::core::option::Option::Some(#name)),
+        None => quote!(::core::option::Option::None),
+    };
+    if let Some(name) = &attrs.name {
+        validate_graphql_name(&graphql_type_name, name.span())?;
+    }
+    if attrs.one_of && attrs.name.is_none() {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            "`#[graphql(one_of)]` requires a GraphQL name: add \
+             `#[graphql(name = \"...\")]` so the `@oneOf` input object exists in the schema",
+        ));
+    }
 
     let mut parsed = Vec::new();
     for field in &fields.named {
@@ -88,6 +113,21 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                 &field_ident,
                 "an input field can have `default` or `default_with`, not both",
             ));
+        }
+        if attrs.one_of {
+            if !is_option(&field.ty) {
+                return Err(syn::Error::new_spanned(
+                    &field.ty,
+                    "every field of a `#[graphql(one_of)]` input must be `Option<T>`: the \
+                     specification requires one-of fields to be nullable",
+                ));
+            }
+            if field_attrs.default.is_some() || field_attrs.default_with.is_some() {
+                return Err(syn::Error::new_spanned(
+                    &field_ident,
+                    "a `#[graphql(one_of)]` input field must not have a default value",
+                ));
+            }
         }
 
         let ty = field.ty.clone();
@@ -168,6 +208,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             default,
             missing,
             deprecation: deprecation_reason(&field_attrs.deprecated),
+            validate: field_attrs.validate,
         });
     }
 
@@ -226,6 +267,31 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         }
     });
 
+    let field_validations = parsed.iter().filter_map(|field| {
+        let path = field.validate.as_ref()?;
+        let ident = &field.ident;
+        let name = &field.graphql_name;
+        Some(quote! {
+            #path(&self.#ident).map_err(|error| ::gurafi::gql::GraphQLError::new(
+                ::std::format!(
+                    "Invalid value for input field `{}.{}`: {}",
+                    #graphql_type_name,
+                    #name,
+                    error.message(),
+                ),
+            ))?;
+        })
+    });
+    let type_validation = attrs.validate.as_ref().map(|path| {
+        quote! {
+            #path(self).map_err(|error| ::gurafi::gql::GraphQLError::new(::std::format!(
+                "Invalid value for input type `{}`: {}",
+                #graphql_type_name,
+                error.message(),
+            )))?;
+        }
+    });
+
     let nested_registrations: Vec<_> = parsed
         .iter()
         .map(|field| {
@@ -236,15 +302,20 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         })
         .collect();
 
+    let one_of = attrs.one_of;
+
     Ok(quote! {
         const _: () = {
             #[automatically_derived]
             impl ::gurafi::InputObject for #ident {
-                const NAME: ::core::option::Option<&'static str> =
-                    ::core::option::Option::Some(#type_name_literal);
+                const NAME: ::core::option::Option<&'static str> = #type_name;
 
                 fn description() -> ::core::option::Option<&'static str> {
                     #type_description
+                }
+
+                fn one_of() -> bool {
+                    #one_of
                 }
 
                 fn fields() -> ::core::result::Result<
@@ -267,8 +338,16 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                     })
                 }
 
+                fn validate(&self) -> ::core::result::Result<(), ::gurafi::gql::GraphQLError> {
+                    #(#field_validations)*
+                    #type_validation
+                    ::core::result::Result::Ok(())
+                }
+
                 fn register_args(registry: &mut ::gurafi::TypeRegistry) {
-                    registry.register_input_object::<Self>();
+                    if <Self as ::gurafi::InputObject>::NAME.is_some() {
+                        registry.register_input_object::<Self>();
+                    }
                     #(#nested_registrations)*
                 }
             }
@@ -280,6 +359,9 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                         ::core::option::Option::Some(name) => {
                             ::gurafi::gql::TypeRef::named(name)
                         }
+                        // Reaching this in a schema is reported as a build error by
+                        // `TypeRegistry::unnamed_input`; the placeholder only keeps the type
+                        // well-formed so the actionable error is the one the user sees.
                         ::core::option::Option::None => {
                             ::gurafi::gql::TypeRef::named("__GurafiUnnamedInput")
                         }
@@ -287,7 +369,11 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                 }
 
                 fn register_input(registry: &mut ::gurafi::TypeRegistry) {
-                    registry.register_input_object::<Self>();
+                    if <Self as ::gurafi::InputObject>::NAME.is_some() {
+                        registry.register_input_object::<Self>();
+                    } else {
+                        registry.unnamed_input::<Self>();
+                    }
                     #(#nested_registrations)*
                 }
             }
@@ -302,7 +388,9 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                 > {
                     match value {
                         ::gurafi::gql::Value::Object(object) => {
-                            <Self as ::gurafi::InputObject>::from_object(object)
+                            let value = <Self as ::gurafi::InputObject>::from_object(object)?;
+                            <Self as ::gurafi::InputObject>::validate(&value)?;
+                            ::core::result::Result::Ok(value)
                         }
                         other => ::core::result::Result::Err(
                             ::gurafi::gql::GraphQLError::new(::std::format!(

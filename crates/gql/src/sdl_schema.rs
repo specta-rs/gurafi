@@ -12,8 +12,8 @@ use crate::{
     error::GraphQLError,
     schema::{Schema, SchemaBuilder, SchemaError},
     types::{
-        DirectiveDefinition, EnumType, Field, InputObjectType, InputValue, InterfaceType, Name,
-        ObjectType, ScalarType, Type, TypeRef, UnionType,
+        AppliedDirective, DirectiveDefinition, EnumType, EnumValue, Field, InputObjectType,
+        InputValue, InterfaceType, Name, ObjectType, ScalarType, Type, TypeRef, UnionType,
     },
 };
 
@@ -63,13 +63,24 @@ pub fn schema_from_sdl(source: &str) -> Result<Schema, SchemaError> {
             }
         }
     }
-    definitions.finish()
+
+    let schema = definitions.finish()?;
+
+    // Directive arguments are checked against the built schema, so custom scalars, enums and
+    // input objects are coerced exactly the way they are for field arguments.
+    let mut errors = validate_directive_values(&schema, &document);
+    // Non-repeatable directives may be applied once on a definition and once on an extension;
+    // those applications only meet in the schema model, so they are checked after the build.
+    check_model_directives(&schema, &mut errors);
+    if errors.is_empty() {
+        Ok(schema)
+    } else {
+        Err(SchemaError { errors })
+    }
 }
 
 /// The directives the specification defines. User directives are added from the document.
 fn check_sdl_directives(document: &ast::Document<'_>) -> Vec<GraphQLError> {
-    use std::collections::HashMap;
-
     use crate::ast::DirectiveLocation as Location;
 
     struct Spec {
@@ -129,23 +140,35 @@ fn check_sdl_directives(document: &ast::Document<'_>) -> Vec<GraphQLError> {
     );
     specs.insert("oneOf", builtin(&[Location::InputObject], &[]));
 
+    // The edges of the directive-reference graph, used to reject a directive that applies
+    // itself (directly or transitively) to one of its own arguments.
+    let mut references: HashMap<&str, Vec<&str>> = HashMap::new();
+
     for definition in &document.definitions {
         if let Definition::TypeSystem(TypeSystemDefinition::Directive(directive)) = definition {
+            let arguments: Vec<(String, bool)> = directive
+                .arguments
+                .iter()
+                .map(|argument| {
+                    (
+                        argument.name.to_owned(),
+                        matches!(argument.ty, ast::Type::NonNull(_))
+                            && argument.default_value.is_none(),
+                    )
+                })
+                .collect();
+            let mut edges = Vec::new();
+            for argument in &directive.arguments {
+                for applied in &argument.directives {
+                    edges.push(applied.name);
+                }
+            }
+            references.insert(directive.name, edges);
             specs.insert(
                 directive.name,
                 Spec {
                     locations: directive.locations.clone(),
-                    args: directive
-                        .arguments
-                        .iter()
-                        .map(|argument| {
-                            (
-                                argument.name.to_owned(),
-                                matches!(argument.ty, ast::Type::NonNull(_))
-                                    && argument.default_value.is_none(),
-                            )
-                        })
-                        .collect(),
+                    args: arguments,
                     repeatable: directive.repeatable,
                 },
             );
@@ -190,7 +213,20 @@ fn check_sdl_directives(document: &ast::Document<'_>) -> Vec<GraphQLError> {
                 );
             }
             seen.push(directive.name);
+
+            let mut seen_arguments: Vec<&str> = Vec::new();
             for argument in &directive.arguments {
+                if seen_arguments.contains(&argument.name) {
+                    errors.push(
+                        GraphQLError::new(format!(
+                            "Directive \"@{}\" was given argument \"{}\" more than once.",
+                            directive.name, argument.name
+                        ))
+                        .at(argument.location),
+                    );
+                }
+                seen_arguments.push(argument.name);
+
                 if !spec.args.iter().any(|(name, _)| name == argument.name) {
                     errors.push(
                         GraphQLError::new(format!(
@@ -243,7 +279,18 @@ fn check_sdl_directives(document: &ast::Document<'_>) -> Vec<GraphQLError> {
             TypeSystemDefinition::SchemaExtension(extension) => {
                 check(&extension.directives, Location::Schema, &specs, &mut errors);
             }
-            TypeSystemDefinition::Directive(_) => {}
+            TypeSystemDefinition::Directive(directive) => {
+                // An argument of a directive definition may itself be annotated, and those
+                // applications use ARGUMENT_DEFINITION (not DIRECTIVE_DEFINITION).
+                for argument in &directive.arguments {
+                    check(
+                        &argument.directives,
+                        Location::ArgumentDefinition,
+                        &specs,
+                        &mut errors,
+                    );
+                }
+            }
             TypeSystemDefinition::Type(definition) => {
                 let location = match &definition.kind {
                     TypeDefinitionKind::Scalar => Location::Scalar,
@@ -324,6 +371,71 @@ fn check_sdl_directives(document: &ast::Document<'_>) -> Vec<GraphQLError> {
             }
         }
     }
+
+    // A schema definition and its extensions are one location. A non-repeatable directive may
+    // not be split across them either. Duplicates inside one definition are already reported by
+    // the per-node pass above.
+    let mut schema_seen: Vec<(&str, usize)> = Vec::new();
+    for (index, definition) in document.definitions.iter().enumerate() {
+        let directives = match definition {
+            Definition::TypeSystem(TypeSystemDefinition::Schema(schema)) => &schema.directives,
+            Definition::TypeSystem(TypeSystemDefinition::SchemaExtension(extension)) => {
+                &extension.directives
+            }
+            _ => continue,
+        };
+        for directive in directives {
+            let Some(spec) = specs.get(directive.name) else {
+                continue;
+            };
+            if !spec.repeatable
+                && schema_seen
+                    .iter()
+                    .any(|(name, seen)| *name == directive.name && *seen != index)
+            {
+                errors.push(
+                    GraphQLError::new(format!(
+                        "Directive \"@{}\" may only be used once on the schema.",
+                        directive.name
+                    ))
+                    .at(directive.location),
+                );
+            }
+            schema_seen.push((directive.name, index));
+        }
+    }
+
+    // A directive referenced by one of its own argument definitions creates a cycle in the
+    // schema. The specification forbids both direct and indirect self-reference.
+    fn reaches(
+        current: &str,
+        target: &str,
+        references: &HashMap<&str, Vec<&str>>,
+        visited: &mut Vec<String>,
+    ) -> bool {
+        if visited.iter().any(|name| name == current) {
+            return false;
+        }
+        visited.push(current.to_owned());
+        references.get(current).is_some_and(|edges| {
+            edges
+                .iter()
+                .any(|next| *next == target || reaches(next, target, references, visited))
+        })
+    }
+
+    for (&name, edges) in &references {
+        let mut visited = Vec::new();
+        if edges
+            .iter()
+            .any(|next| *next == name || reaches(next, name, &references, &mut visited))
+        {
+            errors.push(GraphQLError::new(format!(
+                "Directive \"@{name}\" cannot reference itself through its argument directives."
+            )));
+        }
+    }
+
     errors
 }
 
@@ -335,6 +447,8 @@ struct Definitions {
     mutation: Option<Name>,
     subscription: Option<Name>,
     description: Option<Arc<str>>,
+    /// Schema-level applications, in source order, validated before the schema is built.
+    applied_directives: Vec<AppliedDirective>,
     errors: Vec<GraphQLError>,
     seen: HashMap<Name, usize>,
     schema_definition_seen: bool,
@@ -346,34 +460,40 @@ enum RawType {
         description: Option<Arc<str>>,
         name: Name,
         specified_by: Option<Arc<str>>,
+        directives: Vec<AppliedDirective>,
     },
     Object {
         description: Option<Arc<str>>,
         name: Name,
         interfaces: Vec<Name>,
         fields: Vec<Field>,
+        directives: Vec<AppliedDirective>,
     },
     Interface {
         description: Option<Arc<str>>,
         name: Name,
         interfaces: Vec<Name>,
         fields: Vec<Field>,
+        directives: Vec<AppliedDirective>,
     },
     Union {
         description: Option<Arc<str>>,
         name: Name,
         members: Vec<Name>,
+        directives: Vec<AppliedDirective>,
     },
     Enum {
         description: Option<Arc<str>>,
         name: Name,
-        values: Vec<(Name, Option<Arc<str>>, Option<Arc<str>>)>,
+        values: Vec<EnumValue>,
+        directives: Vec<AppliedDirective>,
     },
     InputObject {
         description: Option<Arc<str>>,
         name: Name,
         fields: Vec<InputValue>,
         one_of: bool,
+        directives: Vec<AppliedDirective>,
     },
 }
 
@@ -404,11 +524,15 @@ impl Definitions {
                     .description
                     .as_ref()
                     .map(|value| Arc::from(value.as_ref()));
+                self.applied_directives
+                    .extend(parsed_directives(&schema.directives, &mut self.errors));
                 for operation in &schema.operations {
                     self.set_root(operation.operation, operation.ty);
                 }
             }
             TypeSystemDefinition::SchemaExtension(extension) => {
+                self.applied_directives
+                    .extend(parsed_directives(&extension.directives, &mut self.errors));
                 for operation in &extension.operations {
                     self.set_root(operation.operation, operation.ty);
                 }
@@ -422,11 +546,8 @@ impl Definitions {
                 result.repeatable = directive.repeatable;
                 result.locations = directive.locations.clone();
                 for argument in &directive.arguments {
-                    match input_value(argument) {
-                        Ok(argument) => {
-                            result = result.arg(argument);
-                        }
-                        Err(error) => self.errors.push(error),
+                    if let Some(argument) = input_value(argument, &mut self.errors) {
+                        result = result.arg(argument);
                     }
                 }
                 self.directive_definitions.push(result);
@@ -450,15 +571,13 @@ impl Definitions {
                     .description
                     .as_ref()
                     .map(|value| Arc::from(value.as_ref()));
+                let directives = parsed_directives(&definition.directives, &mut self.errors);
                 let raw = match &definition.kind {
                     TypeDefinitionKind::Scalar => RawType::Scalar {
                         description,
                         name,
-                        specified_by: directive_string(
-                            &definition.directives,
-                            "specifiedBy",
-                            "url",
-                        ),
+                        specified_by: specified_by_url(&directives),
+                        directives,
                     },
                     TypeDefinitionKind::Object(object) => RawType::Object {
                         description,
@@ -469,6 +588,7 @@ impl Definitions {
                             .map(|name| (*name).into())
                             .collect(),
                         fields: self.fields("object", &object.fields),
+                        directives,
                     },
                     TypeDefinitionKind::Interface(interface) => RawType::Interface {
                         description,
@@ -479,11 +599,13 @@ impl Definitions {
                             .map(|name| (*name).into())
                             .collect(),
                         fields: self.fields("interface", &interface.fields),
+                        directives,
                     },
                     TypeDefinitionKind::Union(union) => RawType::Union {
                         description,
                         name,
                         members: union.types.iter().map(|name| (*name).into()).collect(),
+                        directives,
                     },
                     TypeDefinitionKind::Enum(enumeration) => RawType::Enum {
                         description,
@@ -491,14 +613,9 @@ impl Definitions {
                         values: enumeration
                             .values
                             .iter()
-                            .map(|value| {
-                                (
-                                    value.name.into(),
-                                    value.description.as_ref().map(|v| Arc::from(v.as_ref())),
-                                    directive_string(&value.directives, "deprecated", "reason"),
-                                )
-                            })
+                            .map(|value| enum_value(value, &mut self.errors))
                             .collect(),
+                        directives,
                     },
                     TypeDefinitionKind::InputObject(input) => RawType::InputObject {
                         description,
@@ -506,18 +623,10 @@ impl Definitions {
                         fields: input
                             .fields
                             .iter()
-                            .filter_map(|field| match input_value(field) {
-                                Ok(field) => Some(field),
-                                Err(error) => {
-                                    self.errors.push(error);
-                                    None
-                                }
-                            })
+                            .filter_map(|field| input_value(field, &mut self.errors))
                             .collect(),
-                        one_of: definition
-                            .directives
-                            .iter()
-                            .any(|directive| directive.name == "oneOf"),
+                        one_of: has_directive(&directives, "oneOf"),
+                        directives,
                     },
                 };
                 self.seen.insert(raw.name().clone(), self.types.len());
@@ -531,6 +640,7 @@ impl Definitions {
                     )));
                     return;
                 };
+                let directives = parsed_directives(&extension.directives, &mut self.errors);
                 let mut extra_fields = match &extension.kind {
                     TypeExtensionKind::Object(data) => Some(self.fields("object", &data.fields)),
                     TypeExtensionKind::Interface(data) => {
@@ -541,56 +651,88 @@ impl Definitions {
                 match (&mut self.types[index], &extension.kind) {
                     (
                         RawType::Object {
-                            interfaces, fields, ..
+                            interfaces,
+                            fields,
+                            directives: type_directives,
+                            ..
                         },
                         TypeExtensionKind::Object(data),
                     ) => {
                         interfaces.extend(data.interfaces.iter().map(|name| (*name).into()));
                         fields.extend(extra_fields.take().unwrap_or_default());
+                        type_directives.extend(directives);
                     }
                     (
                         RawType::Interface {
-                            interfaces, fields, ..
+                            interfaces,
+                            fields,
+                            directives: type_directives,
+                            ..
                         },
                         TypeExtensionKind::Interface(data),
                     ) => {
                         interfaces.extend(data.interfaces.iter().map(|name| (*name).into()));
                         fields.extend(extra_fields.take().unwrap_or_default());
-                    }
-                    (RawType::Union { members, .. }, TypeExtensionKind::Union(data)) => {
-                        members.extend(data.types.iter().map(|name| (*name).into()));
-                    }
-                    (RawType::Enum { values, .. }, TypeExtensionKind::Enum(data)) => {
-                        values.extend(data.values.iter().map(|value| {
-                            (
-                                value.name.into(),
-                                value.description.as_ref().map(|v| Arc::from(v.as_ref())),
-                                directive_string(&value.directives, "deprecated", "reason"),
-                            )
-                        }));
+                        type_directives.extend(directives);
                     }
                     (
-                        RawType::InputObject { fields, one_of, .. },
+                        RawType::Union {
+                            members,
+                            directives: type_directives,
+                            ..
+                        },
+                        TypeExtensionKind::Union(data),
+                    ) => {
+                        members.extend(data.types.iter().map(|name| (*name).into()));
+                        type_directives.extend(directives);
+                    }
+                    (
+                        RawType::Enum {
+                            values,
+                            directives: type_directives,
+                            ..
+                        },
+                        TypeExtensionKind::Enum(data),
+                    ) => {
+                        values.extend(
+                            data.values
+                                .iter()
+                                .map(|value| enum_value(value, &mut self.errors)),
+                        );
+                        type_directives.extend(directives);
+                    }
+                    (
+                        RawType::InputObject {
+                            fields,
+                            one_of,
+                            directives: type_directives,
+                            ..
+                        },
                         TypeExtensionKind::InputObject(data),
                     ) => {
-                        if extension
-                            .directives
-                            .iter()
-                            .any(|directive| directive.name == "oneOf")
-                        {
+                        if has_directive(&directives, "oneOf") {
                             *one_of = true;
                         }
-                        fields.extend(data.fields.iter().filter_map(|field| {
-                            match input_value(field) {
-                                Ok(field) => Some(field),
-                                Err(error) => {
-                                    self.errors.push(error);
-                                    None
-                                }
-                            }
-                        }));
+                        fields.extend(
+                            data.fields
+                                .iter()
+                                .filter_map(|field| input_value(field, &mut self.errors)),
+                        );
+                        type_directives.extend(directives);
                     }
-                    (RawType::Scalar { .. }, TypeExtensionKind::Scalar) => {}
+                    (
+                        RawType::Scalar {
+                            specified_by,
+                            directives: type_directives,
+                            ..
+                        },
+                        TypeExtensionKind::Scalar,
+                    ) => {
+                        if let Some(url) = specified_by_url(&directives) {
+                            *specified_by = Some(url);
+                        }
+                        type_directives.extend(directives);
+                    }
                     (raw, _) => {
                         self.errors.push(GraphQLError::new(format!(
                             "Type \"{name}\" was extended with the wrong kind (it is a {}).",
@@ -634,15 +776,12 @@ impl Definitions {
                     .as_ref()
                     .map(|value| Arc::from(value.as_ref()));
                 for argument in &field.arguments {
-                    match input_value(argument) {
-                        Ok(argument) => {
-                            result = result.arg(argument);
-                        }
-                        Err(error) => self.errors.push(error),
+                    if let Some(argument) = input_value(argument, &mut self.errors) {
+                        result = result.arg(argument);
                     }
                 }
-                result.deprecation_reason =
-                    directive_string(&field.directives, "deprecated", "reason");
+                result.directives = parsed_directives(&field.directives, &mut self.errors);
+                result.deprecation_reason = deprecation_reason(&result.directives);
                 let _ = owner;
                 result
             })
@@ -650,10 +789,27 @@ impl Definitions {
     }
 
     fn finish(self) -> Result<Schema, SchemaError> {
-        if !self.errors.is_empty() {
-            return Err(SchemaError {
-                errors: self.errors,
-            });
+        let mut errors = self.errors;
+        // The schema definition and its extensions form one directive location. A non-repeatable
+        // directive may not be split across them. (The AST pass already rejects duplicates within
+        // one definition; this covers the merged document.)
+        let mut seen: Vec<Name> = Vec::new();
+        for directive in &self.applied_directives {
+            let repeatable = self
+                .directive_definitions
+                .iter()
+                .find(|definition| definition.name == directive.name)
+                .is_some_and(|definition| definition.repeatable);
+            if !repeatable && seen.contains(&directive.name) {
+                errors.push(GraphQLError::new(format!(
+                    "Directive \"@{}\" may only be used once on the schema.",
+                    directive.name
+                )));
+            }
+            seen.push(directive.name.clone());
+        }
+        if !errors.is_empty() {
+            return Err(SchemaError { errors });
         }
 
         let mut builder = SchemaBuilder::new();
@@ -666,10 +822,12 @@ impl Definitions {
                     description,
                     name,
                     specified_by,
+                    directives,
                 } => {
                     let mut scalar = ScalarType::new(name);
                     scalar.description = description;
                     scalar.specified_by_url = specified_by;
+                    scalar.directives = directives;
                     Type::Scalar(Arc::new(scalar))
                 }
                 RawType::Object {
@@ -677,10 +835,12 @@ impl Definitions {
                     name,
                     interfaces,
                     fields,
+                    directives,
                 } => {
                     let mut object = ObjectType::new(name);
                     object.description = description;
                     object.interfaces = interfaces;
+                    object.directives = directives;
                     for field in fields {
                         object.insert_field(field);
                     }
@@ -691,10 +851,12 @@ impl Definitions {
                     name,
                     interfaces,
                     fields,
+                    directives,
                 } => {
                     let mut interface = InterfaceType::new(name);
                     interface.description = description;
                     interface.interfaces = interfaces;
+                    interface.directives = directives;
                     for field in fields {
                         interface.insert_field(field);
                     }
@@ -704,31 +866,28 @@ impl Definitions {
                     description,
                     name,
                     members,
+                    directives,
                 } => {
                     let mut union = UnionType::new(name);
                     union.description = description;
                     union.types = members;
+                    union.directives = directives;
                     Type::Union(Arc::new(union))
                 }
                 RawType::Enum {
                     description,
                     name,
                     values,
+                    directives,
                 } => {
                     let mut enumeration = EnumType::new(name);
                     enumeration.description = description;
-                    for (value, description, deprecation_reason) in values {
-                        if enumeration.values.contains_key(&value) {
-                            enumeration.duplicates.push(value.clone());
+                    enumeration.directives = directives;
+                    for value in values {
+                        if enumeration.values.contains_key(&value.name) {
+                            enumeration.duplicates.push(value.name.clone());
                         }
-                        enumeration.values.insert(
-                            value.clone(),
-                            crate::types::EnumValue {
-                                name: value,
-                                description,
-                                deprecation_reason,
-                            },
-                        );
+                        enumeration.values.insert(value.name.clone(), value);
                     }
                     Type::Enum(Arc::new(enumeration))
                 }
@@ -737,10 +896,12 @@ impl Definitions {
                     name,
                     fields,
                     one_of,
+                    directives,
                 } => {
                     let mut input = InputObjectType::new(name);
                     input.description = description;
                     input.one_of = one_of;
+                    input.directives = directives;
                     for field in fields {
                         input.insert_field(field);
                     }
@@ -786,35 +947,97 @@ fn type_ref(ty: &ast::Type<'_>) -> TypeRef {
     }
 }
 
-fn input_value(value: &ast::InputValueDefinition<'_>) -> Result<InputValue, GraphQLError> {
+/// Convert applied directives, preserving source order and argument order.
+fn parsed_directives(
+    directives: &[ast::Directive<'_>],
+    errors: &mut Vec<GraphQLError>,
+) -> Vec<AppliedDirective> {
+    directives
+        .iter()
+        .map(|directive| {
+            let mut result = AppliedDirective::new(directive.name);
+            for argument in &directive.arguments {
+                match const_value(&argument.value) {
+                    Ok(value) => {
+                        result.arguments.insert(argument.name.into(), value);
+                    }
+                    Err(error) => errors.push(error.at(argument.location)),
+                }
+            }
+            result
+        })
+        .collect()
+}
+
+/// The specification's default `@deprecated` reason.
+const DEFAULT_DEPRECATION_REASON: &str = "No longer supported";
+
+/// Read the authoritative deprecation reason from an applied `@deprecated`.
+///
+/// Only a `String` argument is used. Validation rejects a wrong-typed reason before a schema is
+/// returned, so a bogus value never becomes a deprecation reason. An omitted or explicit `null`
+/// reason uses the specification's default.
+fn deprecation_reason(directives: &[AppliedDirective]) -> Option<Arc<str>> {
+    let directive = directives
+        .iter()
+        .rev()
+        .find(|directive| directive.name.as_ref() == "deprecated")?;
+    match directive.get_argument("reason") {
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(Value::Null) | None => Some(Arc::from(DEFAULT_DEPRECATION_REASON)),
+        Some(_) => None,
+    }
+}
+
+/// Read the authoritative URL from an applied `@specifiedBy`.
+fn specified_by_url(directives: &[AppliedDirective]) -> Option<Arc<str>> {
+    let directive = directives
+        .iter()
+        .rev()
+        .find(|directive| directive.name.as_ref() == "specifiedBy")?;
+    match directive.get_argument("url") {
+        Some(Value::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn has_directive(directives: &[AppliedDirective], name: &str) -> bool {
+    directives
+        .iter()
+        .any(|directive| directive.name.as_ref() == name)
+}
+
+fn enum_value(value: &ast::EnumValueDefinition<'_>, errors: &mut Vec<GraphQLError>) -> EnumValue {
+    let directives = parsed_directives(&value.directives, errors);
+    EnumValue {
+        name: value.name.into(),
+        description: value.description.as_ref().map(|v| Arc::from(v.as_ref())),
+        deprecation_reason: deprecation_reason(&directives),
+        directives,
+    }
+}
+
+fn input_value(
+    value: &ast::InputValueDefinition<'_>,
+    errors: &mut Vec<GraphQLError>,
+) -> Option<InputValue> {
     let mut result = InputValue::new(value.name, type_ref(&value.ty));
     result.description = value
         .description
         .as_ref()
         .map(|value| Arc::from(value.as_ref()));
-    result.deprecation_reason = directive_string(&value.directives, "deprecated", "reason");
+    result.directives = parsed_directives(&value.directives, errors);
+    result.deprecation_reason = deprecation_reason(&result.directives);
     if let Some(default) = &value.default_value {
-        result.default_value = Some(const_value(default)?);
+        match const_value(default) {
+            Ok(value) => result.default_value = Some(value),
+            Err(error) => {
+                errors.push(error.at(value.location));
+                return None;
+            }
+        }
     }
-    Ok(result)
-}
-
-fn directive_string(
-    directives: &[ast::Directive<'_>],
-    name: &str,
-    argument: &str,
-) -> Option<Arc<str>> {
-    let directive = directives.iter().find(|directive| directive.name == name)?;
-    let value = directive
-        .arguments
-        .iter()
-        .find(|item| item.name == argument)
-        .map(|item| &item.value);
-    match value {
-        Some(ast::Value::String(value)) => Some(Arc::from(value.as_ref())),
-        _ if name == "deprecated" => Some(Arc::from("No longer supported")),
-        _ => Some(Arc::from("")),
-    }
+    Some(result)
 }
 
 fn const_value(value: &ast::Value<'_>) -> Result<Value, GraphQLError> {
@@ -851,4 +1074,343 @@ fn const_value(value: &ast::Value<'_>) -> Result<Value, GraphQLError> {
             Value::Object(Arc::new(object))
         }
     })
+}
+
+/// Validate every directive argument literal against the schema's directive definitions.
+///
+/// This runs after the schema is built so custom scalars, enums and input objects coerce exactly
+/// as they do for field arguments. Built-in directives are included, which means a wrong-typed
+/// `@deprecated(reason: ...)` or `@specifiedBy(url: ...)` is rejected instead of silently
+/// becoming `""`.
+/// Validate every directive applied at one location against the built schema.
+fn check_directive_values(
+    schema: &Schema,
+    directives: &[ast::Directive<'_>],
+    owner: &str,
+    errors: &mut Vec<GraphQLError>,
+) {
+    for directive in directives {
+        let Some(definition) = schema.get_directive(directive.name) else {
+            continue;
+        };
+        for argument in &directive.arguments {
+            let Some(declared) = definition.args.get(argument.name) else {
+                continue;
+            };
+            if let Err(error) = crate::execution::coerce::coerce_literal(
+                schema,
+                &argument.value,
+                &declared.ty,
+                None,
+            ) {
+                errors.push(
+                    GraphQLError::new(format!(
+                        "Argument \"{}\" of directive \"@{}\" on {owner} is invalid: {}",
+                        argument.name,
+                        directive.name,
+                        error.message()
+                    ))
+                    .at(argument.location),
+                );
+            }
+        }
+    }
+}
+
+fn validate_directive_values(schema: &Schema, document: &ast::Document<'_>) -> Vec<GraphQLError> {
+    let mut errors = Vec::new();
+    for definition in &document.definitions {
+        let Definition::TypeSystem(definition) = definition else {
+            continue;
+        };
+        match definition {
+            TypeSystemDefinition::Schema(schema_definition) => {
+                check_directive_values(
+                    schema,
+                    &schema_definition.directives,
+                    "the schema",
+                    &mut errors,
+                );
+            }
+            TypeSystemDefinition::SchemaExtension(extension) => {
+                check_directive_values(schema, &extension.directives, "the schema", &mut errors);
+            }
+            TypeSystemDefinition::Directive(directive) => {
+                for argument in &directive.arguments {
+                    let owner = format!(
+                        "argument \"{}\" of directive \"@{}\"",
+                        argument.name, directive.name
+                    );
+                    check_directive_values(schema, &argument.directives, &owner, &mut errors);
+                }
+            }
+            TypeSystemDefinition::Type(definition) => {
+                let owner = format!("type \"{}\"", definition.name);
+                check_directive_values(schema, &definition.directives, &owner, &mut errors);
+                match &definition.kind {
+                    TypeDefinitionKind::Scalar | TypeDefinitionKind::Union(_) => {}
+                    TypeDefinitionKind::Object(object) => {
+                        check_fields(schema, definition.name, &object.fields, &mut errors);
+                    }
+                    TypeDefinitionKind::Interface(interface) => {
+                        check_fields(schema, definition.name, &interface.fields, &mut errors);
+                    }
+                    TypeDefinitionKind::Enum(enumeration) => {
+                        for value in &enumeration.values {
+                            let owner =
+                                format!("enum value \"{}.{}\"", definition.name, value.name);
+                            check_directive_values(schema, &value.directives, &owner, &mut errors);
+                        }
+                    }
+                    TypeDefinitionKind::InputObject(input) => {
+                        for field in &input.fields {
+                            let owner =
+                                format!("input field \"{}.{}\"", definition.name, field.name);
+                            check_directive_values(schema, &field.directives, &owner, &mut errors);
+                        }
+                    }
+                }
+            }
+            TypeSystemDefinition::TypeExtension(extension) => {
+                let owner = format!("type \"{}\"", extension.name);
+                check_directive_values(schema, &extension.directives, &owner, &mut errors);
+                match &extension.kind {
+                    TypeExtensionKind::Scalar | TypeExtensionKind::Union(_) => {}
+                    TypeExtensionKind::Object(object) => {
+                        check_fields(schema, extension.name, &object.fields, &mut errors);
+                    }
+                    TypeExtensionKind::Interface(interface) => {
+                        check_fields(schema, extension.name, &interface.fields, &mut errors);
+                    }
+                    TypeExtensionKind::Enum(enumeration) => {
+                        for value in &enumeration.values {
+                            let owner = format!("enum value \"{}.{}\"", extension.name, value.name);
+                            check_directive_values(schema, &value.directives, &owner, &mut errors);
+                        }
+                    }
+                    TypeExtensionKind::InputObject(input) => {
+                        for field in &input.fields {
+                            let owner =
+                                format!("input field \"{}.{}\"", extension.name, field.name);
+                            check_directive_values(schema, &field.directives, &owner, &mut errors);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    errors
+}
+
+fn check_fields(
+    schema: &Schema,
+    type_name: &str,
+    fields: &[ast::FieldDefinition<'_>],
+    errors: &mut Vec<GraphQLError>,
+) {
+    for field in fields {
+        let owner = format!("field \"{type_name}.{}\"", field.name);
+        check_directive_values(schema, &field.directives, &owner, errors);
+        for argument in &field.arguments {
+            let owner = format!(
+                "argument \"{}\" of field \"{}.{}\"",
+                argument.name, type_name, field.name
+            );
+            check_directive_values(schema, &argument.directives, &owner, errors);
+        }
+    }
+}
+
+/// Reject a non-repeatable directive that was applied once on a definition and once on one of
+/// its extensions (or on two extensions).
+///
+/// Within a single definition the AST checker catches duplicates; extensions are merged into the
+/// model later, so this pass is what makes `scalar X @specifiedBy(...)` plus
+/// `extend scalar X @specifiedBy(...)` fail.
+fn check_model_directives(schema: &Schema, errors: &mut Vec<GraphQLError>) {
+    fn check(
+        schema: &Schema,
+        directives: &[AppliedDirective],
+        owner: &str,
+        errors: &mut Vec<GraphQLError>,
+    ) {
+        let mut seen: Vec<&str> = Vec::new();
+        for directive in directives {
+            if schema
+                .get_directive(&directive.name)
+                .is_some_and(|definition| definition.repeatable)
+            {
+                continue;
+            }
+            if seen.contains(&directive.name.as_ref()) {
+                errors.push(GraphQLError::new(format!(
+                    "Directive \"@{}\" may only be used once on {owner}.",
+                    directive.name
+                )));
+            }
+            seen.push(&directive.name);
+        }
+    }
+
+    for (_, ty) in schema.types() {
+        match ty {
+            Type::Scalar(scalar) => {
+                check(
+                    schema,
+                    &scalar.directives,
+                    &format!("scalar \"{}\"", scalar.name),
+                    errors,
+                );
+            }
+            Type::Object(object) => {
+                check(
+                    schema,
+                    &object.directives,
+                    &format!("object \"{}\"", object.name),
+                    errors,
+                );
+                for field in object.fields.values() {
+                    let owner = format!("field \"{}.{}\"", object.name, field.name);
+                    check(schema, &field.directives, &owner, errors);
+                    for argument in field.args.values() {
+                        let owner = format!("argument \"{}\" of {owner}", argument.name);
+                        check(schema, &argument.directives, &owner, errors);
+                    }
+                }
+            }
+            Type::Interface(interface) => {
+                check(
+                    schema,
+                    &interface.directives,
+                    &format!("interface \"{}\"", interface.name),
+                    errors,
+                );
+                for field in interface.fields.values() {
+                    let owner = format!("field \"{}.{}\"", interface.name, field.name);
+                    check(schema, &field.directives, &owner, errors);
+                    for argument in field.args.values() {
+                        let owner = format!("argument \"{}\" of {owner}", argument.name);
+                        check(schema, &argument.directives, &owner, errors);
+                    }
+                }
+            }
+            Type::Union(union) => {
+                check(
+                    schema,
+                    &union.directives,
+                    &format!("union \"{}\"", union.name),
+                    errors,
+                );
+            }
+            Type::Enum(enumeration) => {
+                check(
+                    schema,
+                    &enumeration.directives,
+                    &format!("enum \"{}\"", enumeration.name),
+                    errors,
+                );
+                for value in enumeration.values.values() {
+                    let owner = format!("enum value \"{}.{}\"", enumeration.name, value.name);
+                    check(schema, &value.directives, &owner, errors);
+                }
+            }
+            Type::InputObject(input) => {
+                check(
+                    schema,
+                    &input.directives,
+                    &format!("input object \"{}\"", input.name),
+                    errors,
+                );
+                for field in input.fields.values() {
+                    let owner = format!("input field \"{}.{}\"", input.name, field.name);
+                    check(schema, &field.directives, &owner, errors);
+                }
+            }
+        }
+    }
+
+    for (_, directive) in schema.directives() {
+        for argument in directive.args.values() {
+            let owner = format!(
+                "argument \"{}\" of directive \"@{}\"",
+                argument.name, directive.name
+            );
+            check(schema, &argument.directives, &owner, errors);
+        }
+    }
+}
+
+/// Validate a list of already-coerced applied directives against a built schema.
+///
+/// SDL parsing uses the AST so it can report source locations; this helper exists for
+/// code-first builders, which have no AST. It checks that the directive exists, that it is
+/// allowed at `location`, that every argument is declared and has the right type, that required
+/// arguments are present, and that a non-repeatable directive is not listed twice.
+///
+/// `SchemaBuilder::build` can call this after all definitions are registered. The caller owns
+/// `errors`, so several elements can be validated into one build error.
+// The SDL path validates through the AST so errors keep their source location; this entry point
+// is for the code-first builder.
+#[allow(dead_code)]
+pub(crate) fn validate_applied_directives(
+    schema: &Schema,
+    directives: &[AppliedDirective],
+    location: ast::DirectiveLocation,
+    owner: &str,
+    errors: &mut SchemaError,
+) {
+    let mut seen: Vec<&str> = Vec::new();
+    for directive in directives {
+        let Some(definition) = schema.get_directive(&directive.name) else {
+            errors.push(format!(
+                "Unknown directive \"@{}\" on {owner}.",
+                directive.name
+            ));
+            continue;
+        };
+        if !definition.locations.contains(&location) {
+            errors.push(format!(
+                "Directive \"@{}\" may not be used on {}.",
+                directive.name,
+                location.as_str()
+            ));
+        }
+        if !definition.repeatable && seen.contains(&directive.name.as_ref()) {
+            errors.push(format!(
+                "Directive \"@{}\" may only be used once on {owner}.",
+                directive.name
+            ));
+        }
+        seen.push(&directive.name);
+
+        for (name, value) in &directive.arguments {
+            let Some(declared) = definition.args.get(name.as_ref()) else {
+                errors.push(format!(
+                    "Unknown argument \"{name}\" on directive \"@{}\" applied to {owner}.",
+                    directive.name
+                ));
+                continue;
+            };
+            if let Err(error) =
+                crate::execution::coerce::validate_default_value(schema, value, &declared.ty)
+            {
+                errors.push(format!(
+                    "Argument \"{name}\" of directive \"@{}\" on {owner} is invalid: {}",
+                    directive.name,
+                    error.message()
+                ));
+            }
+        }
+        for argument in definition.args.values() {
+            if matches!(argument.ty, TypeRef::NonNull(_))
+                && argument.default_value.is_none()
+                && directive.get_argument(&argument.name).is_none()
+            {
+                errors.push(format!(
+                    "Directive \"@{}\" requires a \"{}\" argument on {owner}.",
+                    directive.name, argument.name
+                ));
+            }
+        }
+    }
 }

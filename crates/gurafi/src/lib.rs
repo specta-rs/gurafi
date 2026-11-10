@@ -11,11 +11,16 @@
 //!   `#[derive(Union)]` register a Rust type as a GraphQL type.
 //! - A field's GraphQL output type is inferred from its Rust return type via [`OutputType`].
 //! - A field's GraphQL arguments are inferred from its Rust arguments type via [`InputObject`].
-//!   There is no second list of argument declarations to keep in sync.
+//!   There is no second list of argument declarations to keep in sync. An `Input` type is
+//!   args-only by default; add `#[graphql(name = "FilterInput")]` when it should also be a
+//!   reusable input object nested inside other inputs.
 //! - Resolvers always receive `(&Model, Args, &Ctx)` for object fields and `(Args, &Ctx)` for
-//!   root fields, with sync, async, infallible and fallible variants.
+//!   root fields, with sync, async, infallible and fallible variants. `*_with_info` variants add
+//!   the [`gql::ResolveInfo`].
 //! - Field options are chained on the returned [`FieldConfig`]: descriptions, deprecation,
-//!   complexity estimates and authorization.
+//!   complexity estimates, authorization, nullability and checked type overrides.
+//! - A type's definition can be split across modules with [`Schema::object_fields`],
+//!   [`Schema::interface_fields`] and the root `*_fields` methods; declarations merge.
 //!
 //! # Example
 //!
@@ -94,6 +99,11 @@
 //! is a normal GraphQL error, so it participates in null propagation. Root and nested fields use
 //! the same mechanism.
 //!
+//! Whole-object rules are declared once with [`ObjectBuilder::auth`]; interface rules with
+//! [`InterfaceBuilder::auth`] are inherited by every implementing object, including through
+//! another interface. `auth_async` variants await a boxed future, and interface fields can carry
+//! their own authorization that objects inherit. Every variant composes with field-level checks.
+//!
 //! # Asynchronous resolvers
 //!
 //! An async resolver returns a boxed future:
@@ -132,11 +142,11 @@ pub use error::SchemaError;
 pub use expose::{__expose_name, Expose};
 pub use field::{FieldConfig, InterfaceFieldConfig};
 pub use gql::{GraphQLError, Value};
-pub use gurafi_macros::{Enum, Input, Object, Scalar, Union};
+pub use gurafi_macros::{Args, Enum, Input, Object, Scalar, Union};
 pub use id::ID;
 pub use registry::TypeRegistry;
 pub use schema::{
-    BoxFuture, InterfaceBuilder, InterfaceRef, ObjectBuilder, RootBuilder, Schema,
+    BoxFuture, BuildOptions, InterfaceBuilder, InterfaceRef, ObjectBuilder, RootBuilder, Schema,
     SubscriptionBuilder, UnionBuilder, UnionRef, type_ref,
 };
 pub use traits::{

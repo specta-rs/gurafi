@@ -29,6 +29,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     }
 
     let attrs = crate::attr::parse_type_attrs(&input.attrs)?;
+    crate::attr::reject_input_only(&attrs, &input.ident)?;
     let ident = &input.ident;
     let graphql_type_name = attrs
         .name

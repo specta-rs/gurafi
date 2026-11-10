@@ -14,7 +14,7 @@ use crate::{
     error::{GraphQLError, Location},
     schema::Schema,
     types::{Type, TypeRef},
-    validation::{ValidationOptions, rules::types_overlap, visitor::field_context},
+    validation::{ValidationOptions, visitor::field_context},
 };
 
 #[derive(Clone, Copy)]
@@ -74,8 +74,9 @@ struct State<'a, 'b> {
     options: &'b ValidationOptions,
     fragments: &'b HashMap<&'a str, &'a FragmentDefinition<'a>>,
     errors: &'b mut Vec<GraphQLError>,
-    /// Field pairs already compared, keyed by location and parent type.
-    compared: HashSet<(Location, Location, &'a str, &'a str)>,
+    /// Field pairs already compared, keyed by location, parent type and whether the pair was
+    /// reached through mutually exclusive object fragments.
+    compared: HashSet<(Location, Location, &'a str, &'a str, bool)>,
     /// Conflicts already reported, to avoid duplicates when the same selection set is reached
     /// through more than one fragment.
     reported: HashSet<(String, Location, Location)>,
@@ -152,10 +153,22 @@ impl<'a> State<'a, '_> {
         }
     }
 
-    fn compare(&mut self, response_key: &str, left: &Entry<'a>, right: &Entry<'a>) {
-        if !types_overlap(self.schema, left.parent.name(), right.parent.name()) {
-            return;
-        }
+    fn compare(
+        &mut self,
+        response_key: &str,
+        left: &Entry<'a>,
+        right: &Entry<'a>,
+        parent_fields_mutually_exclusive: bool,
+    ) {
+        // Fields on two distinct object types can never both apply at runtime, so the spec
+        // exempts them from the name/argument part of the merge check. Their *response shape*
+        // must still agree: `... on Dog { x: nickname }` and `... on Cat { x: meowVolume }`
+        // conflict when the two types differ, because a client would otherwise receive both a
+        // string and an int under the same response key depending on the runtime type.
+        let mutually_exclusive = parent_fields_mutually_exclusive
+            || (left.parent.name() != right.parent.name()
+                && matches!(left.parent, Type::Object(_))
+                && matches!(right.parent, Type::Object(_)));
 
         let (first, second) = if left.field.location <= right.field.location {
             (left, right)
@@ -167,16 +180,19 @@ impl<'a> State<'a, '_> {
             second.field.location,
             first.parent.name().as_ref(),
             second.parent.name().as_ref(),
+            mutually_exclusive,
         )) {
             return;
         }
 
-        let reason = if left.field.name != right.field.name {
+        let reason = if !mutually_exclusive && left.field.name != right.field.name {
             Some(format!(
                 "they have differing field names (\"{}\" and \"{}\")",
                 left.field.name, right.field.name
             ))
-        } else if !same_arguments(&left.field.arguments, &right.field.arguments) {
+        } else if !mutually_exclusive
+            && !same_arguments(&left.field.arguments, &right.field.arguments)
+        {
             Some("they have differing arguments".to_owned())
         } else if self.types_conflict(left.return_type, right.return_type) {
             Some(format!(
@@ -227,7 +243,7 @@ impl<'a> State<'a, '_> {
             };
             for left_entry in left_group {
                 for right_entry in right_group {
-                    self.compare(key, left_entry, right_entry);
+                    self.compare(key, left_entry, right_entry, mutually_exclusive);
                 }
             }
         }
@@ -258,7 +274,7 @@ impl<'a> State<'a, '_> {
         for (key, group) in &groups {
             for left in 0..group.len() {
                 for right in (left + 1)..group.len() {
-                    self.compare(key, &group[left], &group[right]);
+                    self.compare(key, &group[left], &group[right], false);
                 }
             }
         }

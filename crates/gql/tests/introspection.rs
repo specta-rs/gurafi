@@ -726,14 +726,16 @@ fn schema_shape() {
             "missing {expected}"
         );
     }
-    // Schema order: the built-in scalars are registered first.
+    // Schema order: the referenced built-in scalars come first, in canonical order. `Float` is
+    // not referenced by this schema, so — like graphql-js — it is absent from introspection.
     assert_eq!(
-        type_names[..5]
+        type_names[..4]
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>(),
-        vec!["String", "Int", "Float", "Boolean", "ID"]
+        vec!["String", "Int", "Boolean", "ID"]
     );
+    assert!(!type_names.iter().any(|name| name == "Float"));
 
     let query_type = field(&schema, &context, "__Schema", "queryType", &schema_value);
     assert_eq!(

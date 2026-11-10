@@ -712,6 +712,15 @@ impl<'a> Lexer<'a> {
                 raw.push_str("\"\"\"");
                 continue;
             }
+            // October 2021 2.9.4: a block string may contain tabs, line terminators and any
+            // source character from U+0020 upwards. Other C0 controls are as invalid here as
+            // they are in a single-line string.
+            if (ch as u32) < 0x20 && ch != '\t' && ch != '\n' && ch != '\r' {
+                return Err(self.error(
+                    self.location(),
+                    format!("Invalid character within String: {}.", print_code_point(ch)),
+                ));
+            }
             if let Some(ch) = self.bump() {
                 raw.push(ch);
             }

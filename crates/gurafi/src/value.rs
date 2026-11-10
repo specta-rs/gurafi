@@ -183,6 +183,10 @@ impl<T: OutputType> OutputType for Option<T> {
         T::output_type().nullable()
     }
 
+    fn is_optional() -> bool {
+        true
+    }
+
     fn register_output(registry: &mut crate::registry::TypeRegistry) {
         T::register_output(registry);
     }
@@ -264,6 +268,10 @@ impl<T: OutputType> OutputType for Box<T> {
         T::output_type()
     }
 
+    fn is_optional() -> bool {
+        T::is_optional()
+    }
+
     fn register_output(registry: &mut crate::registry::TypeRegistry) {
         T::register_output(registry);
     }
@@ -294,6 +302,10 @@ impl<T: FromValue> FromValue for Box<T> {
 impl<T: OutputType> OutputType for Arc<T> {
     fn output_type() -> TypeRef {
         T::output_type()
+    }
+
+    fn is_optional() -> bool {
+        T::is_optional()
     }
 
     fn register_output(registry: &mut crate::registry::TypeRegistry) {

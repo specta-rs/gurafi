@@ -156,6 +156,7 @@ pub(crate) async fn execute(
             field_cost: 1,
             max_complexity: options.max_complexity,
             max_depth: options.max_depth,
+            max_breadth: options.max_breadth,
         },
     ) {
         return Response::error(error);
@@ -298,20 +299,18 @@ pub(crate) async fn run_operation<'doc>(
 
 /// Complete one event of a subscription.
 ///
-/// Each source event is the *field value*, not a new root value: the subscription field's
-/// `subscribe` resolver produced it, so executing the root field again (and therefore calling its
-/// `resolve` resolver) would be wrong. Only the field's declared type and selection sets are
-/// completed, exactly as `CompleteValue` would for a field resolved to this event.
+/// October 2021 6.2.3.2: each source event is the operation's **root value**. The subscription
+/// selection set is executed against that event exactly like a query root, so the root field's
+/// normal `resolve` resolver runs (or the default property resolver reads the event's field name).
 ///
 /// The document is re-parsed because the returned response stream is `'static` and therefore
-/// cannot borrow the request string. Validation and variable coercion are *not* repeated; the
-/// coerced field type is passed in from setup.
+/// cannot borrow the request string. Validation, variable coercion, complexity analysis and the
+/// single-root-field check all happened during setup and are not repeated; only resolution runs
+/// per event, with that event's own deadline.
 pub(crate) async fn execute_subscription_event(
     context: &ExecutionContext,
     query: &str,
     operation_name: Option<&str>,
-    response_key: &str,
-    field_ty: TypeRef,
     event: Value,
     deadline: Option<Instant>,
 ) -> Response {
@@ -329,88 +328,16 @@ pub(crate) async fn execute_subscription_event(
         ));
     };
     let fragments = FragmentMap::new(&document);
-
-    let collected = match collect::collect_fields(
-        &context.schema,
-        &fragments,
-        &context.variables,
-        root_type,
-        &operation.selection_set,
-    ) {
-        Ok(collected) => collected,
-        Err(error) => return Response::error(error),
-    };
-    let nodes = collected
-        .iter()
-        .find(|(key, _, _)| crate::types::names_eq(key, response_key))
-        .map(|(_, nodes, _)| nodes.as_slice());
-    let Some(nodes) = nodes else {
-        return Response::error(GraphQLError::new(format!(
-            "Subscription root field \"{response_key}\" was not selected."
-        )));
-    };
-    let Some(first) = nodes.first().copied() else {
-        return Response::error(GraphQLError::new(
-            "A subscription root field has no field node.",
-        ));
-    };
-    let selection_sets: Vec<&ast::SelectionSet<'_>> = nodes
-        .iter()
-        .filter_map(|node| (*node).selection_set.as_ref())
-        .collect();
-
-    let label = FieldLabel {
-        parent: root_type.name.as_ref(),
-        name: first.name,
-    };
-    let mut path = Path::new();
-    path.push(PathSegment::field(response_key));
-    let mut errors = Vec::new();
-    let executor = Executor {
+    run_operation(
         context,
         fragments,
+        root_type,
+        &operation.selection_set,
+        event,
         deadline,
-        parallel: true,
-    };
-    let outcome = executor
-        .complete_value(
-            &event,
-            &field_ty,
-            label,
-            &selection_sets,
-            first.location,
-            &mut path,
-            &mut errors,
-            0,
-        )
-        .await;
-
-    match outcome {
-        Ok(value) => {
-            let mut data = Object::with_capacity(1);
-            data.insert(response_key, value);
-            Response {
-                data: Some(Value::Object(Arc::new(data))),
-                errors,
-                extensions: take_extensions(context),
-            }
-        }
-        Err(error) => {
-            record_error(&mut errors, error, context.max_errors);
-            let data = if field_ty.is_non_null() {
-                Some(Value::Null)
-            } else {
-                let mut data = Object::new();
-                data.insert(response_key, Value::Null);
-                Some(Value::Object(Arc::new(data)))
-            };
-            Response {
-                data,
-                errors,
-                extensions: take_extensions(context),
-            }
-        }
-    }
+        true,
+    )
+    .await
 }
 
 struct Executor<'doc> {
@@ -831,18 +758,21 @@ impl<'doc> Executor<'doc> {
                 path: path.as_slice(),
                 schema: &self.context.schema,
             };
-            let denial = self.context.authorizer.as_ref().and_then(|authorizer| {
-                let authorization = AuthorizationContext {
-                    context: self.context,
-                    field_name: first.name,
-                    parent_type: object_type.name.as_ref(),
-                    return_type: &ty,
-                    path: path.as_slice(),
-                    args: &empty_args,
-                    info: &info,
-                };
-                authorizer.authorize(&authorization).err()
-            });
+            let denial = match self.context.authorizer.as_ref() {
+                Some(authorizer) => {
+                    let authorization = AuthorizationContext {
+                        context: self.context,
+                        field_name: first.name,
+                        parent_type: object_type.name.as_ref(),
+                        return_type: &ty,
+                        path: path.as_slice(),
+                        args: &empty_args,
+                        info: &info,
+                    };
+                    authorizer.authorize_async(&authorization).await.err()
+                }
+                None => None,
+            };
             let outcome = match denial {
                 Some(error) => Err(error),
                 None => match self.resolve_meta(object_type, parent, first) {
@@ -946,18 +876,21 @@ impl<'doc> Executor<'doc> {
                 path: path.as_slice(),
                 schema: &self.context.schema,
             };
-            let denial = self.context.authorizer.as_ref().and_then(|authorizer| {
-                let authorization = AuthorizationContext {
-                    context: self.context,
-                    field_name: field.name.as_ref(),
-                    parent_type: object_type.name.as_ref(),
-                    return_type: &field.ty,
-                    path: path.as_slice(),
-                    args,
-                    info: &info,
-                };
-                authorizer.authorize(&authorization).err()
-            });
+            let denial = match self.context.authorizer.as_ref() {
+                Some(authorizer) => {
+                    let authorization = AuthorizationContext {
+                        context: self.context,
+                        field_name: field.name.as_ref(),
+                        parent_type: object_type.name.as_ref(),
+                        return_type: &field.ty,
+                        path: path.as_slice(),
+                        args,
+                        info: &info,
+                    };
+                    authorizer.authorize_async(&authorization).await.err()
+                }
+                None => None,
+            };
             if let Some(error) = denial {
                 Err(error)
             } else {

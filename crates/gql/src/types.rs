@@ -81,6 +81,51 @@ pub type ResolveFuture<'a> = futures::future::BoxFuture<'a, FieldResult>;
 /// A boxed stream returned by a subscription resolver.
 pub type SubscriptionStream = BoxStream<'static, FieldResult>;
 
+/// A directive applied to a schema element.
+///
+/// `arguments` holds the directive's arguments in source order, already converted to runtime
+/// values. Applied directives are preserved so `Schema::from_sdl` round-trips through
+/// [`Schema::sdl`](crate::Schema::sdl), and so code-first schemas can describe directives that
+/// have no dedicated field in the type model.
+///
+/// The built-in `@deprecated`, `@specifiedBy` and `@oneOf` directives are also recorded here
+/// when they are parsed, but their authoritative data lives in the dedicated
+/// `deprecation_reason`, `specified_by_url` and `one_of` fields. The SDL printer reads those
+/// fields, so a built-in application is never printed twice.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppliedDirective {
+    /// The directive's name without `@`.
+    pub name: Name,
+    /// Arguments in source order.
+    pub arguments: IndexMap<Name, Value>,
+}
+
+impl AppliedDirective {
+    /// Start defining an applied directive.
+    #[must_use]
+    pub fn new(name: impl Into<Name>) -> Self {
+        Self {
+            name: name.into(),
+            arguments: IndexMap::new(),
+        }
+    }
+
+    /// Add an argument.
+    ///
+    /// Directive arguments are ordered, so arguments print in the order they are added.
+    #[must_use]
+    pub fn argument(mut self, name: impl Into<Name>, value: impl Into<Value>) -> Self {
+        self.arguments.insert(name.into(), value.into());
+        self
+    }
+
+    /// Look up an argument by name.
+    #[must_use]
+    pub fn get_argument(&self, name: &str) -> Option<&Value> {
+        map_get(&self.arguments, name)
+    }
+}
+
 /// The kind of a named GraphQL type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TypeKind {
@@ -307,6 +352,8 @@ pub struct ScalarType {
     pub description: Option<Arc<str>>,
     /// An optional `@specifiedBy` URL.
     pub specified_by_url: Option<Arc<str>>,
+    /// Directives applied to the scalar, in application order.
+    pub directives: Vec<AppliedDirective>,
     pub(crate) serialize: Option<ScalarSerializeFn>,
     pub(crate) parse_value: Option<ScalarParseValueFn>,
     pub(crate) parse_literal: Option<ScalarParseLiteralFn>,
@@ -324,6 +371,7 @@ impl fmt::Debug for ScalarType {
             .field("name", &self.name)
             .field("description", &self.description)
             .field("specified_by_url", &self.specified_by_url)
+            .field("directives", &self.directives)
             .finish_non_exhaustive()
     }
 }
@@ -340,6 +388,7 @@ impl ScalarType {
             name: name.into(),
             description: None,
             specified_by_url: None,
+            directives: Vec::new(),
             serialize: None,
             parse_value: None,
             parse_literal: None,
@@ -366,6 +415,13 @@ impl ScalarType {
     #[must_use]
     pub fn specified_by_url(mut self, url: impl Into<Arc<str>>) -> Self {
         self.specified_by_url = Some(url.into());
+        self
+    }
+
+    /// Add an applied directive.
+    #[must_use]
+    pub fn directive(mut self, directive: AppliedDirective) -> Self {
+        self.directives.push(directive);
         self
     }
 
@@ -541,7 +597,7 @@ impl ScalarType {
 }
 
 /// One value of an enum type.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EnumValue {
     /// The value's name.
     pub name: Name,
@@ -549,6 +605,17 @@ pub struct EnumValue {
     pub description: Option<Arc<str>>,
     /// Why the value is deprecated, when it is.
     pub deprecation_reason: Option<Arc<str>>,
+    /// Directives applied to the value, in application order.
+    pub directives: Vec<AppliedDirective>,
+}
+
+impl EnumValue {
+    /// Add an applied directive.
+    #[must_use]
+    pub fn directive(mut self, directive: AppliedDirective) -> Self {
+        self.directives.push(directive);
+        self
+    }
 }
 
 /// An enum type.
@@ -560,6 +627,8 @@ pub struct EnumType {
     pub description: Option<Arc<str>>,
     /// Values in definition order.
     pub values: IndexMap<Name, EnumValue>,
+    /// Directives applied to the enum, in application order.
+    pub directives: Vec<AppliedDirective>,
     /// Duplicate value names encountered while building, reported by schema validation.
     pub(crate) duplicates: Vec<Name>,
 }
@@ -572,6 +641,7 @@ impl EnumType {
             name: name.into(),
             description: None,
             values: IndexMap::new(),
+            directives: Vec::new(),
             duplicates: Vec::new(),
         }
     }
@@ -580,6 +650,13 @@ impl EnumType {
     #[must_use]
     pub fn description(mut self, description: impl Into<Arc<str>>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// Add an applied directive.
+    #[must_use]
+    pub fn directive(mut self, directive: AppliedDirective) -> Self {
+        self.directives.push(directive);
         self
     }
 
@@ -596,6 +673,7 @@ impl EnumType {
                 name,
                 description: None,
                 deprecation_reason: None,
+                directives: Vec::new(),
             },
         );
         self
@@ -619,6 +697,7 @@ impl EnumType {
                 name,
                 description,
                 deprecation_reason,
+                directives: Vec::new(),
             },
         );
         self
@@ -644,6 +723,8 @@ pub struct InputValue {
     pub default_value: Option<Value>,
     /// Whether the input value is deprecated.
     pub deprecation_reason: Option<Arc<str>>,
+    /// Directives applied to the input value, in application order.
+    pub directives: Vec<AppliedDirective>,
 }
 
 impl InputValue {
@@ -656,6 +737,7 @@ impl InputValue {
             ty,
             default_value: None,
             deprecation_reason: None,
+            directives: Vec::new(),
         }
     }
 
@@ -663,6 +745,13 @@ impl InputValue {
     #[must_use]
     pub fn description(mut self, description: impl Into<Arc<str>>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// Add an applied directive.
+    #[must_use]
+    pub fn directive(mut self, directive: AppliedDirective) -> Self {
+        self.directives.push(directive);
         self
     }
 
@@ -692,6 +781,8 @@ pub struct InputObjectType {
     pub fields: IndexMap<Name, InputValue>,
     /// Whether this is a `@oneOf` input object.
     pub one_of: bool,
+    /// Directives applied to the input object, in application order.
+    pub directives: Vec<AppliedDirective>,
     /// Duplicate field names encountered while building, reported by schema validation.
     pub(crate) duplicates: Vec<Name>,
 }
@@ -705,6 +796,7 @@ impl InputObjectType {
             description: None,
             fields: IndexMap::new(),
             one_of: false,
+            directives: Vec::new(),
             duplicates: Vec::new(),
         }
     }
@@ -713,6 +805,13 @@ impl InputObjectType {
     #[must_use]
     pub fn description(mut self, description: impl Into<Arc<str>>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// Add an applied directive.
+    #[must_use]
+    pub fn directive(mut self, directive: AppliedDirective) -> Self {
+        self.directives.push(directive);
         self
     }
 
@@ -756,6 +855,8 @@ pub struct Field {
     pub ty: TypeRef,
     /// Why the field is deprecated, when it is.
     pub deprecation_reason: Option<Arc<str>>,
+    /// Directives applied to the field, in application order.
+    pub directives: Vec<AppliedDirective>,
     /// The field's resolver. `None` uses the default property resolver.
     pub resolve: Option<ResolveFn>,
     /// The field's subscription resolver, used when the field is a subscription root field.
@@ -780,6 +881,7 @@ impl fmt::Debug for Field {
             .field("args", &self.args)
             .field("ty", &self.ty)
             .field("deprecation_reason", &self.deprecation_reason)
+            .field("directives", &self.directives)
             .field("resolve", &self.resolve.is_some())
             .field("subscribe", &self.subscribe.is_some())
             .finish()
@@ -796,6 +898,7 @@ impl Field {
             args: IndexMap::new(),
             ty,
             deprecation_reason: None,
+            directives: Vec::new(),
             resolve: None,
             subscribe: None,
             complexity: None,
@@ -825,6 +928,13 @@ impl Field {
     #[must_use]
     pub fn deprecation_reason(mut self, reason: impl Into<Arc<str>>) -> Self {
         self.deprecation_reason = Some(reason.into());
+        self
+    }
+
+    /// Add an applied directive.
+    #[must_use]
+    pub fn directive(mut self, directive: AppliedDirective) -> Self {
+        self.directives.push(directive);
         self
     }
 
@@ -936,6 +1046,8 @@ pub struct ObjectType {
     pub fields: IndexMap<Name, Field>,
     /// Names of interfaces implemented by this object.
     pub interfaces: Vec<Name>,
+    /// Directives applied to the object, in application order.
+    pub directives: Vec<AppliedDirective>,
     /// Optional runtime type check used when resolving abstract types.
     pub is_type_of: Option<Arc<dyn Fn(&Value) -> bool + Send + Sync>>,
     /// Duplicate field names encountered while building, reported by schema validation.
@@ -949,6 +1061,7 @@ impl fmt::Debug for ObjectType {
             .field("description", &self.description)
             .field("fields", &self.fields)
             .field("interfaces", &self.interfaces)
+            .field("directives", &self.directives)
             .finish_non_exhaustive()
     }
 }
@@ -962,6 +1075,7 @@ impl ObjectType {
             description: None,
             fields: IndexMap::new(),
             interfaces: Vec::new(),
+            directives: Vec::new(),
             is_type_of: None,
             duplicates: Vec::new(),
         }
@@ -971,6 +1085,13 @@ impl ObjectType {
     #[must_use]
     pub fn description(mut self, description: impl Into<Arc<str>>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// Add an applied directive.
+    #[must_use]
+    pub fn directive(mut self, directive: AppliedDirective) -> Self {
+        self.directives.push(directive);
         self
     }
 
@@ -1029,6 +1150,8 @@ pub struct InterfaceType {
     pub fields: IndexMap<Name, Field>,
     /// Names of interfaces implemented by this interface.
     pub interfaces: Vec<Name>,
+    /// Directives applied to the interface, in application order.
+    pub directives: Vec<AppliedDirective>,
     /// Resolves a runtime value to the name of its concrete object type.
     pub resolve_type: Option<ResolveTypeFn>,
     /// Duplicate field names encountered while building, reported by schema validation.
@@ -1042,6 +1165,7 @@ impl fmt::Debug for InterfaceType {
             .field("description", &self.description)
             .field("fields", &self.fields)
             .field("interfaces", &self.interfaces)
+            .field("directives", &self.directives)
             .finish_non_exhaustive()
     }
 }
@@ -1055,6 +1179,7 @@ impl InterfaceType {
             description: None,
             fields: IndexMap::new(),
             interfaces: Vec::new(),
+            directives: Vec::new(),
             resolve_type: None,
             duplicates: Vec::new(),
         }
@@ -1064,6 +1189,13 @@ impl InterfaceType {
     #[must_use]
     pub fn description(mut self, description: impl Into<Arc<str>>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// Add an applied directive.
+    #[must_use]
+    pub fn directive(mut self, directive: AppliedDirective) -> Self {
+        self.directives.push(directive);
         self
     }
 
@@ -1121,6 +1253,8 @@ pub struct UnionType {
     pub description: Option<Arc<str>>,
     /// Member object type names.
     pub types: Vec<Name>,
+    /// Directives applied to the union, in application order.
+    pub directives: Vec<AppliedDirective>,
     /// Resolves a runtime value to the name of its concrete object type.
     pub resolve_type: Option<ResolveTypeFn>,
 }
@@ -1131,6 +1265,7 @@ impl fmt::Debug for UnionType {
             .field("name", &self.name)
             .field("description", &self.description)
             .field("types", &self.types)
+            .field("directives", &self.directives)
             .finish_non_exhaustive()
     }
 }
@@ -1143,6 +1278,7 @@ impl UnionType {
             name: name.into(),
             description: None,
             types: Vec::new(),
+            directives: Vec::new(),
             resolve_type: None,
         }
     }
@@ -1151,6 +1287,13 @@ impl UnionType {
     #[must_use]
     pub fn description(mut self, description: impl Into<Arc<str>>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// Add an applied directive.
+    #[must_use]
+    pub fn directive(mut self, directive: AppliedDirective) -> Self {
+        self.directives.push(directive);
         self
     }
 

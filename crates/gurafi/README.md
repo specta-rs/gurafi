@@ -134,7 +134,7 @@ Fields are **not** derived: declaring them explicitly keeps the resolver, argume
 rules next to each other. The derive implements `ObjectModel` (name and description),
 `OutputType`, and `IntoValue` (the model travels through the executor as `Value::External`).
 
-Fields can be added in four flavours, plus `expose`:
+Fields can be added in four flavours (each with a `*_with_info` form), plus `expose`:
 
 ```rust
 o.field("name", |g: &Giraffe, _: NoArgs, _: &Ctx| g.name.clone());
@@ -142,6 +142,17 @@ o.field_result("name", |g, _: NoArgs, _| Result::Ok(g.name.clone()));
 o.field_async("name", |g, _: NoArgs, _| Box::pin(async move { g.name.clone() }));
 o.field_result_async("name", |g, _: NoArgs, _| {
     Box::pin(async move { Result::Ok(g.name.clone()) })
+});
+```
+
+Calling `schema.object` again for the same model reopens it and adds fields, which lets a type
+span modules. `object_fields` says the same thing explicitly; `object_field` adds one field
+without a closure. `interface`/`interface_fields` and the root `*_fields` methods behave the
+same way. Declarations merge; duplicate field names are still build errors.
+
+```rust
+schema.object_fields::<Giraffe>(|o| {
+    o.field("heightMeters", |g: &Giraffe, _: NoArgs, _: &Ctx| g.height);
 });
 ```
 
@@ -166,11 +177,12 @@ boxes resolver futures anyway, so no extra allocation is added.
 ## Arguments and input objects
 
 Every object and root resolver's second parameter is its arguments type. It must implement
-`InputObject`, which `#[derive(Input)]` provides. Use `NoArgs` (an alias for `()`) when there are
-no arguments. A field's GraphQL arguments are exactly that type's fields:
+`InputObject`, which `#[derive(Input)]` (or its `#[derive(Args)]` alias) provides. Use `NoArgs`
+(an alias for `()`) when there are no arguments. A field's GraphQL arguments are exactly that
+type's fields:
 
 ```rust
-#[derive(Input)]
+#[derive(Args)]
 struct FriendsArgs {
     #[graphql(description = "Max results", default = 10)]
     limit: i32,
@@ -180,23 +192,46 @@ struct FriendsArgs {
 }
 ```
 
+An `Input` type is **args-only by default**: it produces
+`friends(limit: Int! = 10, after: String, before: String)`, not a named
+`input FriendsArgs`. A type used inside another input must be named:
+
+```rust
+#[derive(Input)]
+#[graphql(name = "FilterInput")]
+struct Filter {
+    prefix: Option<String>,
+}
+
+#[derive(Args)]
+struct SearchArgs {
+    filter: Option<Filter>, // FilterInput
+}
+```
+
+Using an unnamed input nested inside another is a build error that names the fix.
+
 Attribute support:
 
 | Attribute | Meaning |
 | --- | --- |
-| `#[graphql(name = "...")]` | Rename the type or field. |
+| `#[graphql(name = "...")]` | Make the type a reusable named input object, or rename a field. |
 | `#[graphql(description = "...")]` | Set a description (doc comments also work). |
 | `#[graphql(default = expr)]` | Default value, typed as the field's Rust type. |
 | `#[graphql(default_with = "path")]` | Default computed by calling `path()`. |
 | `#[graphql(deprecated)]` / `#[graphql(deprecated = "reason")]` | Deprecate a field. |
+| `#[graphql(validate = "path")]` | Validate after coercion; `path` receives `&Self` on the type or `&FieldType` on a field. |
+| `#[graphql(one_of)]` | Register a named input as a `@oneOf` input. |
 
 `Option<T>` fields are optional. Every other field without a default is required. Nested input
-objects, enums, custom scalars and lists work directly (`Option<Vec<Color>>`, `Option<Filter>`,
-...). Input objects can be self-referential through a nullable or list field; the registration
-step detects and stops re-entry.
+objects, enums, custom scalars and lists work directly (`Option<Vec<Color>>`,
+`Option<FilterInput>`, ...). Input objects can be self-referential through a nullable or list
+field; the registration step detects and stops re-entry.
 
-Use `#[derive(Input)]` types as fields of other input types as well as field arguments. Their
-`gql::InputObjectType` is registered automatically.
+Validation functions return `Result<(), gql::GraphQLError>`; failures become normal field errors.
+For rules that need the request context, chain `.validate::<Args>(|args, ctx| ...)` on the field.
+A `@oneOf` input requires every field to be `Option<T>`, forbids defaults, and accepts exactly one
+non-null field per value.
 
 ## Field options
 
@@ -218,14 +253,28 @@ q.field("giraffe", ...)
 - `auth` runs before the resolver, including before argument coercion. A denial is a normal
   GraphQL error, so it participates in null propagation: a nullable field becomes `null`, and a
   denial in a non-null field nulls its parent as the specification requires. `auth_error` sets
-  the client-visible message (default `"Not authorized"`).
+  the client-visible message (default `"Not authorized"`). `auth_async` takes a boxed future.
 - `as_abstract` declares the field's GraphQL type as an interface or union while the resolver
   still returns concrete model values. List and nullability wrappers are preserved, so
   `Vec<Giraffe>` with `as_abstract(node)` becomes `[Node]!`.
+- `nullable`, `non_null` and `nullable_items` adjust the declared nullability. `non_null` on an
+  `Option`-returning resolver is a build error.
+- `as_type::<T>()` (alias `returns::<T>()`) replaces the GraphQL type and is checked at build:
+  scalar-to-scalar, enum-to-enum, or a truthful abstract-type relationship. It cannot see runtime
+  values, so a dishonest override still fails at execution time.
+
+Object-level rules are declared on the builder with `o.auth(...)` and apply to every field in
+every declaration for that model. Interface rules (`i.auth(...)`) and interface-field rules
+(`i.field::<T>("f").auth(...)`) are inherited by implementing objects. All levels compose.
 
 Authentication (who the caller is) belongs to the server: it validates credentials and passes
 the result to every request as the context. Authorization (whether this caller may see this
-field) is the per-field `auth` predicate. The same mechanism works for root and nested fields.
+field) is the `auth` predicate. The same mechanism works for root and nested fields.
+
+Resolvers can receive `&gql::ResolveInfo<'_>` with the `field_with_info`,
+`field_result_with_info`, `field_async_with_info` and `field_result_async_with_info` methods
+(and the root equivalents). The info exposes the field name, parent type, return type, response
+path and schema; `gql` does not currently expose the selection AST.
 
 ## Enums, scalars and IDs
 
@@ -298,6 +347,15 @@ Interface fields have no resolvers; execution uses the concrete object's field r
 validates that every implementing object provides a compatible field and argument set when the
 schema is built.
 
+When the object should reuse the interface's type and arguments and only add a resolver, use
+`resolve_inherited`. The build finds the matching field (including through interfaces that
+implement other interfaces), copies its type and arguments, and checks that the resolver's args
+type and return type agree:
+
+```rust
+o.resolve_inherited("id", |g: &Giraffe, _: NoArgs, _: &Ctx| ID::new(g.name.clone()));
+```
+
 Unions list their members explicitly, or a `#[derive(Union)]` enum provides the output type:
 
 ```rust
@@ -334,8 +392,21 @@ schema.subscription(|s| {
 
 The resolver returns a `Stream<Item = Result<T, gql::GraphQLError>> + Send + 'static`. It is
 called once when the subscription starts; anything it borrows from the context must be cloned
-first because the stream outlives the call (channels and `Arc`s are the usual choice). `gql`
-executes the field's selection set once per event.
+first because the stream outlives the call (channels and `Arc`s are the usual choice). Each event
+is the field's own value: the builder wraps it as the subscription root value and extracts it
+again, matching the specification's event model.
+
+When the event type differs from the field value, `field_map` takes a separate resolver:
+
+```rust
+s.field_map(
+    "giraffeBorn",
+    |_: NoArgs, _: &Ctx| events(),                  // Stream<Item = Result<BornEvent, _>>
+    |event: &BornEvent, _: NoArgs, _: &Ctx| Ok(event.giraffe.clone()),
+);
+```
+
+`field_with_info` passes `&ResolveInfo` to the subscribe closure.
 
 ## Building and serving
 
@@ -345,7 +416,16 @@ let gql_schema: gql::Schema = schema.build()?;
 
 `build` collects every problem it can find: duplicate type names, fields referencing an object
 that was never registered, missing unions, invalid interface implementations, invalid input
-cycles, and invalid defaults. `SchemaError::errors()` gives the individual messages.
+cycles, invalid defaults, dishonest type overrides and inherited fields whose resolvers do not
+match their interface. `SchemaError::errors()` gives the individual messages.
+
+`Schema` is `Clone`, so the declaration survives building. `build_with(BuildOptions)` sets root
+descriptions and stable type ordering; `build_clone()` builds from a clone:
+
+```rust
+let schema = schema
+    .build_with(BuildOptions::new().query_description("Root fields.").sort_types(true))?;
+```
 
 The resulting `gql::Schema` is the same value the rest of the ecosystem uses. A server executes
 requests with:

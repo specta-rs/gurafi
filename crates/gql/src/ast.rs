@@ -278,8 +278,9 @@ impl<'a> Directive<'a> {
 pub enum Value<'a> {
     /// A variable reference, without the `$`.
     Variable(&'a str),
-    /// An integer literal. Parsed as `i64` so validation can report out-of-range literals.
-    Int(i64),
+    /// An integer literal. Parsed as `i128` so validation can report out-of-range literals for
+    /// both the 32-bit `Int` scalar and custom scalars that accept larger integers.
+    Int(i128),
     /// A float literal.
     Float(f64),
     /// A string or block string.

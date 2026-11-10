@@ -23,6 +23,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     }
 
     let attrs = parse_type_attrs(&input.attrs)?;
+    crate::attr::reject_input_only(&attrs, &input.ident)?;
     let ident = &input.ident;
     let name = attrs
         .name

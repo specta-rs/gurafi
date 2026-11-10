@@ -13,8 +13,8 @@ use crate::{
     Value,
     schema::Schema,
     types::{
-        DirectiveDefinition, EnumType, Field, InputObjectType, InputValue, InterfaceType, Name,
-        ObjectType, ScalarType, Type, UnionType,
+        AppliedDirective, DirectiveDefinition, EnumType, Field, InputObjectType, InputValue,
+        InterfaceType, Name, ObjectType, ScalarType, Type, UnionType,
     },
 };
 
@@ -26,6 +26,12 @@ const BUILT_IN_DIRECTIVES: [&str; 5] = ["skip", "include", "deprecated", "specif
 
 /// The reason the specification assigns when none is supplied.
 const DEFAULT_DEPRECATION_REASON: &str = "No longer supported";
+
+/// Directives whose authoritative data lives in a dedicated model field.
+///
+/// They are still recorded in [`AppliedDirective`] lists, but printing them from there as well
+/// would duplicate the `deprecation_reason`, `specified_by_url` and `one_of` fields.
+const DEDICATED_DIRECTIVES: [&str; 3] = ["deprecated", "specifiedBy", "oneOf"];
 
 /// Render a schema as GraphQL SDL.
 #[must_use]
@@ -191,6 +197,7 @@ fn print_scalar(scalar: &ScalarType) -> String {
             print_value(&Value::from(url.as_ref()))
         );
     }
+    push_applied_directives(&mut output, &scalar.directives);
     output
 }
 
@@ -199,6 +206,7 @@ fn print_object(object: &ObjectType) -> String {
     push_description(&mut output, object.description.as_deref(), "");
     let _ = write!(output, "type {}", object.name);
     push_implements(&mut output, &object.interfaces);
+    push_applied_directives(&mut output, &object.directives);
     push_fields(&mut output, object.fields.values());
     output
 }
@@ -208,6 +216,7 @@ fn print_interface(interface: &InterfaceType) -> String {
     push_description(&mut output, interface.description.as_deref(), "");
     let _ = write!(output, "interface {}", interface.name);
     push_implements(&mut output, &interface.interfaces);
+    push_applied_directives(&mut output, &interface.directives);
     push_fields(&mut output, interface.fields.values());
     output
 }
@@ -216,6 +225,7 @@ fn print_union(union: &UnionType) -> String {
     let mut output = String::new();
     push_description(&mut output, union.description.as_deref(), "");
     let _ = write!(output, "union {}", union.name);
+    push_applied_directives(&mut output, &union.directives);
     if !union.types.is_empty() {
         output.push_str(" = ");
         let members: Vec<&str> = union.types.iter().map(|name| name.as_ref()).collect();
@@ -228,6 +238,7 @@ fn print_enum(enumeration: &EnumType) -> String {
     let mut output = String::new();
     push_description(&mut output, enumeration.description.as_deref(), "");
     let _ = write!(output, "enum {}", enumeration.name);
+    push_applied_directives(&mut output, &enumeration.directives);
     if enumeration.values.is_empty() {
         return output;
     }
@@ -236,6 +247,7 @@ fn print_enum(enumeration: &EnumType) -> String {
         push_description(&mut output, value.description.as_deref(), "  ");
         let _ = write!(output, "  {}", value.name);
         push_deprecation(&mut output, value.deprecation_reason.as_deref());
+        push_applied_directives(&mut output, &value.directives);
         output.push('\n');
     }
     output.push('}');
@@ -249,6 +261,7 @@ fn print_input_object(input: &InputObjectType) -> String {
     if input.one_of {
         output.push_str(" @oneOf");
     }
+    push_applied_directives(&mut output, &input.directives);
     if input.fields.is_empty() {
         return output;
     }
@@ -269,6 +282,7 @@ fn print_directive(directive: &DirectiveDefinition) -> String {
     if directive.repeatable {
         output.push_str(" repeatable");
     }
+    push_deprecation(&mut output, directive.deprecation_reason.as_deref());
     let locations: Vec<&str> = directive
         .locations
         .iter()
@@ -308,6 +322,7 @@ fn print_field(field: &Field, indent: &str) -> String {
     output.push_str(&print_arguments(&field.args, indent));
     let _ = write!(output, ": {}", field.ty);
     push_deprecation(&mut output, field.deprecation_reason.as_deref());
+    push_applied_directives(&mut output, &field.directives);
     output
 }
 
@@ -322,6 +337,7 @@ fn print_arguments(args: &IndexMap<Name, InputValue>, indent: &str) -> String {
             .as_deref()
             .is_some_and(|description| !description.is_empty())
             || argument.deprecation_reason.is_some()
+            || !argument.directives.is_empty()
     });
 
     if !multiline {
@@ -351,6 +367,7 @@ fn print_input_value(value: &InputValue) -> String {
         output.push_str(&print_value(default));
     }
     push_deprecation(&mut output, value.deprecation_reason.as_deref());
+    push_applied_directives(&mut output, &value.directives);
     output
 }
 
@@ -367,12 +384,46 @@ fn push_deprecation(output: &mut String, reason: Option<&str>) {
     }
 }
 
+/// Print every applied directive that does not have a dedicated model field.
+fn push_applied_directives(output: &mut String, directives: &[AppliedDirective]) {
+    for directive in directives {
+        if DEDICATED_DIRECTIVES.contains(&directive.name.as_ref()) {
+            continue;
+        }
+        output.push_str(" @");
+        output.push_str(&directive.name);
+        if directive.arguments.is_empty() {
+            continue;
+        }
+        output.push('(');
+        for (index, (name, value)) in directive.arguments.iter().enumerate() {
+            if index != 0 {
+                output.push_str(", ");
+            }
+            output.push_str(name);
+            output.push_str(": ");
+            output.push_str(&print_value(value));
+        }
+        output.push(')');
+    }
+}
+
 /// Write a description as a block string above its definition.
 fn push_description(output: &mut String, description: Option<&str>, indent: &str) {
     let Some(description) = description else {
         return;
     };
     if description.is_empty() {
+        return;
+    }
+
+    // Block strings normalise every line ending to `\n`, so a description containing a carriage
+    // return would not survive a print/parse round-trip. Print those as a normal (escaped)
+    // string instead, where `\r` has an explicit escape.
+    if description.contains('\r') {
+        output.push_str(indent);
+        output.push_str(&print_value(&Value::from(description)));
+        output.push('\n');
         return;
     }
 

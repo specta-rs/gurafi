@@ -8,7 +8,7 @@
 
 #![allow(dead_code)]
 
-use gurafi::{Enum, ID, Input, NoArgs, Object, Result, Schema, Union, expose};
+use gurafi::{BuildOptions, Enum, ID, Input, NoArgs, Object, Result, Schema, Union, expose};
 
 /// Per-request data. A real server puts the authenticated user and database handles here.
 struct Ctx {
@@ -72,7 +72,8 @@ fn main() {
 
     schema.object::<Giraffe>(|o| {
         o.implements(node);
-        o.field("id", |g: &Giraffe, _: NoArgs, _: &Ctx| {
+        // The type and arguments come from `Node`; only the resolver is new.
+        o.resolve_inherited("id", |g: &Giraffe, _: NoArgs, _: &Ctx| {
             ID::new(g.name.clone())
         });
         o.expose(expose!(Giraffe::name));
@@ -132,9 +133,16 @@ fn main() {
             .auth(|ctx: &Ctx| ctx.user.is_some())
             .auth_error("Sign in to see your name.")
             .complexity(1);
+
+        q.field_with_info("request", |_: NoArgs, _: &Ctx, info| {
+            format!("{}:{}", info.parent_type, info.field_name)
+        })
+        .description("The resolved field's own name.");
     });
 
-    let schema = schema.build().expect("the schema is valid");
+    let schema = schema
+        .build_with(BuildOptions::new().query_description("The zoo's entry points."))
+        .expect("the schema is valid");
 
     println!("{}", schema.sdl());
 
@@ -145,6 +153,7 @@ fn main() {
                 giraffes(limit: 1) { name heightMeters color }
                 search { __typename ... on Zookeeper { name } }
                 myName
+                request
             }"#,
         ),
         &gql::ExecutionOptions::with_context(Ctx { user: None }),

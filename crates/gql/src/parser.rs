@@ -563,20 +563,24 @@ impl<'a> Parser<'a> {
         self.advance()?;
         match kind {
             TokenKind::Int(raw) => {
-                let value = raw.parse::<i64>().map_err(|_| {
-                    self.error(location, format!("Int value out of range: \"{raw}\"."))
+                // Literals larger than `i128` are the only ones the AST cannot represent. The
+                // grammar has no upper bound, but every practical custom scalar fits; `Int`
+                // coercion still rejects anything outside 32 bits.
+                let value = raw.parse::<i128>().map_err(|_| {
+                    self.error(
+                        location,
+                        format!("Int value is too large to represent: \"{raw}\"."),
+                    )
                 })?;
                 Ok(Value::Int(value))
             }
             TokenKind::Float(raw) => {
+                // Grammar-valid floats that overflow `f64` become an infinity. That is still a
+                // valid Float *literal*; the built-in scalar's literal coercion rejects
+                // non-finite values, while a custom scalar may interpret the literal itself.
                 let value = raw.parse::<f64>().map_err(|_| {
                     self.error(location, format!("Invalid float value: \"{raw}\"."))
                 })?;
-                if !value.is_finite() {
-                    return Err(
-                        self.error(location, format!("Float value out of range: \"{raw}\"."))
-                    );
-                }
                 Ok(Value::Float(value))
             }
             TokenKind::String(value) | TokenKind::BlockString(value) => Ok(Value::String(value)),

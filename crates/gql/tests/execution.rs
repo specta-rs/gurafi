@@ -1062,8 +1062,8 @@ fn executes_subscriptions() {
             Field::new("counter", TypeRef::named("Counter").non_null()).subscribe(|_| {
                 Box::pin(async {
                     Ok(futures::stream::iter(vec![
-                        Ok(value([("value", Value::Int(1))])),
-                        Ok(value([("value", Value::Int(2))])),
+                        Ok(value([("counter", value([("value", Value::Int(1))]))])),
+                        Ok(value([("counter", value([("value", Value::Int(2))]))])),
                     ])
                     .boxed())
                 })
@@ -1131,58 +1131,61 @@ fn subscription_source_errors_follow_nullability() {
 }
 
 #[test]
-fn subscription_events_complete_without_rerunning_root_resolvers() {
+fn subscription_events_are_root_values() {
     let subscribe_calls = Arc::new(AtomicUsize::new(0));
     let resolve_calls = Arc::new(AtomicUsize::new(0));
 
     let scalar_subscribe_calls = Arc::clone(&subscribe_calls);
     let scalar_resolve_calls = Arc::clone(&resolve_calls);
 
-    let schema =
-        Schema::builder()
-            .object(ObjectType::new("Query").field(Field::new("ping", TypeRef::string())))
-            .object(
-                ObjectType::new("Subscription")
-                    .field(
-                        Field::new("scalar", TypeRef::int().non_null())
-                            .subscribe(move |_| {
-                                let calls = Arc::clone(&scalar_subscribe_calls);
-                                Box::pin(async move {
-                                    calls.fetch_add(1, Ordering::SeqCst);
-                                    Ok(futures::stream::iter(vec![
-                                        Ok::<Value, GraphQLError>(Value::Int(1)),
-                                        Ok(Value::Int(2)),
-                                    ])
-                                    .boxed())
-                                })
-                            })
-                            .resolve(move |_| {
-                                let calls = Arc::clone(&scalar_resolve_calls);
-                                Box::pin(async move {
-                                    calls.fetch_add(1, Ordering::SeqCst);
-                                    Ok(Value::Int(99))
-                                })
-                            }),
-                    )
-                    .field(
-                        Field::new("widget", TypeRef::named("Widget")).subscribe(|_| {
-                            Box::pin(async {
-                                Ok(futures::stream::iter(vec![Ok::<Value, GraphQLError>(value([
-                                    ("name", Value::from("a")),
-                                    ("count", Value::Int(1)),
-                                ]))])
+    let schema = Schema::builder()
+        .object(ObjectType::new("Query").field(Field::new("ping", TypeRef::string())))
+        .object(
+            ObjectType::new("Subscription")
+                .field(
+                    Field::new("scalar", TypeRef::int().non_null())
+                        .subscribe(move |_| {
+                            let calls = Arc::clone(&scalar_subscribe_calls);
+                            Box::pin(async move {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                Ok(futures::stream::iter(vec![
+                                    Ok::<Value, GraphQLError>(Value::Int(1)),
+                                    Ok(Value::Int(2)),
+                                ])
                                 .boxed())
                             })
+                        })
+                        .resolve(move |_| {
+                            let calls = Arc::clone(&scalar_resolve_calls);
+                            Box::pin(async move {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                Ok(Value::Int(99))
+                            })
                         }),
+                )
+                .field(
+                    Field::new("widget", TypeRef::named("Widget")).subscribe(|_| {
+                        Box::pin(async {
+                            Ok(
+                                futures::stream::iter(vec![Ok::<Value, GraphQLError>(value([(
+                                    "widget",
+                                    value([("name", Value::from("a")), ("count", Value::Int(1))]),
+                                )]))])
+                                .boxed(),
+                            )
+                        })
+                    }),
+                )
+                .field(
+                    Field::new(
+                        "widgets",
+                        TypeRef::named("Widget").non_null().list().non_null(),
                     )
-                    .field(
-                        Field::new(
-                            "widgets",
-                            TypeRef::named("Widget").non_null().list().non_null(),
-                        )
-                        .subscribe(|_| {
-                            Box::pin(async {
-                                Ok(futures::stream::iter(vec![Ok::<Value, GraphQLError>(
+                    .subscribe(|_| {
+                        Box::pin(async {
+                            Ok(
+                                futures::stream::iter(vec![Ok::<Value, GraphQLError>(value([(
+                                    "widgets",
                                     Value::List(vec![
                                         value([
                                             ("name", Value::from("a")),
@@ -1193,39 +1196,46 @@ fn subscription_events_complete_without_rerunning_root_resolvers() {
                                             ("count", Value::Int(2)),
                                         ]),
                                     ]),
-                                )])
-                                .boxed())
-                            })
-                        }),
-                    )
-                    .field(Field::new("nullable", TypeRef::string()).subscribe(|_| {
-                        Box::pin(async {
-                            Ok(
-                                futures::stream::iter(vec![Ok::<Value, GraphQLError>(Value::Null)])
-                                    .boxed(),
+                                )]))])
+                                .boxed(),
                             )
                         })
-                    }))
-                    .field(
-                        Field::new("strict", TypeRef::string().non_null()).subscribe(|_| {
-                            Box::pin(async {
-                                Ok(futures::stream::iter(vec![Ok::<Value, GraphQLError>(
+                    }),
+                )
+                .field(Field::new("nullable", TypeRef::string()).subscribe(|_| {
+                    Box::pin(async {
+                        Ok(
+                            futures::stream::iter(vec![Ok::<Value, GraphQLError>(value([(
+                                "nullable",
+                                Value::Null,
+                            )]))])
+                            .boxed(),
+                        )
+                    })
+                }))
+                .field(
+                    Field::new("strict", TypeRef::string().non_null()).subscribe(|_| {
+                        Box::pin(async {
+                            Ok(
+                                futures::stream::iter(vec![Ok::<Value, GraphQLError>(value([(
+                                    "strict",
                                     Value::Null,
-                                )])
-                                .boxed())
-                            })
-                        }),
-                    ),
-            )
-            .object(
-                ObjectType::new("Widget")
-                    .field(Field::new("name", TypeRef::string().non_null()))
-                    .field(Field::new("count", TypeRef::int())),
-            )
-            .query("Query")
-            .subscription("Subscription")
-            .build()
-            .expect("valid schema");
+                                )]))])
+                                .boxed(),
+                            )
+                        })
+                    }),
+                ),
+        )
+        .object(
+            ObjectType::new("Widget")
+                .field(Field::new("name", TypeRef::string().non_null()))
+                .field(Field::new("count", TypeRef::int())),
+        )
+        .query("Query")
+        .subscription("Subscription")
+        .build()
+        .expect("valid schema");
 
     fn responses(schema: &Schema, query: &str) -> Vec<Response> {
         let subscription = block_on(gql::subscribe(
@@ -1237,16 +1247,18 @@ fn subscription_events_complete_without_rerunning_root_resolvers() {
         block_on(subscription.stream.collect::<Vec<_>>())
     }
 
-    // A scalar event is completed directly against the field's scalar type.
+    // Each event is the operation's root value, so the root field's `resolve` runs for every
+    // event instead of the event being used as the field value directly.
     let scalar = responses(&schema, "subscription { scalar }");
     assert_eq!(scalar.len(), 2);
     assert!(scalar[0].errors.is_empty(), "{:?}", scalar[0].errors);
-    assert_eq!(scalar[0].data, Some(value([("scalar", Value::Int(1))])));
-    assert_eq!(scalar[1].data, Some(value([("scalar", Value::Int(2))])));
+    assert_eq!(scalar[0].data, Some(value([("scalar", Value::Int(99))])));
+    assert_eq!(scalar[1].data, Some(value([("scalar", Value::Int(99))])));
     assert_eq!(subscribe_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(resolve_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(resolve_calls.load(Ordering::SeqCst), 2);
 
-    // An object event is completed against the field's selection set.
+    // Without a `resolve` resolver the default property resolver reads the root field's name from
+    // the event object.
     let widget = responses(&schema, "subscription { widget { name count } }");
     assert_eq!(widget.len(), 1);
     assert!(widget[0].errors.is_empty(), "{:?}", widget[0].errors);
@@ -1273,7 +1285,7 @@ fn subscription_events_complete_without_rerunning_root_resolvers() {
         )]))
     );
 
-    // A null event is a legal value for a nullable root field.
+    // A null root-field value is a legal event for a nullable field.
     let nullable = responses(&schema, "subscription { nullable }");
     assert_eq!(nullable.len(), 1);
     assert!(nullable[0].errors.is_empty(), "{:?}", nullable[0].errors);
@@ -1294,8 +1306,8 @@ fn subscription_events_complete_without_rerunning_root_resolvers() {
         Some(&[gql::PathSegment::field("strict")][..])
     );
 
-    // The root field's `resolve` was never called; `subscribe` ran exactly once.
-    assert_eq!(resolve_calls.load(Ordering::SeqCst), 0);
+    // `subscribe` ran exactly once and `resolve` ran once per scalar event.
+    assert_eq!(resolve_calls.load(Ordering::SeqCst), 2);
     assert_eq!(subscribe_calls.load(Ordering::SeqCst), 1);
 }
 

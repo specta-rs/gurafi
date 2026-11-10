@@ -62,9 +62,10 @@ fn collect_value_usages<'a>(
         Value::List(items) => {
             let item_type = expected.and_then(list_item);
             for item in items {
-                // An argument or input-field default covers the value in that position, not the
-                // items inside a list literal.
-                collect_value_usages(schema, item, item_type, false, location, out);
+                // graphql-js keeps the enclosing argument/input-field definition while visiting
+                // list elements, so a default on `g(xs: ...)` also covers a variable nested in a
+                // list literal such as `g(xs: [$x])`.
+                collect_value_usages(schema, item, item_type, has_default, location, out);
             }
         }
         Value::Object(fields) => {

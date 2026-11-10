@@ -32,12 +32,14 @@ struct FriendsArgs {
 }
 
 #[derive(Input)]
+#[graphql(name = "FilterInput")]
 struct Filter {
     color: Option<Color>,
     nested: Option<NestedFilter>,
 }
 
 #[derive(Input)]
+#[graphql(name = "NestedFilterInput")]
 struct NestedFilter {
     text: String,
     #[graphql(default = true)]
@@ -347,13 +349,13 @@ fn arguments_are_derived_from_the_args_type() {
 fn nested_input_objects_are_registered() {
     let schema = build_full_schema();
     let filter = schema
-        .input_object_type("Filter")
-        .expect("Filter registered by the field's args");
+        .input_object_type("FilterInput")
+        .expect("FilterInput registered by the field's args");
     assert_eq!(filter.fields["color"].ty.to_string(), "Color");
-    assert_eq!(filter.fields["nested"].ty.to_string(), "NestedFilter");
+    assert_eq!(filter.fields["nested"].ty.to_string(), "NestedFilterInput");
 
     let nested = schema
-        .input_object_type("NestedFilter")
+        .input_object_type("NestedFilterInput")
         .expect("nested input registered");
     assert_eq!(nested.fields["text"].ty.to_string(), "String!");
     assert_eq!(nested.fields["exact"].ty.to_string(), "Boolean!");
@@ -468,22 +470,22 @@ fn build_reports_unregistered_object_types() {
 }
 
 #[test]
-fn build_reports_duplicate_registrations() {
+fn a_second_object_declaration_merges_fields() {
     let mut schema = Schema::<Ctx>::new();
-    schema.object::<User>(|_| {});
-    schema.object::<User>(|_| {});
+    schema.object::<User>(|o| {
+        o.expose(expose!(User::name));
+    });
+    schema.object_fields::<User>(|o| {
+        o.field("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
+    });
     schema.query(|q| {
         q.field("ok", |_: NoArgs, _: &Ctx| true);
     });
 
-    let error = schema.build().expect_err("build must fail");
-    assert!(
-        error
-            .errors()
-            .iter()
-            .any(|error| error.message().contains("registered more than once")),
-        "unexpected errors: {error}"
-    );
+    let schema = schema.build().expect("merged object builds");
+    let user = schema.object_type("User").expect("User exists");
+    assert!(user.get_field("name").is_some());
+    assert!(user.get_field("id").is_some());
 }
 
 #[test]

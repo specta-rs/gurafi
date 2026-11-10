@@ -2,9 +2,9 @@
 //!
 //! A subscription is set up like a query: the document is parsed, validated, an operation is
 //! selected and its variables are coerced. The single root field's `subscribe` resolver then
-//! produces a source stream. Each event is already the value of that root field, so event
-//! execution completes the field's declared type directly instead of resolving the root field
-//! again.
+//! produces a source stream. Per October 2021 6.2.3.2 each source event is the operation's root
+//! value: event execution re-runs the subscription selection set with the event as the parent, so
+//! the root field's `resolve` resolver (or the default property resolver) runs for every event.
 
 use std::{fmt, sync::Arc, time::Instant};
 
@@ -90,6 +90,7 @@ pub(crate) async fn subscribe(
             field_cost: 1,
             max_complexity: options.max_complexity,
             max_depth: options.max_depth,
+            max_breadth: options.max_breadth,
         },
     )
     .map_err(Response::error)?;
@@ -186,7 +187,7 @@ pub(crate) async fn subscribe(
             args: &args,
             info: &info,
         };
-        if let Err(error) = authorizer.authorize(&authorization) {
+        if let Err(error) = authorizer.authorize_async(&authorization).await {
             return Err(Response::error(error));
         }
     }
@@ -225,8 +226,6 @@ pub(crate) async fn subscribe(
                             &context,
                             &query,
                             operation_name.as_deref(),
-                            &response_key,
-                            field_ty.clone(),
                             value,
                             deadline,
                         )

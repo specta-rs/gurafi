@@ -30,6 +30,31 @@ Fields are declared explicitly. This is where resolvers, arguments, authorizatio
 and complexity estimates live, so keeping the declaration next to the code beats
 deriving field lists automatically.
 
+### Splitting a definition across modules
+
+`object` reopens an object that already exists, so a type can be declared in
+several places. The merge keeps descriptions, interfaces and the generated
+`is_type_of` check. A field name declared twice is still a build error.
+
+```rust
+schema.object::<Giraffe>(|o| {
+    o.expose(expose!(Giraffe::name));
+});
+
+// in another module, or later in the same one
+schema.object_fields::<Giraffe>(|o| {
+    o.field("height", |g: &Giraffe, _: NoArgs, _: &Ctx| g.height);
+});
+
+schema.object_field::<Giraffe, _, NoArgs, _>("age", |g: &Giraffe, _: NoArgs, _: &Ctx| {
+    g.age
+});
+```
+
+`interface`/`interface_fields`, `query`/`query_fields`, `mutation`/`mutation_fields`
+and `subscription`/`subscription_fields` behave the same way. Roots already
+append; the `*_fields` spellings just say so at the call site.
+
 ### Resolvers
 
 Object fields receive the model, their arguments and the context:
@@ -41,7 +66,7 @@ o.field("age", |g: &Giraffe, _: gurafi::NoArgs, _: &Ctx| {
 .description("Age in years");
 ```
 
-Four variants exist:
+Four base variants exist; each has a `*_with_info` form:
 
 | Method | Sync/async | Failure |
 | --- | --- | --- |
@@ -50,7 +75,17 @@ Four variants exist:
 | `field_async` | async | infallible |
 | `field_result_async` | async | `Result` |
 
-Root fields omit the model argument and receive `(Args, &Ctx)`.
+Each has a `*_with_info` variant that appends `&gql::ResolveInfo<'_>` to the
+closure, for field name, parent type, return type, response path and schema:
+
+```rust
+o.field_with_info("path", |g: &Giraffe, _: NoArgs, _: &Ctx, info| {
+    format!("{}.{}", info.parent_type, info.field_name)
+});
+```
+
+Root fields omit the model argument and receive `(Args, &Ctx)`; their
+`*_with_info` variants work the same way.
 
 ### Field options
 
@@ -70,15 +105,60 @@ Authorization is per field. Authentication belongs to the server: it validates
 the request and puts the user into the context passed to
 `gql::ExecutionOptions`, exactly as `suku`'s context extractor does.
 
-## Arguments and input objects
-
-A resolver's second parameter is its arguments type. Derive `Input` and the
-GraphQL arguments follow automatically; there is no second declaration.
+A rule for a whole type is declared once, on the builder:
 
 ```rust
-use gurafi::Input;
+schema.object::<Giraffe>(|o| {
+    o.auth(|ctx: &Ctx| ctx.user.is_some())
+        .auth_error("Sign in to see giraffes");
+    // every field on this object, in every object_fields call, is guarded
+});
 
-#[derive(Input)]
+let node = schema.interface("Node", |i| {
+    i.auth(|ctx: &Ctx| ctx.user.is_some());
+    i.field::<ID>("id").auth(|ctx: &Ctx| ctx.user.is_some());
+    // interface authorization is inherited by implementing objects
+});
+```
+
+`auth_async` takes a boxed future for checks that need I/O. All levels compose:
+a field must pass its own rule, the object's rule and every implemented
+interface's rule.
+
+### Nullability and type overrides
+
+The Rust return type gives the default GraphQL type. When the API needs a
+different one, the builder checks it:
+
+```rust
+o.field("name", |g: &Giraffe, _: NoArgs, _: &Ctx| Some(g.name.clone()))
+    .non_null();          // build error: the resolver can return None
+
+o.field("name", |g: &Giraffe, _: NoArgs, _: &Ctx| g.name.clone())
+    .nullable();          // String! becomes String
+
+o.field("tags", |g: &Giraffe, _: NoArgs, _: &Ctx| g.tags.clone())
+    .nullable_items();    // [String!]! becomes [String]!
+
+o.field("date", |g: &Giraffe, _: NoArgs, _: &Ctx| g.date_string.clone())
+    .returns::<Date>();   // checked replacement (as_type is an alias)
+```
+
+`as_type`/`returns` only accepts scalar-to-scalar, enum-to-enum, or a
+relationship to an abstract type that is truthful about possible types. It
+cannot see the runtime value, so a mismatched override still fails during
+execution; keep the Rust type and the override honest.
+
+## Arguments and input objects
+
+A resolver's second parameter is its arguments type. Derive `Input` (or `Args`,
+an alias that says "arguments only") and the GraphQL arguments follow
+automatically; there is no second declaration.
+
+```rust
+use gurafi::{Args, Input};
+
+#[derive(Args)]
 struct FriendsArgs {
     #[graphql(description = "Max results", default = 10)]
     limit: i32,
@@ -90,7 +170,73 @@ o.field_result("friends", |g: &Giraffe, args: FriendsArgs, _: &Ctx| {
 });
 ```
 
+`FriendsArgs` is **not** a named input type: it produces
+`friends(limit: Int! = 10, after: String)`, not an extra `input FriendsArgs`.
+An input type used inside another input must be named:
+
+```rust
+#[derive(Input)]
+#[graphql(name = "FilterInput")]
+struct Filter {
+    color: Option<Color>,
+}
+
+#[derive(Args)]
+struct SearchArgs {
+    filter: Option<Filter>, // refers to FilterInput
+}
+```
+
+Using an unnamed input nested inside another is a build error that names the
+fix, rather than a leaked internal type.
+
 Use `NoArgs` when a field takes no arguments.
+
+### Validation
+
+`#[graphql(validate = "path")]` runs after coercion. On a type it receives
+`&Self`; on a field it receives `&FieldType`. Either returns
+`Result<(), gql::GraphQLError>` and the failure becomes a field error:
+
+```rust
+fn valid_name(name: &str) -> Result<(), gql::GraphQLError> {
+    (!name.trim().is_empty())
+        .then_some(())
+        .ok_or_else(|| gql::GraphQLError::new("name must not be empty"))
+}
+
+#[derive(Input)]
+struct CreateArgs {
+    #[graphql(validate = "valid_name")]
+    name: String,
+}
+```
+
+For rules that need the request context, validate on the field builder instead:
+
+```rust
+q.field("create", |args: CreateArgs, _: &Ctx| args.name)
+    .validate::<CreateArgs>(|args, ctx| {
+        if ctx.user.is_some() { Ok(()) } else {
+            Err(gql::GraphQLError::new("sign in first"))
+        }
+    });
+```
+
+### One-of inputs
+
+`#[graphql(one_of)]` registers a `@oneOf` input. Every field must be
+`Option<T>`, no field may have a default, and a caller must provide exactly one
+non-null field:
+
+```rust
+#[derive(Input)]
+#[graphql(name = "SearchBy", one_of)]
+struct SearchBy {
+    id: Option<ID>,
+    name: Option<String>,
+}
+```
 
 ## Enums, scalars and IDs
 
@@ -126,6 +272,22 @@ schema.object::<User>(|o| {
     // ...
 });
 ```
+
+Interface authorization and authorization on interface fields are inherited by
+implementing objects (see above). A field whose type and arguments come straight
+from the interface needs only a resolver:
+
+```rust
+schema.object::<User>(|o| {
+    o.implements(node);
+    o.resolve_inherited("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
+});
+```
+
+At build time the matching interface field (including through interfaces that
+implement other interfaces) supplies the type, arguments, description when the
+object did not set one, and the build checks that the resolver's args type
+matches the interface declaration.
 
 Unions list their members, and fields can declare an abstract return type:
 
@@ -165,6 +327,21 @@ schema.subscription(|s| {
 });
 ```
 
+A `field` stream yields the field's own values; the builder wraps each event as
+the subscription root value and extracts it again. When the event carries more
+than the field value, use `field_map` and supply the resolver:
+
+```rust
+s.field_map(
+    "giraffeBorn",
+    |_: NoArgs, _: &Ctx| events(),
+    |event: &BornEvent, _: NoArgs, _: &Ctx| Ok(event.giraffe.clone()),
+);
+```
+
+Subscription fields also accept `field_with_info`, which passes `&ResolveInfo`
+to the `subscribe` closure.
+
 ## Building
 
 ```rust
@@ -173,6 +350,21 @@ let schema: gql::Schema = schema.build().expect("valid schema");
 
 `build` validates the schema with `gql`. Duplicate types, missing registrations,
 invalid interface implementations and dangling references are reported together.
+
+`Schema` is `Clone`, so a builder can be kept after building. `build_with` takes
+[`BuildOptions`] for root descriptions and stable type ordering, and
+`build_clone` builds from a clone:
+
+```rust
+use gurafi::BuildOptions;
+
+let options = BuildOptions::new()
+    .query_description("Everything readable.")
+    .sort_types(true);
+
+let first = schema.clone().build_with(options)?;
+let second = schema.build_clone()?;
+```
 
 The result is a plain `gql::Schema`. It can be served by `suku` or any transport
 built on `gql`.

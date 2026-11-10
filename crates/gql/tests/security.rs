@@ -160,6 +160,7 @@ fn analyzer_options(max_complexity: u32) -> gql::complexity::ComplexityOptions {
         field_cost: 1,
         max_complexity,
         max_depth: 0,
+        max_breadth: 0,
     }
 }
 

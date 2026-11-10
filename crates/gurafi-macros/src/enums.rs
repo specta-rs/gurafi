@@ -32,6 +32,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     }
 
     let attrs = crate::attr::parse_type_attrs(&input.attrs)?;
+    crate::attr::reject_input_only(&attrs, &input.ident)?;
     let ident = &input.ident;
     let graphql_type_name = attrs
         .name
@@ -58,6 +59,13 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             return Err(syn::Error::new_spanned(
                 &variant.ident,
                 "`default` does not apply to enum variants",
+            ));
+        }
+        if variant_attrs.validate.is_some() {
+            return Err(syn::Error::new_spanned(
+                &variant.ident,
+                "`validate` does not apply to enum variants; validation belongs on an input \
+                 object or one of its fields",
             ));
         }
         let graphql_name = variant_attrs
@@ -105,6 +113,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                 name: ::gurafi::gql::Name::from(#name),
                 description: #description,
                 deprecation_reason: #deprecation,
+                directives: ::std::vec::Vec::new(),
             }
         }
     });
