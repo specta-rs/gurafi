@@ -145,6 +145,13 @@ impl<Ctx: 'static> AuthGuard<Ctx> {
     }
 }
 
+/// Sentinel arguments type stored by [`crate::ObjectBuilder::raw_field`].
+///
+/// A raw field without arguments has no resolver, so a `validate` hook could never run. Using a
+/// dedicated `TypeId` lets [`FieldConfig::validate`] report that clearly instead of accepting the
+/// hook and silently dropping it.
+pub(crate) struct RawFieldArgs;
+
 /// The arguments-type check installed by [`FieldConfig::validate`].
 ///
 /// The slot is cloned into the field's resolver before the builder returns it, so a validation
@@ -477,6 +484,15 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
         &mut self,
         validator: impl Fn(&A, &Ctx) -> Result<(), GraphQLError> + Send + Sync + 'static,
     ) -> &mut Self {
+        if self.args_type == TypeId::of::<RawFieldArgs>() {
+            self.registry.push_error(GraphQLError::new(format!(
+                "Field `{}.{}` is declared with `raw_field`, which installs no resolver, so a \
+                 `validate` hook could never run. Declare the field with `raw_field_with::<_, \
+                 Args>(...)` to coerce arguments through a resolver, then call `validate` on that.",
+                self.owner, self.name,
+            )));
+            return self;
+        }
         if TypeId::of::<A>() != self.args_type {
             self.registry.push_error(GraphQLError::new(format!(
                 "Field `{}.{}` calls `validate::<{}>()`, but its resolver's arguments type is \
@@ -730,12 +746,57 @@ impl<Ctx> std::fmt::Debug for FieldConfig<'_, Ctx> {
     }
 }
 
+/// Read a raw field's value from the executor parent value.
+///
+/// A raw object field has no resolver: its value comes from the object map produced by
+/// [`crate::Raw::object`]. A model parent (`Value::External`) means the object was resolved
+/// normally, so the map is absent and the field cannot be read.
+pub(crate) fn read_raw_field(
+    field_name: &str,
+    parent: &gql::Value,
+) -> Result<gql::Value, GraphQLError> {
+    match parent {
+        gql::Value::Object(object) => {
+            Ok(object.get(field_name).cloned().unwrap_or(gql::Value::Null))
+        }
+        gql::Value::Null => Ok(gql::Value::Null),
+        gql::Value::External(_) => Err(GraphQLError::new(format!(
+            "Field \"{field_name}\" is a raw field with no resolver, but its parent is a model \
+             value, not a raw object. Resolve the parent with `Raw`, or declare the field with a \
+             resolver."
+        ))),
+        other => Err(GraphQLError::new(format!(
+            "Field \"{field_name}\" is a raw field with no resolver and its parent is a {}, not \
+             an object.",
+            other.kind()
+        ))),
+    }
+}
+
+/// Install the executor's default property resolver on a field that has none.
+///
+/// Raw object fields intentionally have no resolver, so the executor reads the value from the
+/// object map without a per-field call. Authorization, however, is applied by wrapping the
+/// field's resolver. When an authorization rule reaches such a field, install an equivalent
+/// property resolver first so the guard cannot be silently skipped.
+pub(crate) fn install_property_resolver(field: &mut Field) {
+    if field.resolve.is_some() || field.subscribe.is_some() {
+        return;
+    }
+    let name = field.name.clone();
+    field.resolve = Some(Arc::new(move |context| {
+        let name = name.clone();
+        Box::pin(async move { read_raw_field(&name, context.parent) })
+    }));
+}
+
 /// Wrap a field's resolvers with an authorization check.
 ///
 /// Used for field-level auth as the config is dropped, and for object- and interface-level auth
 /// when the schema is built. Wrapping here rather than relying on the executor's authorizer keeps
 /// the feature available even when a server does not install one.
 pub(crate) fn apply_auth_guard<Ctx: 'static>(field: &mut Field, guard: Arc<AuthGuard<Ctx>>) {
+    install_property_resolver(field);
     let resolve_guard = Arc::clone(&guard);
     if let Some(resolve) = field.resolve.take() {
         field.resolve = Some(Arc::new(move |context| {

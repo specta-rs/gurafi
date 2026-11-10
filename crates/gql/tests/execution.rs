@@ -1440,7 +1440,7 @@ fn resolves_typename_meta_field() {
 }
 
 #[test]
-fn typename_uses_descriptor_metadata() {
+fn typename_ignores_the_internal_key_on_plain_objects() {
     let schema = Schema::builder()
         .object(ObjectType::new("Query").field(Field::new("user", TypeRef::named("User"))))
         .object(ObjectType::new("User").field(Field::new("name", TypeRef::string())))
@@ -1448,6 +1448,8 @@ fn typename_uses_descriptor_metadata() {
         .build()
         .expect("valid schema");
 
+    // `__gql_typename` is introspection metadata, not user data. A raw object containing it
+    // must not be able to claim another runtime type.
     let response = block_on(gql::execute(
         &schema,
         Request::new("{ user { __typename } }"),
@@ -1464,7 +1466,7 @@ fn typename_uses_descriptor_metadata() {
         response.data,
         Some(value([(
             "user",
-            value([("__typename", Value::from("SpecialUser"))])
+            value([("__typename", Value::from("User"))])
         )]))
     );
 }

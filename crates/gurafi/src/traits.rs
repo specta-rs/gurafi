@@ -22,6 +22,7 @@ use gql::{GraphQLError, TypeRef, Value};
 /// | `Option<T>` | `T` with the outer non-null removed |
 /// | `Vec<T>` | `[T]!`, keeping `T`'s own nullability |
 /// | `Box<T>`, `Arc<T>` | `T` |
+/// | [`crate::Raw`] | `T`'s GraphQL type, with a prebuilt value |
 /// | a derived object, enum, scalar or union | its GraphQL name |
 ///
 /// There is deliberately no mapping from `Result<T, E>`: a fallible field is declared with one

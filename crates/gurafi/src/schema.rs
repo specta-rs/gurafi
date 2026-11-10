@@ -29,7 +29,12 @@
 //! [`Schema::subscription_fields`] calls, including from different modules. Declarations merge;
 //! duplicate field names are still build errors.
 
-use std::{any::TypeId, collections::HashMap, marker::PhantomData, sync::Arc};
+use std::{
+    any::TypeId,
+    collections::{HashMap, HashSet},
+    marker::PhantomData,
+    sync::Arc,
+};
 
 use futures::{Stream, StreamExt};
 use gql::{GraphQLError, Name, TypeRef};
@@ -39,7 +44,8 @@ use crate::{
     error::SchemaError,
     expose::Expose,
     field::{
-        AuthGuard, FieldCheck, FieldConfig, InterfaceFieldConfig, ValidationSlot, apply_auth_guard,
+        AuthGuard, FieldCheck, FieldConfig, InterfaceFieldConfig, RawFieldArgs, ValidationSlot,
+        apply_auth_guard, read_raw_field,
     },
     registry::TypeRegistry,
     traits::{
@@ -177,6 +183,10 @@ pub struct Schema<Ctx: 'static = ()> {
     objects: IndexMap<&'static str, gql::ObjectType>,
     /// The Rust model that owns each object name, so two models cannot silently merge.
     object_owners: IndexMap<&'static str, TypeId>,
+    /// Fields declared with `raw_field`/`raw_field_with`, per object. A raw object must not also
+    /// carry resolver-backed fields, because those would receive the raw map instead of the
+    /// model.
+    raw_fields: IndexMap<&'static str, HashSet<Name>>,
     interfaces: IndexMap<&'static str, gql::InterfaceType>,
     unions: IndexMap<&'static str, gql::UnionType>,
     query: Vec<gql::Field>,
@@ -205,6 +215,7 @@ impl<Ctx: 'static> Clone for Schema<Ctx> {
             registry: self.registry.clone(),
             objects: self.objects.clone(),
             object_owners: self.object_owners.clone(),
+            raw_fields: self.raw_fields.clone(),
             interfaces: self.interfaces.clone(),
             unions: self.unions.clone(),
             query: self.query.clone(),
@@ -257,6 +268,7 @@ impl<Ctx: 'static> Schema<Ctx> {
             registry: TypeRegistry::new(),
             objects: IndexMap::new(),
             object_owners: IndexMap::new(),
+            raw_fields: IndexMap::new(),
             interfaces: IndexMap::new(),
             unions: IndexMap::new(),
             query: Vec::new(),
@@ -332,12 +344,14 @@ impl<Ctx: 'static> Schema<Ctx> {
         }
         let existing = self.objects.shift_remove(M::NAME);
         let existing_auth_error = self.object_auth_error.get(M::NAME).cloned();
+        let raw_fields = self.raw_fields.entry(M::NAME).or_default();
         let mut builder = ObjectBuilder::<Ctx, M>::new(
             existing,
             existing_auth_error,
             &mut self.registry,
             &mut self.checks,
             &mut self.pending_inherited,
+            raw_fields,
             M::NAME,
         );
         build(&mut builder);
@@ -630,6 +644,7 @@ impl<Ctx: 'static> Schema<Ctx> {
             }
         }
 
+        self.check_raw_field_mixing(&mut errors);
         self.expand_transitive_interfaces();
         self.resolve_inherited(&mut errors);
         self.apply_guards();
@@ -763,6 +778,34 @@ impl<Ctx: 'static> Schema<Ctx> {
                 {
                     object.interfaces.push(Arc::from(name));
                 }
+            }
+        }
+    }
+
+    /// Reject objects that mix raw fields with resolver-backed fields.
+    ///
+    /// A raw object is resolved as a whole, so its parent value is an object map. A
+    /// resolver-backed field on the same object would be handed that map where its resolver
+    /// expects the Rust model, which only fails later, per request, with an internal error.
+    fn check_raw_field_mixing(&self, errors: &mut Vec<GraphQLError>) {
+        for (object_name, raw_fields) in &self.raw_fields {
+            if raw_fields.is_empty() {
+                continue;
+            }
+            let Some(object) = self.objects.get(object_name) else {
+                continue;
+            };
+            for field in object.fields.values() {
+                if raw_fields.contains(&field.name) {
+                    continue;
+                }
+                errors.push(GraphQLError::new(format!(
+                    "Object `{object_name}` mixes raw fields with resolver-backed field `{}`. A \
+                     raw object is resolved as a whole, so that resolver would receive a raw \
+                     object map where it expects the `{object_name}` model. Declare every field \
+                     with `raw_field`/`raw_field_with`, or give every field a resolver.",
+                    field.name,
+                )));
             }
         }
     }
@@ -930,6 +973,7 @@ pub struct ObjectBuilder<'a, Ctx: 'static, M: ObjectModel> {
     object: gql::ObjectType,
     checks: &'a mut Vec<FieldCheck>,
     pending_inherited: &'a mut Vec<PendingInherited>,
+    raw_fields: &'a mut HashSet<Name>,
     auth: Vec<Arc<AuthGuard<Ctx>>>,
     auth_error: Option<Arc<str>>,
     marker: PhantomData<fn() -> (Ctx, M)>,
@@ -942,6 +986,7 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
         registry: &'a mut TypeRegistry,
         checks: &'a mut Vec<FieldCheck>,
         pending_inherited: &'a mut Vec<PendingInherited>,
+        raw_fields: &'a mut HashSet<Name>,
         name: &'static str,
     ) -> Self {
         let object = existing.unwrap_or_else(|| {
@@ -956,6 +1001,7 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
             object,
             checks,
             pending_inherited,
+            raw_fields,
             auth: Vec::new(),
             auth_error: existing_auth_error,
             marker: PhantomData,
@@ -1046,6 +1092,136 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
             std::any::type_name::<T>(),
             TypeId::of::<()>(),
             ValidationSlot::new(),
+        )
+    }
+
+    /// Declare a field that is read from a raw object map instead of a resolver.
+    ///
+    /// No resolver is installed. When the parent value is the object map produced by
+    /// [`Raw::object`](crate::Raw::object), execution reads the field with the same name using
+    /// the executor's default property lookup. This is the object-side counterpart to
+    /// [`Raw`](crate::Raw): declare every field of an object this way when the object is
+    /// resolved as a whole.
+    ///
+    /// ```
+    /// use gurafi::{NoArgs, Object, Raw, RawObject, Schema};
+    ///
+    /// struct Ctx;
+    ///
+    /// #[derive(Object)]
+    /// struct Giraffe {
+    ///     name: String,
+    /// }
+    ///
+    /// let mut schema = Schema::<Ctx>::new();
+    /// schema.object::<Giraffe>(|o| {
+    ///     o.raw_field::<String>("name");
+    /// });
+    /// schema.query(|q| {
+    ///     q.field("giraffe", |_: NoArgs, _: &Ctx| {
+    ///         Raw::<Giraffe>::object(RawObject::new().field("name", "Melman").build())
+    ///     });
+    /// });
+    /// # let _ = schema.build().expect("valid schema");
+    /// ```
+    ///
+    /// The type comes from `T`, so the declared GraphQL type is still checked against the rest
+    /// of the schema. The value in the map is not: a missing non-null field or a wrong-typed
+    /// field is an execution-time error, not a build error. An object that declares a raw field
+    /// may not also declare a resolver-backed field; the build rejects the mix because the
+    /// resolver would receive a raw object map where it expects the Rust model.
+    ///
+    /// `raw_field` has no arguments. To implement an interface field that takes arguments (or to
+    /// have the executor coerce and validate arguments for a concrete raw field), use
+    /// [`ObjectBuilder::raw_field_with`]. A `validate` hook on `raw_field` is a build error, since
+    /// there is no resolver in which it could run.
+    ///
+    /// The map itself is trusted: object keys are read by name, and reserved `__gql_*` keys are
+    /// ignored by [`crate::RawObject`] and removed by [`crate::Raw::new`]. Untrusted data must go
+    /// through one of those constructors, never through an arbitrary `gql::Value::Object`.
+    pub fn raw_field<T: OutputType>(&mut self, name: &'static str) -> FieldConfig<'_, Ctx> {
+        T::register_output(self.registry);
+        self.raw_fields.insert(Arc::from(name));
+        let field = gql::Field::new(name, T::output_type());
+        self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<RawFieldArgs>(),
+            ValidationSlot::new(),
+        )
+    }
+
+    /// Declare a raw field with arguments, read from the raw object map by name.
+    ///
+    /// This is [`ObjectBuilder::raw_field`] plus `A`'s argument declarations. The executor
+    /// coerces and validates the arguments through a normal resolver, then reads the field value
+    /// from the parent object map. Use it for an interface field that takes arguments, or when a
+    /// concrete raw field needs argument coercion:
+    ///
+    /// ```
+    /// use gurafi::{Input, NoArgs, Object, Raw, RawObject, Schema};
+    ///
+    /// struct Ctx;
+    ///
+    /// #[derive(Object)]
+    /// struct Giraffe {
+    ///     name: String,
+    /// }
+    ///
+    /// #[derive(Input)]
+    /// struct PictureArgs {
+    ///     width: i32,
+    /// }
+    ///
+    /// let mut schema = Schema::<Ctx>::new();
+    /// schema.object::<Giraffe>(|o| {
+    ///     o.raw_field_with::<String, PictureArgs>("picture");
+    /// });
+    /// schema.query(|q| {
+    ///     q.field("giraffe", |_: NoArgs, _: &Ctx| {
+    ///         Raw::<Giraffe>::object(
+    ///             RawObject::new().field("picture", "wide.jpg").build(),
+    ///         )
+    ///     });
+    /// });
+    /// # let _ = schema.build().expect("valid schema");
+    /// ```
+    ///
+    /// A `validate` hook is run once per resolution, just as it is on a resolver-backed field.
+    /// Authorization installs a guard around the same resolver.
+    pub fn raw_field_with<T: OutputType, A: InputObject>(
+        &mut self,
+        name: &'static str,
+    ) -> FieldConfig<'_, Ctx> {
+        T::register_output(self.registry);
+        A::register_args(self.registry);
+        self.raw_fields.insert(Arc::from(name));
+        let validation = ValidationSlot::new();
+        let hook = validation.clone();
+        let field_name = name;
+        let field = add_arguments::<A>(gql::Field::new(name, T::output_type()), self.registry)
+            .resolve(move |context| {
+                let hook = hook.clone();
+                Box::pin(async move {
+                    let args = coerce_args::<A>(
+                        context.args,
+                        context.info.parent_type,
+                        context.info.field_name,
+                    )?;
+                    if hook.is_installed() {
+                        let ctx = context.context.require_data::<Ctx>()?;
+                        hook.run(&args, ctx)?;
+                    }
+                    read_raw_field(field_name, context.parent)
+                })
+            });
+        self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
         )
     }
 

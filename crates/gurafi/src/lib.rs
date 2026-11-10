@@ -123,6 +123,40 @@
 //! `Box::pin` is required because the closure must return a future that borrows the model, and
 //! Rust's `Fn` traits cannot express a return type that borrows from the closure's arguments.
 //! The executor boxes resolver futures anyway, so this is not an extra allocation in practice.
+//!
+//! # Resolving a whole object at once
+//!
+//! [`Raw<T>`] returns a prebuilt [`gql::Value`] while taking its schema type from `T`. Declare
+//! the object's fields with [`ObjectBuilder::raw_field`] and the executor reads them from the
+//! map, so one resolver can produce an entire object:
+//!
+//! ```
+//! # use gurafi::{NoArgs, Object, Raw, RawObject, Schema};
+//! # struct Ctx;
+//! # #[derive(Object)] struct Giraffe { name: String, height: f32 }
+//! # let mut schema = Schema::<Ctx>::new();
+//! schema.object::<Giraffe>(|o| {
+//!     o.raw_field::<String>("name");
+//!     o.raw_field::<f32>("height");
+//! });
+//! schema.query(|q| {
+//!     q.field("giraffe", |_: NoArgs, _: &Ctx| {
+//!         Raw::<Giraffe>::object(
+//!             RawObject::new()
+//!                 .field("name", "Melman")
+//!                 .field("height", 3.4)
+//!                 .build(),
+//!         )
+//!     });
+//! });
+//! # let _ = schema.build().expect("valid schema");
+//! ```
+//!
+//! The caller is responsible for field names, nullability and `__typename`; most mistakes are
+//! execution-time field errors with normal null propagation. Custom scalar values are passed
+//! through unchanged, and mixing a raw field with a resolver-backed field is a build error. See
+//! [`Raw`] and [`RawObject`] for lists, abstract types, reserved `__gql_*` keys and the
+//! performance tradeoff.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -131,6 +165,7 @@ mod error;
 mod expose;
 mod field;
 mod id;
+mod raw;
 mod registry;
 mod schema;
 mod traits;
@@ -144,6 +179,7 @@ pub use field::{FieldConfig, InterfaceFieldConfig};
 pub use gql::{GraphQLError, Value};
 pub use gurafi_macros::{Args, Enum, Input, Object, Scalar, Union};
 pub use id::ID;
+pub use raw::{Raw, RawObject};
 pub use registry::TypeRegistry;
 pub use schema::{
     BoxFuture, BuildOptions, InterfaceBuilder, InterfaceRef, ObjectBuilder, RootBuilder, Schema,

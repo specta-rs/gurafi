@@ -2695,10 +2695,14 @@ impl<'doc> Executor<'doc> {
         let resolved = if let Some(resolve) = resolve_type {
             Some(resolve(value, self.context)?)
         } else if let Value::Object(object) = value {
+            // An explicit `__typename` is the documented way for a raw object to choose its
+            // concrete type, so it wins. `TYPENAME_KEY` is an internal introspection detail and
+            // is only trusted when the value really is an introspection descriptor; otherwise a
+            // user-supplied raw map could switch its own runtime type.
             object
-                .get(introspection::TYPENAME_KEY)
-                .or_else(|| object.get("__typename"))
+                .get("__typename")
                 .and_then(Value::as_str)
+                .or_else(|| introspection_descriptor_typename(object))
                 .map(Arc::from)
         } else {
             None
@@ -2787,10 +2791,11 @@ impl<'doc> Executor<'doc> {
         }
 
         if node.name == "__typename" {
+            // The executor already completed this value as `object_type` (abstract resolution
+            // and fragment matching both happened against it), so report that type. Only an
+            // introspection runtime descriptor may override it with its internal type key.
             let typename = match parent {
-                Value::Object(object) => object
-                    .get(introspection::TYPENAME_KEY)
-                    .and_then(Value::as_str)
+                Value::Object(object) => introspection_descriptor_typename(object)
                     .map(Arc::from)
                     .unwrap_or_else(|| object_type.name.clone()),
                 _ => object_type.name.clone(),
@@ -2800,6 +2805,21 @@ impl<'doc> Executor<'doc> {
 
         Err(unknown_meta_field(node, object_type))
     }
+}
+
+/// The runtime type name of an introspection descriptor.
+///
+/// Introspection values are [`Value::Object`]s whose keys are all private `__gql_` metadata.
+/// Anything containing a non-internal key is user data, even when a caller has inserted
+/// `__gql_typename` into it. Treating those values as descriptors would let a raw object map
+/// choose its own runtime type, bypassing `resolve_type`, object authorization and
+/// `is_type_of` selection.
+fn introspection_descriptor_typename(object: &Object) -> Option<&str> {
+    let name = object.get(introspection::TYPENAME_KEY)?.as_str()?;
+    object
+        .keys()
+        .all(|key| key.starts_with("__gql_"))
+        .then_some(name)
 }
 
 /// Run sibling field futures with bounded concurrency.

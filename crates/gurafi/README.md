@@ -380,6 +380,73 @@ model travels as `Value::External`, and the object type's check is a downcast to
 Override it per abstract type with `resolve_type` on the interface or union builder if you need
 custom resolution.
 
+## Resolving a whole object at once
+
+When an object already exists as a GraphQL value — cached JSON, a row serialised once, an
+upstream response — use `Raw<T>` to hand it to the executor in one piece. `T` still determines
+the schema type; the value is passed through unchanged.
+
+```rust
+use gurafi::{NoArgs, Object, Raw, RawObject};
+
+#[derive(Object)]
+struct Giraffe {
+    name: String,
+    height: f32,
+}
+
+schema.object::<Giraffe>(|o| {
+    // No resolver: each field is read from the raw object map by name.
+    o.raw_field::<String>("name");
+    o.raw_field::<f32>("height");
+});
+
+q.field("giraffe", |_: NoArgs, _: &Ctx| {
+    Raw::<Giraffe>::object(
+        RawObject::new()
+            .field("name", "Melman")
+            .field("height", 3.4)
+            .build(),
+    )
+});
+```
+
+`Raw<Vec<Giraffe>>::list([...])` resolves a list, and `Raw<Option<Giraffe>>` (or
+`Raw::null()`) makes a nullable value. Nested objects are just another `RawObject` field.
+
+For an interface or union field, add `.as_abstract(node)` and either include
+`RawObject::typename("Giraffe")` in the map or install `resolve_type` on the abstract type.
+`gql` cannot infer the concrete type from a raw map, so one of the two is required.
+
+The caller owns the map's correctness. Wrong shapes, missing non-null fields and a `null` in a
+non-null position are normal field errors with normal null propagation — no panic — but they are
+not schema-build errors. The exception is a custom scalar: its raw value is passed through
+unchanged, so `ScalarValue::to_value` does not run. Use a real resolver when a custom scalar must
+validate or normalise its output.
+
+Resolving a whole object skips its per-field resolvers, so declare every selected field with
+`raw_field`. Mixing a raw field with a resolver-backed field on the same object is a schema-build
+error, because the resolver would receive a raw object map instead of the Rust model. An
+unguarded raw field stays resolver-free; field, object and inherited interface authorization still
+apply, and the builder installs a property resolver only when a guard needs one.
+
+`raw_field` takes no arguments. For an interface field with arguments, or a concrete raw field
+that should coerce and validate arguments, use
+`o.raw_field_with::<String, Args>("name")`. A `validate` hook on plain `raw_field` is a build
+error, since there is no resolver in which it could run.
+
+Raw maps are trusted data. Keys beginning with `__gql_` are reserved for introspection and must
+not come from user input: `RawObject` ignores them, and `Raw::new`/`Raw::object` strip them
+recursively, so build a map from untrusted JSON with those constructors. Use
+`RawObject::typename` (not `__gql_typename`) to choose the concrete type of an interface or union
+value. `__typename` is preserved and therefore trusted: if untrusted data must not choose its own
+type, set it from trusted data or resolve the type from checked data.
+
+The tradeoff is speed versus accountability: per-field resolution gives typed models, argument
+coercion, validation and independent field optimization. `Raw` skips those per-field costs, and
+in exchange the resolver returning the object is the single place responsible for the whole
+value.
+
 ## Subscriptions
 
 ```rust
