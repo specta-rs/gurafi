@@ -31,9 +31,9 @@ pub(crate) struct PreparedDocument<'a> {
     pub(crate) document: ast::Document<'a>,
     /// Position of the selected operation among `document.definitions`.
     pub(crate) operation_index: usize,
-    /// The error normal validation would report for an introspection field when introspection is
-    /// disabled. `None` when the document does not use `__schema` or `__type` at all.
-    pub(crate) introspection_error: Option<GraphQLError>,
+    /// The errors normal validation would report for introspection fields when introspection is
+    /// disabled, in discovery order. Empty when the document does not use `__schema` or `__type`.
+    pub(crate) introspection_errors: Vec<GraphQLError>,
     /// A conservative upper bound on the selected operation's cost, depth and breadth, computed
     /// once because the document is fixed. `None` when no bound can be proven, in which case every
     /// request runs the exact analysis.
@@ -68,8 +68,8 @@ pub(crate) async fn execute<'a>(
     request_variables: Option<&crate::Object>,
     options: &ExecutionOptions,
 ) -> Response {
-    if let (false, Some(error)) = (options.introspection, &prepared.introspection_error) {
-        return Response::error(error.clone());
+    if !options.introspection && !prepared.introspection_errors.is_empty() {
+        return introspection_rejection(&prepared.introspection_errors, options.max_errors);
     }
     let Some(operation) = prepared.operation() else {
         return Response::error(GraphQLError::new(
@@ -136,7 +136,7 @@ pub(crate) enum BuildPreparedError {
 /// Prepare the document for execution against a schema.
 ///
 /// Parsing, validation and operation selection happen here, once. The operation index and the
-/// introspection compatibility error are stored alongside the document so per-request execution
+/// introspection compatibility errors are stored alongside the document so per-request execution
 /// only has to borrow them.
 pub(crate) fn build<'a>(
     schema: &Schema,
@@ -199,30 +199,51 @@ pub(crate) fn build<'a>(
         _ => plan::build_empty(),
     };
 
-    let introspection_error = if uses_introspection(&document) {
+    let introspection_errors = if uses_introspection(&document) {
+        // Normal validation reports every introspection field it finds (bounded by the request's
+        // error limit). Storing all of them here lets a prepared request reproduce that exact
+        // response instead of collapsing to a single error.
         validation::validate(
             schema,
             &document,
             &ValidationOptions {
                 introspection: false,
                 max_depth: 0,
-                max_errors: 1,
+                max_errors: MAX_STORED_INTROSPECTION_ERRORS,
             },
         )
-        .into_iter()
-        .next()
     } else {
-        None
+        Vec::new()
     };
 
     Ok(PreparedDocument {
         document,
         operation_index,
-        introspection_error,
+        introspection_errors,
         static_complexity,
         variables,
         plan,
     })
+}
+
+/// Upper bound on the introspection-disabled validation errors kept at preparation.
+///
+/// Validation itself stops at this count, and replay truncates to the request's own
+/// [`ExecutionOptions::max_errors`], so a prepared response still matches normal execution.
+const MAX_STORED_INTROSPECTION_ERRORS: usize = 100;
+
+/// Build the response normal validation would produce when introspection is disabled.
+fn introspection_rejection(errors: &[GraphQLError], max_errors: usize) -> Response {
+    let limit = if max_errors == 0 {
+        errors.len()
+    } else {
+        max_errors.min(errors.len())
+    };
+    Response {
+        data: None,
+        errors: errors[..limit].to_vec(),
+        extensions: None,
+    }
 }
 
 /// Select the operation and return its index in `document.definitions`.
@@ -331,8 +352,11 @@ pub(crate) async fn subscribe<'a>(
     options: &ExecutionOptions,
     make_event_handler: impl FnOnce(Arc<ExecutionContext>, Option<std::time::Duration>) -> EventHandler,
 ) -> Result<crate::SubscriptionResponse, Response> {
-    if let (false, Some(error)) = (options.introspection, &prepared.introspection_error) {
-        return Err(Response::error(error.clone()));
+    if !options.introspection && !prepared.introspection_errors.is_empty() {
+        return Err(introspection_rejection(
+            &prepared.introspection_errors,
+            options.max_errors,
+        ));
     }
     let Some(operation) = prepared.operation() else {
         return Err(Response::error(GraphQLError::new(

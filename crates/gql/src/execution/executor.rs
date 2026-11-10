@@ -47,6 +47,15 @@ use super::{
 /// path (and the same stack bound) a document at the parser's depth limit already uses.
 const SYNC_DEPTH_LIMIT: usize = 12;
 
+/// How deep the precompiled plan path may recurse before execution falls back to dynamic
+/// collection.
+///
+/// The planned path's async frames are larger than the dynamic path's; a debug build overflows a
+/// 2 MiB stack at roughly 90 planned levels, while the dynamic path is the one the parser's
+/// [`crate::parser::MAX_DEPTH`] (96) bound was verified against. Well-formed real documents are far
+/// shallower, so this only affects documents at the parser's limit.
+const MAX_PLANNED_DEPTH: usize = 48;
+
 /// A map of fragment definitions keyed by name, borrowed from the parsed document.
 ///
 /// Documents usually define only a handful of fragments, and execution looks them up once per
@@ -395,6 +404,10 @@ pub(crate) async fn run_operation<'doc>(
     parallel: bool,
     skip_root_authorization: bool,
 ) -> Response {
+    // The plan is a pure optimization. A deep plan would make the planned path's recursion exceed
+    // the stack bound the parser guarantees for the dynamic path, so it is dropped here and the
+    // executor collects fields dynamically instead.
+    let plan = plan.filter(|plan| plan.depth() <= MAX_PLANNED_DEPTH);
     let executor = Executor {
         context,
         fragments,
@@ -2699,6 +2712,11 @@ impl<'doc> Executor<'doc> {
         // the selected built-in scalars pass through).
         if let Some(parent_object) = parent_object {
             if plan.identity_projection && plan.matches_parent(parent_object) {
+                // Reusing the parent skips completion, but not the operation's deadline: a request
+                // whose timeout already elapsed must report it exactly as the general path does.
+                if self.expired() {
+                    return Err(timeout_error(path));
+                }
                 return Ok(Ok(Arc::clone(parent_object)));
             }
         }

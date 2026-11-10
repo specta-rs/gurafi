@@ -403,24 +403,22 @@ where
         extensions,
     } = parameters;
 
-    let has_query = query
-        .as_deref()
-        .is_some_and(|query| !query.trim().is_empty());
-    let has_id = id.as_deref().is_some_and(|id| !id.trim().is_empty())
-        || header_persisted_id(&parts.headers).is_some();
-    if !has_query && !has_id {
+    let mut request = match get_request(query, id, variables, operation_name, extensions) {
+        Ok(request) => request,
+        Err(error) => return request_error(accept, StatusCode::BAD_REQUEST, error.message()),
+    };
+    apply_header_id(&mut request, &parts.headers);
+
+    // The gate runs on the constructed request, not on the raw parameters: an Apollo automatic
+    // persisted-query GET carries its identifier only inside `extensions.persistedQuery`, and a
+    // header can supply it too. Both are visible through `prepared_id()`.
+    if request.query.trim().is_empty() && request.prepared_id().is_none() {
         return request_error(
             accept,
             StatusCode::BAD_REQUEST,
             "Missing required `query` parameter.",
         );
     }
-
-    let mut request = match get_request(query, id, variables, operation_name, extensions) {
-        Ok(request) => request,
-        Err(error) => return request_error(accept, StatusCode::BAD_REQUEST, error.message()),
-    };
-    apply_header_id(&mut request, &parts.headers);
 
     // GraphQL over HTTP: GET may only execute queries. Allowing mutations here turns every
     // cookie-authenticated endpoint into a CSRF target; subscriptions also open long-lived
@@ -753,10 +751,17 @@ fn header_persisted_id(headers: &HeaderMap) -> Option<String> {
     })
 }
 
-/// Apply a persisted-query header when the request body did not carry an identifier.
+/// Apply a persisted-query header when the request did not carry an identifier anywhere.
+///
+/// The body's `id` and the extension shapes (`extensions.id`,
+/// `extensions.persistedQuery.sha256Hash`, …) both take precedence: the header is a fallback, not
+/// an override. Applying it only when [`GraphQLRequest::prepared_id`] is `None` is what prevents a
+/// stale or shared header from silently changing which operation a request executes.
 fn apply_header_id(request: &mut GraphQLRequest, headers: &HeaderMap) {
-    if request.id.is_none() {
-        request.id = header_persisted_id(headers);
+    if request.prepared_id().is_none() {
+        if let Some(id) = header_persisted_id(headers) {
+            request.id = Some(id);
+        }
     }
 }
 
@@ -766,13 +771,17 @@ fn apply_header_id_to_payload(payload: &mut RequestPayload, headers: &HeaderMap)
     };
     match payload {
         RequestPayload::Single(request) => {
-            if request.id.is_none() {
+            if request.prepared_id().is_none() {
                 request.id = Some(id);
             }
         }
         RequestPayload::Batch(requests) => {
+            // A header is shared by the whole batch, so it applies to every item that does not
+            // already name its own operation. Batch size is capped by `max_batch_size`, and each
+            // item is executed with its own limits, so this fans one identifier out to at most
+            // that many operations; send per-item identifiers if that is not desired.
             for request in requests {
-                if request.id.is_none() {
+                if request.prepared_id().is_none() {
                     request.id = Some(id.clone());
                 }
             }

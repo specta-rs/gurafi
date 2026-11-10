@@ -6,10 +6,14 @@
 //! cargo bench -q -p gql --bench prepared
 //! ```
 //!
-//! The workload is the same representative query in both cases: normal `gql::execute` pays parse,
-//! validation, operation selection, variable coercion, complexity analysis and execution;
-//! `PreparedQuery::execute` pays variable coercion, complexity analysis and execution. Numbers are
-//! printed as `KEY=VALUE` so runs can be compared without a plotting dependency.
+//! The workload is the same representative query in both cases, but not the same work: normal
+//! `gql::execute` pays parse, validation, operation selection, variable coercion, complexity
+//! analysis and execution, while `PreparedQuery::execute` skips parsing, validation and operation
+//! selection and pays variable coercion, complexity checking and execution. For a document whose
+//! static complexity bound is safe (no field estimators, no unresolved expansion), the prepared
+//! path can also skip the exact per-request complexity walk; the bound is conservative, so a
+//! request outside it still runs the exact analysis. Numbers are printed as `KEY=VALUE` so runs can
+//! be compared without a plotting dependency.
 //!
 //! Allocations are counted by a thin wrapper around the system allocator. The wrapper only
 //! delegates to `System`; there is no custom memory management.

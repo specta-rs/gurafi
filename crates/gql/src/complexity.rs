@@ -507,9 +507,11 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
 /// symbolic (one coefficient per list-nesting level) so a request can plug in its own
 /// [`ComplexityOptions::list_factor`] at execution time.
 ///
-/// The bound is only an answer for limits it can prove: if any reachable field has a custom
-/// complexity estimator, whose result depends on runtime argument values, no bound is produced and
-/// the operation falls back to the exact per-request analysis.
+/// The bound is only an answer for limits it can prove: if any reachable field — leaf or not — has
+/// a custom complexity estimator, whose result depends on runtime argument values, no bound is
+/// produced and the operation falls back to the exact per-request analysis. An estimator on a leaf
+/// field is just as variable-dependent as one on a field with a selection set, so both disable the
+/// bound.
 pub(crate) struct StaticComplexity {
     /// `coefficients[i]` is the number of cost units multiplied by `list_factor^i`.
     coefficients: SmallVec<[u64; 4]>,
@@ -650,14 +652,16 @@ impl<'a, 'document, 'source> StaticAnalyzer<'a, 'document, 'source> {
                     // charging each one can only over-estimate.
                     bound.add(0, u64::from(FIELD_COST));
 
+                    // Any estimator may read argument values supplied by the request, whether or
+                    // not the field has a selection set, so its presence disables the static
+                    // bound for the whole operation.
+                    let definition = field_definition_on(self.schema.get_type(scope), field.name);
+                    if definition.is_some_and(|definition| definition.complexity.is_some()) {
+                        return Err(());
+                    }
                     let Some(selection_set) = &field.selection_set else {
                         continue;
                     };
-                    let definition = field_definition_on(self.schema.get_type(scope), field.name);
-                    if definition.is_some_and(|definition| definition.complexity.is_some()) {
-                        // The estimator may read argument values supplied by the request.
-                        return Err(());
-                    }
                     let return_type = match definition {
                         Some(definition) => Cow::Borrowed(&definition.ty),
                         None => match meta_field_type(field.name) {
@@ -690,7 +694,14 @@ impl<'a, 'document, 'source> StaticAnalyzer<'a, 'document, 'source> {
                     if active_fragments.len() >= MAX_FRAGMENT_DEPTH {
                         return Err(());
                     }
-                    let condition = self.fragment_scope(fragment.type_condition, scope);
+                    // Resolve applicability exactly as the per-request analyzer does. A fragment
+                    // that cannot apply is not charged; narrowing an abstract condition against an
+                    // object parent must land on the object scope so its estimators are seen.
+                    let Some(condition) =
+                        fragment_scope(self.schema, fragment.type_condition, scope)
+                    else {
+                        continue;
+                    };
                     active_fragments.push(spread.name);
                     let inner = self.analyze_selection(
                         fragment.selection_set.items.iter(),
@@ -704,7 +715,10 @@ impl<'a, 'document, 'source> StaticAnalyzer<'a, 'document, 'source> {
                 }
                 ast::Selection::InlineFragment(fragment) => {
                     let condition = match fragment.type_condition {
-                        Some(condition) => self.fragment_scope(condition, scope),
+                        Some(condition) => match fragment_scope(self.schema, condition, scope) {
+                            Some(condition) => condition,
+                            None => continue,
+                        },
                         None => Arc::clone(scope),
                     };
                     let inner = self.analyze_selection(
@@ -720,18 +734,6 @@ impl<'a, 'document, 'source> StaticAnalyzer<'a, 'document, 'source> {
         }
         self.breadth = self.breadth.max(distinct_keys(keys));
         Ok(bound)
-    }
-
-    /// The type a fragment's selections are looked up on.
-    ///
-    /// Applicability is deliberately not checked: including a fragment that cannot apply can only
-    /// raise the estimate. An unknown condition falls back to the enclosing scope, matching the
-    /// exact analysis' defensive behaviour.
-    fn fragment_scope(&self, condition: &'source str, parent: &Arc<str>) -> Arc<str> {
-        if condition == parent.as_ref() || self.schema.get_type(condition).is_none() {
-            return Arc::clone(parent);
-        }
-        Arc::from(condition)
     }
 }
 

@@ -135,16 +135,20 @@ A request can then send only an identifier, in any of these shapes:
 ```
 
 `id`, `doc_id`, `documentId` and `queryId` are also accepted in `extensions`, and
-`extensions.persistedQuery` accepts `sha256Hash`, `hash`, `id`, `queryId` or `documentId`. The
-`X-Persisted-Query-Id` and `X-Query-Id` headers set the identifier for GET and POST requests
-(including every operation in a batch) when the body does not carry one. GET requests may omit
-`query` when they send an identifier.
+`extensions.persistedQuery` accepts `sha256Hash`, `hash`, `id`, `queryId` or `documentId`.
+Identifiers and hashes are opaque keys: a `sha256Hash` entry is not hash-verified. The
+`X-Persisted-Query-Id` and `X-Query-Id` headers are a fallback used only when the request carries
+no identifier in the body or extensions; for a batch they fill in every item without one. GET
+requests may omit `query` when they send an identifier, including an `extensions.persistedQuery`
+hash in the query string.
 
 When an identifier matches a registered query, the registered text is executed and any supplied
-query text is ignored, so a client cannot substitute a different document. The operation name is
-taken from the manifest entry (or the prepared query), so an `operationName` on the request is not
-needed for a persisted request. An unknown identifier with supplied query text falls back to
-normal execution by default. To reject arbitrary query text, make the registry an allowlist:
+query text is ignored, so a client cannot substitute a different document. The prepared operation
+is fixed: a request `operationName` must match it, and a disagreeing name is an error rather than a
+silent switch. An unknown identifier with supplied query text falls back to normal execution by
+default; that fallback does not register the operation. A prepared registry is tied to the schema
+instance it was prepared with, and installing it on a server for another schema is rejected at
+execution. To reject arbitrary query text, make the registry an allowlist:
 
 ```rust,no_run
 # fn build(schema: gql::Schema) {

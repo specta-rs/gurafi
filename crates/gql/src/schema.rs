@@ -128,6 +128,18 @@ impl Schema {
         self.inner.description.as_deref()
     }
 
+    /// Whether two schemas are the same instance.
+    ///
+    /// Cloning a [`Schema`] shares its allocation, so a clone reports `true`. Two schemas built
+    /// separately — even from identical definitions — report `false`, because their types,
+    /// interned names and field positions are distinct allocations. Code that stores a schema
+    /// alongside prepared work (such as a prepared query) can use this to refuse executing that
+    /// work against a different schema instance.
+    #[must_use]
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Directives applied to the schema itself, in source order.
     #[must_use]
     pub fn applied_directives(&self) -> &[crate::types::AppliedDirective] {

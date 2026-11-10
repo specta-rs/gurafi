@@ -109,7 +109,11 @@ let server = Server::new(schema)
 
 Aliases accepted for the identifier are `id`, `hash`, `sha256Hash`, `queryId` and `documentId`;
 the source may be `body`, `query`, `document` or `source`; the operation name may be `name` or
-`operationName`.
+`operationName`. Identifiers and hashes are **opaque keys**: an id spelled `sha256Hash` is looked
+up as-is, with no hash verification, so entries must be loaded from a source you trust. Duplicate
+object keys in `from_json_str`/`from_json_slice` are rejected rather than silently keeping the last
+value; a pre-parsed `serde_json::Value` cannot represent duplicates, so only the text and slice
+loaders can detect them.
 
 Requests may send only an identifier:
 
@@ -118,20 +122,42 @@ Requests may send only an identifier:
 { "extensions": { "persistedQuery": { "version": 1, "sha256Hash": "hello" } } }
 ```
 
-`doc_id`, `documentId`, `queryId`, `extensions.id` and `extensions.hash` are also accepted. The
-`X-Persisted-Query-Id` and `X-Query-Id` headers set the identifier when the body does not carry
-one; for a batch the header applies to every operation that has no identifier of its own. GET
-requests may omit `query` when they carry an identifier.
+`doc_id`, `documentId`, `queryId`, `extensions.id` and `extensions.hash` are also accepted. GET
+requests may omit `query` when they carry an identifier, including an APQ-style hash in the
+`extensions` query-string parameter:
+
+```text
+GET /graphql?extensions={"persistedQuery":{"version":1,"sha256Hash":"hello"}}
+```
+
+The `X-Persisted-Query-Id` and `X-Query-Id` headers are a fallback: they apply only when the
+request itself carries no identifier, whether as a top-level `id`/`doc_id`/`documentId`/`queryId`
+or in `extensions`. They never override an identifier from the request. For a batch the header
+fills in every item that has no identifier of its own; the batch size limit bounds how many
+operations one header can select, and each item still runs with its own variables and limits. Send
+per-item identifiers when one header should not fan out.
 
 If an identifier matches, the registered text wins and any request `query` text is ignored. An
-unknown identifier with supplied query text falls back to normal execution unless
-`require_prepared(true)` is set. In allowlist mode every request must resolve to a registered
-query; otherwise the response contains `PersistedQueryNotFound` with
+`operationName` on the request must name the prepared operation (or match an unnamed prepared
+operation by being absent); a disagreeing name returns a GraphQL error instead of silently running
+a different operation. An unknown identifier with supplied query text falls back to normal
+execution unless `require_prepared(true)` is set. That fallback does not register or learn the
+supplied operation: Apollo APQ's "hash miss then send the query" flow only works in fallback mode,
+and a later request with the same hash still needs the query text unless the operation was loaded
+into the manifest at startup. In allowlist mode every request must resolve to a registered query;
+otherwise the response contains `PersistedQueryNotFound` with
 `extensions.code = "PERSISTED_QUERY_NOT_FOUND"`. The HTTP status follows normal request-error
 handling: 400 for `application/graphql-response+json`, 200 for legacy `application/json`.
 
-Prepared subscriptions are supported and reuse the prepared document for setup and every source
-event.
+Prepared queries hold the exact [`gql::Schema`] instance they were prepared against. Installing a
+registry built for schema A on a `Server` for schema B is rejected at execution with a GraphQL
+error, so a prepared query can never resolve fields or introspection data from the wrong schema.
+Prepare against the clone the server owns (for example `server.schema().clone()`), not a separately
+built schema that merely has the same types.
+
+Prepared subscriptions are supported. Setup and every source event reuse the prepared document,
+and the HTTP layer emits them over server-sent events (`Accept: text/event-stream`) exactly as it
+does for normal subscriptions.
 
 ## HTTP behaviour
 

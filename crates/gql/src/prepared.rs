@@ -33,6 +33,11 @@
 //! arbitrary client-supplied documents. Once a document is trusted (for example, a persisted
 //! operation loaded from a build-time manifest), preparing it moves that work to startup and
 //! produces a value that can be cloned, shared and executed concurrently.
+//!
+//! A prepared query keeps the [`Schema`] it was prepared against and executes against that
+//! instance. Cloning a schema shares the instance ([`Schema::ptr_eq`] reports `true`), but a
+//! separately built schema is distinct even when its definitions match, which matters when a
+//! registry is shared between servers.
 
 use std::{fmt, sync::Arc, time::Duration};
 

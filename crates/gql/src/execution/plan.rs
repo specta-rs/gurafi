@@ -63,6 +63,12 @@ const MAX_CONDITIONAL_NODES: usize = 4;
 pub(crate) struct PreparedPlan<'a> {
     sources: Vec<Source<'a>>,
     root: Option<u32>,
+    /// Selection-set levels reachable through the plan's child sources.
+    ///
+    /// The planner is iterative, but execution follows those sources recursively. This lets the
+    /// executor send a very deep plan down the dynamic path, whose stack bound is the one the
+    /// parser's depth limit was chosen against.
+    depth: usize,
 }
 
 /// One merged selection list and the field plans derived from it.
@@ -302,6 +308,14 @@ impl<'a> PreparedPlan<'a> {
         self.root
     }
 
+    /// The number of selection-set levels the planned path would recurse through.
+    ///
+    /// Zero for an empty plan. Callers use it to keep execution's stack bound: the dynamic path
+    /// is the one the parser depth limit protects, while the planned path has larger frames.
+    pub(crate) fn depth(&self) -> usize {
+        self.depth
+    }
+
     /// Iterate a source's selection sets, borrowing them from the plan.
     pub(crate) fn source_sets(
         &self,
@@ -508,6 +522,7 @@ pub(crate) fn build_empty<'a>() -> PreparedPlan<'a> {
     PreparedPlan {
         sources: Vec::new(),
         root: None,
+        depth: 0,
     }
 }
 
@@ -571,9 +586,59 @@ pub(crate) fn build<'a>(
     }
 
     PreparedPlan {
+        depth: plan_depth(&builder.sources),
         sources: builder.sources,
         root: Some(0),
     }
+}
+
+/// The longest chain of planned selection sources reachable from the root.
+///
+/// Sources are interned as a graph: a source can be reached from several parents, and a
+/// pathological document can even point back at an ancestor. A source whose plan is missing
+/// (unplannable, budget exhausted) ends the planned recursion there, but counting it as a level
+/// only over-estimates, which is the safe direction for the caller's stack check.
+fn plan_depth(sources: &[Source<'_>]) -> usize {
+    fn visit(sources: &[Source<'_>], id: u32, state: &mut [u8], memo: &mut [usize]) -> usize {
+        let index = id as usize;
+        if index >= sources.len() {
+            return 0;
+        }
+        match state[index] {
+            2 => return memo[index],
+            // A cycle already being visited contributes no additional levels of its own.
+            1 => return 1,
+            _ => {}
+        }
+        state[index] = 1;
+        let mut depth = 1;
+        for plan in &sources[index].types {
+            for group in &plan.groups {
+                for variant in &group.variants {
+                    let Some(child) = variant.child else {
+                        continue;
+                    };
+                    if child as usize == index {
+                        continue;
+                    }
+                    depth = depth.max(1 + visit(sources, child, state, memo));
+                }
+            }
+        }
+        state[index] = 2;
+        memo[index] = depth;
+        depth
+    }
+
+    if sources.is_empty() {
+        return 0;
+    }
+    visit(
+        sources,
+        0,
+        &mut vec![0u8; sources.len()],
+        &mut vec![0usize; sources.len()],
+    )
 }
 
 enum PlanError {

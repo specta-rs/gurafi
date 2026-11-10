@@ -28,12 +28,16 @@
 //! `body`/`query`/`document`/`source` for the text, `name`/`operationName` for the operation
 //! name, and `type` for a query/mutation/subscription check.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use gql::{
     Schema,
     ast::OperationKind,
     prepared::{PreparedQuery, PreparedQueryRegistry, PreparedQueryRegistryError},
+};
+use serde::{
+    Deserialize,
+    de::{self, Deserializer, MapAccess, SeqAccess, Visitor},
 };
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
@@ -168,26 +172,37 @@ impl PreparedQueries {
 
     /// Load a manifest from a JSON string.
     ///
+    /// Duplicate object keys are rejected rather than silently keeping the last value, so two
+    /// entries with the same identifier cannot hide a mistake in a generated manifest.
+    ///
     /// # Errors
     ///
-    /// Returns an error for malformed JSON, an unrecognised manifest shape, a duplicate id, or a
-    /// query that is invalid against the schema.
+    /// Returns an error for malformed JSON, a duplicate object key, an unrecognised manifest
+    /// shape, a duplicate id, or a query that is invalid against the schema.
     pub fn from_json_str(schema: &Schema, json: &str) -> Result<Self, PreparedQueriesError> {
+        reject_duplicate_keys_str(json)?;
         let value: JsonValue = serde_json::from_str(json)?;
         Self::from_json_value(schema, &value)
     }
 
     /// Load a manifest from JSON bytes.
     ///
+    /// Duplicate object keys are rejected, exactly as in [`PreparedQueries::from_json_str`].
+    ///
     /// # Errors
     ///
-    /// Returns an error for malformed JSON or an invalid manifest.
+    /// Returns an error for malformed JSON, a duplicate object key, or an invalid manifest.
     pub fn from_json_slice(schema: &Schema, json: &[u8]) -> Result<Self, PreparedQueriesError> {
+        reject_duplicate_keys_slice(json)?;
         let value: JsonValue = serde_json::from_slice(json)?;
         Self::from_json_value(schema, &value)
     }
 
     /// Load a manifest from an already parsed JSON value.
+    ///
+    /// A parsed JSON object cannot retain duplicate keys, so this path cannot detect them; prefer
+    /// [`PreparedQueries::from_json_str`] or [`PreparedQueries::from_json_slice`] for untrusted or
+    /// generated manifest text.
     ///
     /// # Errors
     ///
@@ -409,6 +424,105 @@ fn first_string<'a>(map: &'a JsonMap<String, JsonValue>, keys: &[&str]) -> Optio
             .and_then(JsonValue::as_str)
             .filter(|value| !value.is_empty())
     })
+}
+
+/// A JSON value walker that rejects duplicate object keys.
+///
+/// `serde_json` parses an object into a map, so a duplicated key silently overwrites the earlier
+/// value before any manifest code can see it. This visitor runs first and reports the duplicate
+/// with its key, which is the only place the raw text still distinguishes the two entries.
+struct DuplicateKeyCheck;
+
+impl<'de> Deserialize<'de> for DuplicateKeyCheck {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateKeyVisitor)
+    }
+}
+
+struct DuplicateKeyVisitor;
+
+impl<'de> Visitor<'de> for DuplicateKeyVisitor {
+    type Value = DuplicateKeyCheck;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("any JSON value")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut seen = HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key.clone()) {
+                return Err(de::Error::custom(format!("duplicate object key \"{key}\"")));
+            }
+            map.next_value::<DuplicateKeyCheck>()?;
+        }
+        Ok(DuplicateKeyCheck)
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while seq.next_element::<DuplicateKeyCheck>()?.is_some() {}
+        Ok(DuplicateKeyCheck)
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyCheck)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyCheck)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyCheck)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyCheck)
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyCheck)
+    }
+
+    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyCheck)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyCheck)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyCheck)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        DuplicateKeyCheck::deserialize(deserializer)
+    }
+}
+
+fn reject_duplicate_keys_str(json: &str) -> Result<(), serde_json::Error> {
+    let mut deserializer = serde_json::Deserializer::from_str(json);
+    DuplicateKeyCheck::deserialize(&mut deserializer)?;
+    deserializer.end()
+}
+
+fn reject_duplicate_keys_slice(json: &[u8]) -> Result<(), serde_json::Error> {
+    let mut deserializer = serde_json::Deserializer::from_slice(json);
+    DuplicateKeyCheck::deserialize(&mut deserializer)?;
+    deserializer.end()
 }
 
 /// Build the error response for an unknown persisted identifier.

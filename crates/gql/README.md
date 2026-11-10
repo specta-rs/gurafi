@@ -72,7 +72,15 @@ complexity limits, introspection policy, authorization, timeouts and null propag
 execution. `PreparedQueryRegistry` builds a named set with duplicate-id detection, and
 `gql::execute_prepared` is the free-function form of `PreparedQuery::execute`.
 
-Preparation is done against one schema. A registry is cheap to clone and share.
+Preparation is done against one schema instance. Cloning a schema shares that instance, but two
+separately built schemas do not compare equal: use [`Schema::ptr_eq`] when the distinction matters.
+A prepared query stores its schema, so callers that dispatch prepared work next to a different
+schema should check the instance first (`suku` does this for its servers). Complexity is checked
+with a conservative bound computed at preparation; documents with field-level complexity
+estimators fall back to the exact per-request analysis, because estimator results can depend on
+request variables.
+
+[`Schema::ptr_eq`]: https://docs.rs/gql/latest/gql/struct.Schema.html#method.ptr_eq
 
 ## Features
 

@@ -11,7 +11,7 @@ use core::fmt;
 use std::{any::Any, sync::Arc, time::Duration};
 
 use gql::{
-    Authorizer, ExecutionOptions, Schema, SubscriptionResponse, Value,
+    Authorizer, ExecutionOptions, GraphQLError, Response, Schema, SubscriptionResponse, Value,
     ast::OperationKind,
     prepared::{PreparedQuery, PreparedQueryRegistry},
 };
@@ -309,6 +309,10 @@ impl Server {
     /// When a request carries an identifier that matches an entry, the registered query text is
     /// executed. Supplied query text is ignored for a matching identifier, so a client can never
     /// substitute its own document for a trusted persisted one.
+    ///
+    /// The entries are tied to the schema instance they were prepared against. Installing a set
+    /// prepared for a different schema does not panic; requests that resolve to such an entry are
+    /// rejected with a GraphQL error.
     #[must_use]
     pub fn prepared_queries(mut self, queries: PreparedQueries) -> Self {
         self.inner_mut().prepared = Some(queries.into_registry());
@@ -316,6 +320,9 @@ impl Server {
     }
 
     /// Install a prepared-query registry directly.
+    ///
+    /// As with [`Server::prepared_queries`], entries prepared against a different schema instance
+    /// are rejected at execution time.
     #[must_use]
     pub fn prepared_query_registry(mut self, registry: PreparedQueryRegistry) -> Self {
         self.inner_mut().prepared = Some(registry);
@@ -339,9 +346,38 @@ impl Server {
     }
 
     /// Look up a prepared query by identifier.
+    ///
+    /// This does not verify that the query was prepared against this server's schema instance.
+    /// Execution does; use [`Server::prepared_query_for_current_schema`] when the caller needs the
+    /// same guarantee.
     #[must_use]
     pub fn prepared_query(&self, id: &str) -> Option<&PreparedQuery> {
         self.inner.prepared.as_ref()?.get(id)
+    }
+
+    /// Look up a prepared query and verify it targets this server's schema instance.
+    ///
+    /// A registry can be built against one schema and then installed on a server for another.
+    /// Executing such a query would run resolvers and type lookups from the wrong schema, so all
+    /// request paths reject it with a GraphQL error instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`gql::GraphQLError`] when the identifier exists but its query was prepared against
+    /// a different schema instance. Returns `Ok(None)` for an unknown identifier.
+    pub fn prepared_query_for_current_schema(
+        &self,
+        id: &str,
+    ) -> Result<Option<&PreparedQuery>, gql::GraphQLError> {
+        let Some(prepared) = self.prepared_query(id) else {
+            return Ok(None);
+        };
+        if !prepared.schema().ptr_eq(&self.inner.schema) {
+            return Err(GraphQLError::new(format!(
+                "Prepared query \"{id}\" was prepared against a different schema instance; prepare it with this server's schema."
+            )));
+        }
+        Ok(Some(prepared))
     }
 
     /// Whether prepared queries are required (allowlist mode).
@@ -381,12 +417,21 @@ impl Server {
         let options = self.execution_options(context);
 
         if let Some(id) = request.prepared_id() {
-            if let Some(prepared) = self.prepared_query(id) {
-                let future = prepared.execute(variables.as_ref(), &options);
-                return match options.timeout {
-                    Some(timeout) => timed(timeout, future).await,
-                    None => future.await,
-                };
+            match self.prepared_query_for_current_schema(id) {
+                Ok(Some(prepared)) => {
+                    if let Some(error) =
+                        prepared_operation_name_error(prepared, request.operation_name.as_deref())
+                    {
+                        return Response::error(error);
+                    }
+                    let future = prepared.execute(variables.as_ref(), &options);
+                    return match options.timeout {
+                        Some(timeout) => timed(timeout, future).await,
+                        None => future.await,
+                    };
+                }
+                Ok(None) => {}
+                Err(error) => return Response::error(error),
             }
             if self.inner.require_prepared || request.query.trim().is_empty() {
                 return persisted_query_not_found(id);
@@ -447,12 +492,21 @@ impl Server {
         let options = self.execution_options(context);
 
         if let Some(id) = request.prepared_id() {
-            if let Some(prepared) = self.prepared_query(id) {
-                let future = prepared.subscribe(variables.as_ref(), &options);
-                return match options.timeout {
-                    Some(timeout) => timed_subscribe(timeout, future).await,
-                    None => future.await,
-                };
+            match self.prepared_query_for_current_schema(id) {
+                Ok(Some(prepared)) => {
+                    if let Some(error) =
+                        prepared_operation_name_error(prepared, request.operation_name.as_deref())
+                    {
+                        return Err(Response::error(error));
+                    }
+                    let future = prepared.subscribe(variables.as_ref(), &options);
+                    return match options.timeout {
+                        Some(timeout) => timed_subscribe(timeout, future).await,
+                        None => future.await,
+                    };
+                }
+                Ok(None) => {}
+                Err(error) => return Err(Response::error(error)),
             }
             if self.inner.require_prepared || request.query.trim().is_empty() {
                 return Err(persisted_query_not_found(id));
@@ -480,8 +534,17 @@ impl Server {
         request: &GraphQLRequest,
     ) -> Result<Option<OperationKind>, gql::GraphQLError> {
         if let Some(id) = request.prepared_id() {
-            if let Some(prepared) = self.prepared_query(id) {
-                return Ok(Some(prepared.kind()));
+            match self.prepared_query_for_current_schema(id) {
+                Ok(Some(prepared)) => {
+                    if let Some(error) =
+                        prepared_operation_name_error(prepared, request.operation_name.as_deref())
+                    {
+                        return Err(error);
+                    }
+                    return Ok(Some(prepared.kind()));
+                }
+                Ok(None) => {}
+                Err(error) => return Err(error),
             }
             if self.inner.require_prepared || request.query.trim().is_empty() {
                 return Err(persisted_query_not_found_error(id));
@@ -516,6 +579,25 @@ impl Server {
 /// The request error for a body that has neither query text nor a persisted identifier.
 fn missing_query_error() -> gql::GraphQLError {
     gql::GraphQLError::new("Missing required `query` field.")
+}
+
+/// Reject a persisted request whose `operationName` does not match the prepared operation.
+///
+/// The prepared document selected its operation at preparation time, so a request cannot change
+/// which operation runs. Silently ignoring a disagreeing name would hide a client bug, so it is
+/// reported instead.
+fn prepared_operation_name_error(
+    prepared: &PreparedQuery,
+    requested: Option<&str>,
+) -> Option<gql::GraphQLError> {
+    let requested = requested?;
+    if prepared.operation_name() == Some(requested) {
+        return None;
+    }
+    Some(gql::GraphQLError::new(format!(
+        "Prepared query \"{}\" does not contain an operation named \"{requested}\".",
+        prepared.id()
+    )))
 }
 
 fn missing_query_response() -> gql::Response {

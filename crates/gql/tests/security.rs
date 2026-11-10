@@ -4,12 +4,7 @@
 //! untrusted clients and currently passes (i.e. the problem is present). The remaining tests
 //! pin protections that the engine does provide, so a regression shows up here.
 //!
-//! Two tests abort the process on purpose (stack overflow) and are `#[ignore]`d; run them on
-//! their own:
-//!
-//! ```text
-//! cargo test -p gql --test security -- --ignored --nocapture
-//! ```
+//! The stack-bound tests run on a dedicated 2 MiB thread, the default for a Tokio worker.
 
 use std::sync::{Arc, Mutex};
 
@@ -550,6 +545,79 @@ fn deep_query_is_rejected_before_execution_on_a_small_stack() {
                 "{:?}",
                 response.errors
             );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+/// A prepared document must keep the same stack guarantee as normal execution.
+///
+/// Preparation is iterative, but executing a plan recurses through larger async frames than the
+/// dynamic collection path. Execution therefore drops a plan deeper than a safe threshold and
+/// collects dynamically, so a prepared document at the parser's depth limit still runs on a 2 MiB
+/// stack (the default for a Tokio worker).
+#[test]
+fn prepared_execute_on_a_2_mib_stack() {
+    let depth = gql::parser::MAX_DEPTH - 2;
+    let schema = recursive_schema();
+    let mut query = String::new();
+    for _ in 0..depth {
+        query.push_str("{ a ");
+    }
+    query.push_str("{ ping }");
+    for _ in 0..depth {
+        query.push_str(" }");
+    }
+    let prepared = gql::prepared::PreparedQuery::new(&schema, "deep", &query, None)
+        .expect("valid prepared query");
+
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            let response = block_on(prepared.execute(
+                None,
+                &ExecutionOptions::default().root_value(gql::Object::new()),
+            ));
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+            assert!(response.data.is_some());
+            std::mem::forget(prepared);
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+/// The shallow side of the planned-path threshold still executes on a 2 MiB stack.
+///
+/// This walks the last depth that keeps the precompiled plan; the next level falls back to
+/// dynamic collection (covered by `prepared_execute_on_a_2_mib_stack`). Both sides of the
+/// threshold must stay within a worker's stack.
+#[test]
+fn prepared_planned_nesting_near_the_threshold_runs_on_a_small_stack() {
+    let depth = 47;
+    let schema = recursive_schema();
+    let mut query = String::new();
+    for _ in 0..depth {
+        query.push_str("{ a ");
+    }
+    query.push_str("{ ping }");
+    for _ in 0..depth {
+        query.push_str(" }");
+    }
+    let prepared = gql::prepared::PreparedQuery::new(&schema, "near", &query, None)
+        .expect("valid prepared query");
+
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            let response = block_on(prepared.execute(
+                None,
+                &ExecutionOptions::default().root_value(gql::Object::new()),
+            ));
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+            assert!(response.data.is_some());
+            std::mem::forget(prepared);
         })
         .expect("spawn")
         .join()
