@@ -186,6 +186,37 @@ fn prepared_handles_variable_defaults_and_aliases() {
 }
 
 #[test]
+fn prepared_exact_object_projection_matches_parent() {
+    let schema = schema();
+    // The parent `friend` object already has exactly these keys in this order, so completion
+    // may reuse it; a subset selection must still drop the extra key.
+    let exact = "{ user(id: \"1\") { friend { id name age } } }";
+    let normal = run(&schema, exact, None);
+    let prepared = block_on(
+        PreparedQuery::new(&schema, "exact", exact, None)
+            .expect("prepared")
+            .execute(None, &options()),
+    );
+    assert_eq!(normal, prepared);
+
+    let subset = "{ user(id: \"1\") { friend { id name } } }";
+    let normal = run(&schema, subset, None);
+    let prepared = block_on(
+        PreparedQuery::new(&schema, "subset", subset, None)
+            .expect("prepared")
+            .execute(None, &options()),
+    );
+    assert_eq!(normal, prepared);
+    let friend = field(&prepared, "user")
+        .as_object()
+        .and_then(|user| user.get("friend"))
+        .and_then(Value::as_object)
+        .expect("friend object");
+    assert_eq!(friend.len(), 2);
+    assert!(friend.get("age").is_none());
+}
+
+#[test]
 fn prepared_applies_null_propagation() {
     let schema = schema();
     let prepared = PreparedQuery::new(&schema, "nulls", "{ required }", None).expect("prepared");

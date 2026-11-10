@@ -2688,15 +2688,23 @@ impl<'doc> Executor<'doc> {
         errors: &mut Vec<GraphQLError>,
         depth: usize,
     ) -> Result<Result<Arc<Object>, ()>, GraphQLError> {
-        // The response object is the one allocation this path needs, filled in place.
-        let mut result = Arc::new(Object::with_capacity(plan.len()));
-        let object = Arc::get_mut(&mut result).expect("a fresh Arc is uniquely owned");
         // An authorizer is caller code and must observe every field, so the scalar shortcut is
         // only safe when none is configured.
         let parent_object = match parent {
             Value::Object(parent) if self.context.authorizer.is_none() => Some(parent),
             _ => None,
         };
+        // A leaf object whose response is exactly its parent object can be reused as is: no
+        // completion is needed and nothing observable changes (the values already have the shapes
+        // the selected built-in scalars pass through).
+        if let Some(parent_object) = parent_object {
+            if plan.identity_projection && plan.matches_parent(parent_object) {
+                return Ok(Ok(Arc::clone(parent_object)));
+            }
+        }
+        // The response object is the one allocation this path needs, filled in place.
+        let mut result = Arc::new(Object::with_capacity(plan.len()));
+        let object = Arc::get_mut(&mut result).expect("a fresh Arc is uniquely owned");
         let check_deadline = self.deadline.is_some();
         for group in plan.groups() {
             let Some(variant) = group.variant(&self.context.variables) else {
@@ -3293,6 +3301,23 @@ impl<'doc> Executor<'doc> {
         errors: &mut Vec<GraphQLError>,
         depth: usize,
     ) -> Option<Result<Value, GraphQLError>> {
+        if !selections.is_empty() && depth < SYNC_DEPTH_LIMIT {
+            if let Some(plan) = self.planned_object_fields(object, selections) {
+                if !plan.has_resolvers {
+                    return self.complete_planned_object_list_sync(
+                        plan,
+                        object,
+                        items_non_null,
+                        value,
+                        label,
+                        location,
+                        path,
+                        errors,
+                        depth,
+                    );
+                }
+            }
+        }
         let Value::List(items) = value else {
             return Some(Err(list_mismatch_error(label, value, path, location)));
         };
@@ -3337,6 +3362,82 @@ impl<'doc> Executor<'doc> {
                         path.pop();
                         return None;
                     }
+                }
+            };
+            path.pop();
+            match outcome {
+                Ok(value) => completed.push(value),
+                Err(error) => {
+                    if items_non_null {
+                        return Some(Err(error));
+                    }
+                    record_error(errors, error, self.context.max_errors);
+                    completed.push(Value::Null);
+                }
+            }
+        }
+        Some(Ok(Value::List(completed)))
+    }
+
+    /// The planned field set for a synchronous object completion, when one exists.
+    ///
+    /// Returning the plan directly lets the common prepared-query path skip the large
+    /// [`collect::CollectedFields`] value (whose dynamic variant is intentionally inline) entirely.
+    #[inline]
+    fn planned_object_fields(
+        &self,
+        object_type: &ObjectType,
+        selections: &Selections<'_, 'doc>,
+    ) -> Option<&'doc crate::execution::plan::FieldPlan<'doc>> {
+        let plan = self.plans?;
+        let source = selections.source?;
+        plan.field_plan(source, object_type)
+    }
+
+    /// Complete a list of plain objects whose fields are already planned.
+    ///
+    /// This is [`Self::complete_object_list_sync`] without the dynamic collection bookkeeping: the
+    /// plan is known to exist for the item type and to contain no resolvers, so every item fills
+    /// its response object directly.
+    #[allow(clippy::too_many_arguments)]
+    fn complete_planned_object_list_sync(
+        &self,
+        plan: &'doc crate::execution::plan::FieldPlan<'doc>,
+        object: &'doc ObjectType,
+        items_non_null: bool,
+        value: &Value,
+        label: FieldLabel<'_>,
+        location: Location,
+        path: &mut Path,
+        errors: &mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> Option<Result<Value, GraphQLError>> {
+        let Value::List(items) = value else {
+            return Some(Err(list_mismatch_error(label, value, path, location)));
+        };
+        let mut completed = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            path.push(PathSegment::index(index));
+            let outcome = if item.is_null() {
+                if items_non_null {
+                    Err(located(
+                        format!("Cannot return null for non-nullable field {label}."),
+                        path,
+                        location,
+                    ))
+                } else {
+                    Ok(Value::Null)
+                }
+            } else if !matches!(item, Value::Object(_) | Value::External(_)) {
+                Err(object_mismatch_error(label, object, item, path, location))
+            } else {
+                match self.planned_fields_sync(plan, object, item, path, errors, depth) {
+                    Ok(Ok(completed)) => Ok(Value::Object(completed)),
+                    Ok(Err(())) => {
+                        path.pop();
+                        return None;
+                    }
+                    Err(error) => Err(error),
                 }
             };
             path.pop();
@@ -3434,6 +3535,23 @@ impl<'doc> Executor<'doc> {
         errors: &mut Vec<GraphQLError>,
         depth: usize,
     ) -> Option<Result<Value, GraphQLError>> {
+        if !selections.is_empty() && depth < SYNC_DEPTH_LIMIT {
+            if let Some(plan) = self.planned_object_fields(object, selections) {
+                if !plan.has_resolvers {
+                    if !matches!(value, Value::Object(_) | Value::External(_)) {
+                        return Some(Err(object_mismatch_error(
+                            label, object, value, path, location,
+                        )));
+                    }
+                    return match self.planned_fields_sync(plan, object, value, path, errors, depth)
+                    {
+                        Ok(Ok(completed)) => Some(Ok(Value::Object(completed))),
+                        Ok(Err(())) => None,
+                        Err(error) => Some(Err(error)),
+                    };
+                }
+            }
+        }
         let collected =
             match self.collect_object_sync(object, label, selections, location, path, depth)? {
                 Ok(collected) => collected,
@@ -3919,13 +4037,7 @@ fn property_value<'v>(value: Option<&'v Value>) -> Cow<'v, Value> {
 /// This is [`builtin_scalar_passthrough`] with the scalar already identified at preparation, so a
 /// scalar leaf costs one shape check and a clone.
 fn scalar_shape(kind: plan::ScalarKind, value: &Value) -> Option<Value> {
-    let matches = match kind {
-        plan::ScalarKind::String => matches!(value, Value::String(_)),
-        plan::ScalarKind::Int => matches!(value, Value::Int(_)),
-        plan::ScalarKind::Boolean => matches!(value, Value::Boolean(_)),
-        plan::ScalarKind::Float => matches!(value, Value::Float(number) if number.is_finite()),
-    };
-    matches.then(|| value.clone())
+    kind.accepts(value).then(|| value.clone())
 }
 
 /// A value a built-in scalar serialises to itself.

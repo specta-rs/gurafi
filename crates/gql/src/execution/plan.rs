@@ -10,6 +10,9 @@
 //! * Field groups keep the specification's first-seen response-key order, their merged field
 //!   nodes, and the schema field they resolve to (as a positional index, so execution does not
 //!   hash the object type's field map).
+//! * A plan whose response is exactly its parent object (only unconditional, unaliased built-in
+//!   scalar properties) records that fact, so a matching parent value can be reused instead of
+//!   copied field by field.
 //! * `@skip`/`@include` conditions that depend on variables are kept as per-node requirements. A
 //!   group precomputes one variant per possible combination of its conditional nodes, so runtime
 //!   work is limited to evaluating those requirements and indexing the variant.
@@ -87,6 +90,12 @@ pub(crate) struct FieldPlan<'a> {
     /// The synchronous completion path refuses a type that defines one, whatever the selection
     /// asks for. Planning it once keeps that check off the per-object path.
     pub(crate) has_resolvers: bool,
+    /// Whether the response object is exactly a projection of the parent object.
+    ///
+    /// True when every group is an unconditional, unaliased, resolver-free built-in scalar
+    /// property. Such a plan can reuse the parent object without copying when the parent's keys
+    /// and value shapes line up, which is common for leaf objects nested in a list.
+    pub(crate) identity_projection: bool,
 }
 
 /// A field that completes by copying an unaliased built-in scalar property.
@@ -113,6 +122,19 @@ pub(crate) enum ScalarKind {
     Boolean,
     /// `Float`.
     Float,
+}
+
+impl ScalarKind {
+    /// Whether `value` already has the shape this scalar passes through unchanged.
+    #[inline(always)]
+    pub(crate) fn accepts(self, value: &Value) -> bool {
+        match self {
+            Self::String => matches!(value, Value::String(_)),
+            Self::Int => matches!(value, Value::Int(_)),
+            Self::Boolean => matches!(value, Value::Boolean(_)),
+            Self::Float => matches!(value, Value::Float(number) if number.is_finite()),
+        }
+    }
 }
 
 /// One response key's merged field nodes.
@@ -321,6 +343,31 @@ impl<'a> FieldPlan<'a> {
     #[inline(always)]
     pub(crate) fn groups(&'a self) -> &'a [FieldGroup<'a>] {
         &self.groups
+    }
+
+    /// Whether `parent` is already exactly this plan's response object.
+    ///
+    /// Only plans whose response is the identity projection qualify. The check compares response
+    /// keys and value shapes, so a hit means the response can reuse the parent's object without
+    /// copying it or changing any value.
+    #[inline]
+    pub(crate) fn matches_parent(&self, parent: &Object) -> bool {
+        if !self.identity_projection || self.groups.len() != parent.len() {
+            return false;
+        }
+        let mut fields = parent.iter();
+        for group in &self.groups {
+            let Some((key, value)) = fields.next() else {
+                return false;
+            };
+            let Some(property) = &group.property else {
+                return false;
+            };
+            if !names_eq(group.response_key, key) || !property.kind.accepts(value) {
+                return false;
+            }
+        }
+        true
     }
 
     /// View one group of this plan.
@@ -671,6 +718,13 @@ impl<'a> Builder<'a, '_, '_> {
             .fields
             .values()
             .any(|field| field.resolve.is_some());
+        // A plan can stand in for its parent object only when the response is the identity
+        // projection: every group is one unconditional, unaliased built-in scalar property.
+        let identity_projection = groups.iter().all(|group| {
+            group.property.is_some()
+                && group.variants.len() == 1
+                && group.variants[0].nodes.len() == 1
+        });
 
         for (source, name) in tasks {
             self.queue.push_back((source, name));
@@ -680,6 +734,7 @@ impl<'a> Builder<'a, '_, '_> {
             type_name: object_type.name.clone(),
             groups,
             has_resolvers,
+            identity_projection,
         })
     }
 
@@ -1167,6 +1222,58 @@ mod tests {
         assert_eq!(user_plan.groups[2].nodes.len(), 1);
         assert!(user_plan.groups[0].property.is_some());
         assert!(user_plan.groups[3].property.is_none());
+    }
+
+    #[test]
+    fn exact_projection_reuses_the_parent_object() {
+        let schema = schema();
+        let document = parse_query(
+            r#"
+            query {
+              user { id name age }
+            }
+            "#,
+        )
+        .expect("parses");
+        let plan = build_plan(&schema, &document);
+        let root = plan.field_plan(0, schema.query_type()).expect("root");
+        let child = root.groups[0]
+            .variant(&Object::new())
+            .expect("variant")
+            .child
+            .expect("child source");
+        let user = schema.object_type("User").expect("user type");
+        let user_plan = plan.field_plan(child, user).expect("user plan");
+        assert!(user_plan.identity_projection);
+
+        let exact = Object::from_fields([
+            ("id", Value::from("1")),
+            ("name", Value::from("Alice")),
+            ("age", Value::Int(30)),
+        ]);
+        assert!(user_plan.matches_parent(&exact));
+
+        // A different order, an extra key, a missing key, or a value of the wrong shape keeps
+        // the general completion path.
+        let reordered = Object::from_fields([
+            ("name", Value::from("Alice")),
+            ("id", Value::from("1")),
+            ("age", Value::Int(30)),
+        ]);
+        assert!(!user_plan.matches_parent(&reordered));
+        let extra = Object::from_fields([
+            ("id", Value::from("1")),
+            ("name", Value::from("Alice")),
+            ("age", Value::Int(30)),
+            ("friends", Value::List(Vec::new())),
+        ]);
+        assert!(!user_plan.matches_parent(&extra));
+        let null_age = Object::from_fields([
+            ("id", Value::from("1")),
+            ("name", Value::from("Alice")),
+            ("age", Value::Null),
+        ]);
+        assert!(!user_plan.matches_parent(&null_age));
     }
 
     #[test]
