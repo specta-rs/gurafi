@@ -7,6 +7,7 @@ layers**.
 | --- | --- | --- |
 | Specification engine | `gql` | GraphQL documents, types, execution, introspection |
 | Developer experience | `gurafi` (+ `gurafi-macros`) | `gql`, Rust types |
+| Relay | `gurafi-relay` | `gurafi`, Relay conventions |
 | Transport | `suku` | `gql`, HTTP |
 
 This is what makes it possible to build another high-level API or another
@@ -75,8 +76,8 @@ only reached by a valid operation with valid variables.
 
 ## `gurafi`: developer experience
 
-`gurafi` is the Pothos analogue. It exists to make the common case feel like
-writing Rust, not like describing a schema:
+`gurafi` exists to make the common case feel like writing Rust, not like
+describing a schema:
 
 - Rust types infer GraphQL types (`String` → `String!`, `Option<T>` → nullable,
   `Vec<T>` → list, `Result<T, E>` in fallible resolvers).
@@ -91,13 +92,29 @@ writing Rust, not like describing a schema:
   `interface_fields`, `query_fields`, ...), so declarations merge naturally.
 - `.auth(...)`, `.complexity(...)`, `.description(...)`, `.deprecated(...)`,
   `.nullable()`, `.non_null()` and `.as_type::<T>()` attach the same metadata
-  Pothos exposes through field options, with build-time checks.
+  with build-time checks.
 - Object- and interface-level authorization, validation hooks, one-of inputs and
   resolver info are first-class.
-- Interfaces, unions, enums, custom scalars and subscriptions are first-class.
+- Interfaces, unions, enums, custom scalars, custom directives and subscriptions are first-class.
+- Plugins provide build-time field hooks for tracing, mocks, scopes and response extensions.
+- Runtime-named references support Relay connections, payloads and generated result unions.
+- `Loader` and `RequestCache` provide request-scoped batching and caching.
+- `#[derive(ErrorUnion)]` and `field_result_union` expose typed failures as GraphQL unions.
 
 Everything `gurafi` produces is a normal `gql::Schema`; `suku` (or any other
 transport) cannot tell the difference.
+
+## `gurafi-relay`: Relay conventions
+
+`gurafi-relay` is a thin layer over the `gurafi` builder:
+
+- typed global IDs and the shared `Node` interface
+- `node`/`nodes` dispatch with request-scoped caching
+- connections, cursor pagination and `PageInfo`
+- mutation payloads with `clientMutationId`
+
+It uses runtime-named object references, so connection and payload type names do not need
+code generation.
 
 ## `suku`: transport
 

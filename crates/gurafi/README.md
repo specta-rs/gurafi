@@ -190,7 +190,7 @@ GraphQL `errors` entry. The success `data` field uses `T`'s type (`Option<T>` st
 lists keep their wrappers, and an abstract `T` keeps its abstract type). Error payload objects are
 registered like any other object with `schema.object::<M>(...)`; forgetting one is a build error
 that names the missing type. Sync, async, root, object and subscription fields are supported.
-See [`docs/schema/errors.md`](../../docs/schema/errors.md) for names, limitations and how this
+See [`docs/plugins/errors.md`](../../docs/plugins/errors.md) for names, limitations and how this
 relates to error masking.
 
 ## Objects
@@ -648,7 +648,7 @@ gurafi = { version = "0.0.1", features = ["tracing"] }
 
 `gurafi.schema.build`, `gurafi.loader.load` and `gurafi.loader.batch` are the summary points;
 per-resolver, auth, validator and cache events are TRACE. Loader spans record the key *type* and
-cache hit/miss, never key values. See [`docs/observability.md`](../../docs/observability.md) for
+cache hit/miss, never key values. See [`docs/plugins/tracing.md`](../../docs/plugins/tracing.md) for
 the span tree and performance guidance.
 
 ## Workspace

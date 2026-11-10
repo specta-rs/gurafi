@@ -1,86 +1,76 @@
-# Gurafi Documentation
+# gurafi documentation
 
-Rust crates for building GraphQL servers.
+`gurafi` is a type-safe, code-first GraphQL stack for Rust. Rust types describe the schema,
+`#[derive]` macros provide the wiring, and the resulting `gql::Schema` is a normal GraphQL
+schema that can be executed directly or served over HTTP.
 
-## Contents
+The documentation follows a progressive learning path: start with a schema and a query, then add
+models, fields, arguments and context. Each concept is expressed with Rust types, builder methods
+and derives rather than with generated resolver types.
 
-- [Architecture](architecture.md) — how `gql`, `gurafi` and `suku` fit together
-- [Defining a schema](schema/object.md) — objects, inputs, enums, interfaces, unions, auth, validation, type overrides
-- [Plugins](schema/plugins.md) — build-time field hooks, resolver wrapping, tracing, mocks and response extensions
-- [Typed error result unions](schema/errors.md) — exposing `Result<T, E>` as a GraphQL union of success and error payloads
-- [Serving over HTTP](server/suku.md) — requests, batches, subscriptions, limits, auth
-- [Schema evolution](schema/evolution.md) — compatibility diffing and SDL snapshots
-- [Observability](observability.md) — the optional `tracing` feature, span tree and performance tips
+## Start here
 
-## Define a schema
+- [Getting started](guide/getting-started.md) — install the crates, build a schema, run a query
+- [Objects](guide/objects.md) — turn application data into GraphQL object types
+- [Fields](guide/fields.md) — resolvers, lists, nullability, exposure and field options
+- [Using args](guide/args.md) — typed arguments from Rust structs
+- [Using context](guide/context.md) — request state shared by every resolver
 
-```rust
-use gurafi::{expose, NoArgs, Object, Schema};
+## Guide
 
-#[derive(Object)]
-struct Giraffe {
-    name: String,
-    height_meters: f64,
-}
+- [Enums](guide/enums.md)
+- [Scalars](guide/scalars.md)
+- [Input objects](guide/inputs.md)
+- [Queries, mutations and subscriptions](guide/operations.md)
+- [Interfaces](guide/interfaces.md)
+- [Unions](guide/unions.md)
+- [Schema builder](guide/schema-builder.md)
+- [Using plugins](guide/using-plugins.md)
+- [File layout](guide/app-layout.md)
+- [Circular references](guide/circular-references.md)
+- [Patterns](guide/patterns.md)
+- [Nullability](guide/nullability.md)
+- [Type inference](guide/type-inference.md)
+- [Using GraphiQL](guide/playground.md)
+- [Printing schemas](guide/printing-schemas.md)
+- [Generating client types](guide/client-codegen.md)
+- [Troubleshooting](guide/troubleshooting.md)
+- [Writing plugins](guide/writing-plugins.md)
+- [Integrations and non-goals](guide/non-goals.md)
 
-let mut schema = Schema::<()>::new();
+## Plugins and extensions
 
-schema.object::<Giraffe>(|o| {
-    o.description("Long necks, cool patterns, taller than you.");
-    o.expose(expose!(Giraffe::name));
-    o.expose(expose!(Giraffe::height_meters as "heightMeters"));
-});
+- [Add GraphQL and schema composition](plugins/add-graphql.md)
+- [Complexity](plugins/complexity.md)
+- [Dataloaders and request cache](plugins/dataloader.md)
+- [Directives](plugins/directives.md)
+- [Typed errors](plugins/errors.md)
+- [Mocks](plugins/mocks.md)
+- [Relay](plugins/relay.md)
+- [Scope auth](plugins/scope-auth.md)
+- [Simple objects](plugins/simple-objects.md)
+- [Tracing and observability](plugins/tracing.md)
+- [Validation](plugins/validation.md)
 
-schema.query(|q| {
-    q.field("giraffe", |_: NoArgs, _: &()| Giraffe {
-        name: "Melman".into(),
-        height_meters: 5.2,
-    });
-});
+## Server
 
-let schema = schema.build().unwrap();
-```
+- [Serving over HTTP with `suku`](server/suku.md)
+- [Error formatting and masking](server/suku.md#error-formatting-and-masking)
 
-`gurafi` only adds developer experience. The resulting `gql::Schema` is a normal
-GraphQL schema and can be executed directly:
+## Reference
 
-```rust
-let response = gql::execute(
-    &schema,
-    gql::Request::new("{ giraffe { name heightMeters } }"),
-    &gql::ExecutionOptions::default(),
-).await;
-```
+- [Architecture](architecture.md) — how `gql`, `gurafi`, `gurafi-relay` and `suku` fit together
+- [Schema evolution](guide/printing-schemas.md) — compatibility diffing, SDL snapshots, composition
 
-## Serve over HTTP
+## Crates
 
-```rust
-use suku::{Context, Server};
+| Crate | Role |
+| --- | --- |
+| [`gql`](../crates/gql) | GraphQL specification: parser, validation, execution, introspection |
+| [`gurafi`](../crates/gurafi) | Rust-first schema builder and type-safe DX |
+| [`gurafi-macros`](../crates/gurafi-macros) | Derives for `Object`, `Args`, `Input`, `Enum`, `Scalar`, `Union`, `ErrorUnion` |
+| [`gurafi-relay`](../crates/gurafi-relay) | Relay global IDs, `Node`, connections and mutation payloads |
+| [`suku`](../crates/suku) | GraphQL over HTTP, batching, SSE subscriptions and error masking |
 
-let server = Server::new(schema)
-    .introspection(true)
-    .max_depth(15)
-    .max_complexity(1_000);
-
-let app = suku::axum::GraphQL::new(server)
-    .path("/graphql")
-    .graphiql(true)
-    .with_context(|request: suku::ContextRequest| async move {
-        Ok(Context::empty())
-    })
-    .into_router();
-```
-
-See [`examples/axum`](../examples/axum) for a runnable server with a Bearer-token
-authentication extractor and CORS.
-
-## Layers
-
-| Layer | Crate | Knows about |
-| --- | --- | --- |
-| Specification | `gql` | GraphQL documents, types, validation, execution, introspection |
-| DX | `gurafi` | `gql` and Rust types |
-| Transport | `suku` | `gql` and HTTP |
-
-The layers are independent: another high-level API can build on `gql`, and another
-HTTP framework can serve a `gql::Schema` without `suku`.
+The crates are deliberately independent: `gql` knows nothing about HTTP or Rust models, `gurafi`
+builds only on the public `gql` API, and `suku` only understands `gql::Schema`.

@@ -272,7 +272,7 @@ suku = { version = "0.0.1", features = ["tracing"] }
 `suku.request` is INFO and records method, path, body size, operation, request id, batch size and
 status. Its children cover parsing, execution, serialization and subscriptions. Transport and
 extractor failures are WARN events with a status and code. Bodies, headers, tokens and variable
-values are never recorded. See [`docs/observability.md`](../../docs/observability.md) for the span
+values are never recorded. See [`docs/plugins/tracing.md`](../../docs/plugins/tracing.md) for the span
 tree and the recommended `tracing-subscriber` setup.
 
 ## Tests

@@ -95,7 +95,7 @@
 //! The optional `tracing` feature (which enables `gurafi/tracing` and `gql/tracing`) adds DEBUG
 //! spans for node resolution, connection paging and mutation payloads. They record requested,
 //! resolved, null and error counts, cache hits, loader calls, page-info flags and edge counts;
-//! local-ID and cursor values are never recorded. See the repository's `docs/observability.md`.
+//! local-ID and cursor values are never recorded. See the repository's `docs/plugins/tracing.md`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

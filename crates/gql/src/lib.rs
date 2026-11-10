@@ -38,7 +38,7 @@
 //! the feature enabled, spans record counts, byte lengths and short identifier prefixes; variable
 //! values, arguments and document text are never recorded. Operation summaries are INFO, field
 //! spans are DEBUG and collection spans are TRACE. See the repository's
-//! `docs/observability.md` for the span tree.
+//! `docs/plugins/tracing.md` for the span tree.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]

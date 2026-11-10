@@ -1,4 +1,4 @@
-# Observability with `tracing`
+# Tracing and observability
 
 Every crate in the stack has an **optional** `tracing` feature. It is off by default: a default
 build and a `--no-default-features` build do not compile `tracing` at all and contain none of the
@@ -41,7 +41,7 @@ RUST_LOG=gql=debug,gurafi=debug,suku=debug,gurafi_relay=debug
 RUST_LOG=gql=trace,gurafi=trace
 ```
 
-A runnable example is in [`examples/tracing`](../examples/tracing). It requires the feature:
+A runnable example is in [`examples/tracing`](../../examples/tracing). It requires the feature:
 
 ```sh
 RUST_LOG=gql=debug,gurafi=debug \

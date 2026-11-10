@@ -271,7 +271,7 @@
 //! The optional `tracing` feature instruments schema building, plugin application, authorization,
 //! validation, resolvers, error-union dispatch, [`Loader`] batching and [`RequestCache`] lookups.
 //! It is off by default. Loader spans record the key *type* and cache hit/miss, never key values;
-//! per-resolver and cache events are TRACE. See the repository's `docs/observability.md`.
+//! per-resolver and cache events are TRACE. See the repository's `docs/plugins/tracing.md`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

@@ -103,5 +103,5 @@ gql = { version = "0.2", features = ["tracing"] }
 Spans are hierarchical (`gql.execute` → `gql.execute_operation` → `gql.field`) and record shapes,
 counts and timings rather than variable values, arguments or document text. Field spans are DEBUG
 and collection spans are TRACE; enable them while investigating an operation, and keep INFO for
-request summaries. See [`docs/observability.md`](../../docs/observability.md) for the full catalog
+request summaries. See [`docs/plugins/tracing.md`](../../docs/plugins/tracing.md) for the full catalog
 and the recommended `tracing-subscriber` setup.

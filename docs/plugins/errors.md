@@ -5,8 +5,8 @@ unexpected failure, but some failures are part of the API: a `createUser` mutati
 because the address is taken, and the client needs a typed `ConflictError` payload it can switch
 on, not a message in the `errors` array.
 
-`gurafi` supports the Pothos Errors pattern. A field returns `Result<T, E>` where `E` is an enum
-derived with `ErrorUnion`, and the builder generates a result union:
+A field can return `Result<T, E>` where `E` is an enum derived with `ErrorUnion`. The builder
+generates a result union from the Rust types:
 
 ```graphql
 type Mutation {
@@ -224,23 +224,18 @@ Error masking remains a server concern. `suku`'s `Server::format_error` runs ove
 before they reach the client; typed error payloads are response data and are not touched by it.
 Do not put internal diagnostics in an error payload just because it is typed.
 
-## Comparison to Pothos
+## How the Rust pieces fit
 
-Pothos's Errors plugin turns a resolver's result into a union of a success payload and error
-payload objects. `gurafi` expresses the same shape with Rust types:
-
-| Pothos | `gurafi` |
+| Rust declaration | Generated GraphQL |
 | --- | --- |
-| `builder.objectRef` / `objectType` for payloads | `#[derive(Object)]` and `schema.object::<M>(...)` |
-| Errors plugin's generated success type | `<Parent><Field>Success` with `data: T` |
-| Errors plugin's generated union | `<Parent><Field>Result` |
-| `errors: [ErrorType]` metadata | `#[derive(ErrorUnion)]` on a Rust enum |
-| `Result<T, E>` resolver | `Result<T, E>` resolver on `field_result_union` |
+| `#[derive(Object)]` error payload | an object type with its normal fields |
+| `#[derive(ErrorUnion)]` enum | the union member list and `Err(E)` conversion |
+| `field_result_union::<T, E, ...>` | `<Parent><Field>Success` and `<Parent><Field>Result` |
+| resolver returning `Result<T, E>` | `Ok(T)` as `data`, `Err(E)` as the matching payload |
 
-The main difference is registration: Pothos keeps payload types in its schema builder, whereas
-`gurafi` requires each error payload object to be registered like any other object type. That is
-what keeps its fields, authorization and resolvers in the same place as the rest of the schema,
-and it makes a missing payload a build error rather than an execution-time surprise.
+Error payloads are registered like any other object, so their fields, authorization and
+resolvers live with the rest of the schema. A missing payload is a build error rather than an
+execution-time surprise.
 
 ## Limitations
 

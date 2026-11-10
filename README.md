@@ -83,7 +83,7 @@ tracing_subscriber::registry()
 Operation summaries are INFO, field spans and loader batches are DEBUG, and the hottest
 per-object/per-item work is TRACE. Run the example with
 `RUST_LOG=gql=debug,gurafi=debug cargo run -p example-tracing --features tracing`, and see
-[`docs/observability.md`](docs/observability.md) for the full span tree, safe fields and
+[`docs/plugins/tracing.md`](docs/plugins/tracing.md) for the full span tree, safe fields and
 production/development guidance.
 
 ## What `gurafi` adds
@@ -106,7 +106,7 @@ production/development guidance.
 - **Typed error result unions.** `#[derive(ErrorUnion)]` and
   `field_result_union` turn `Result<T, E>` into a generated GraphQL union of a
   success payload and each typed error payload, without encoding failures as
-  GraphQL errors. See [`docs/schema/errors.md`](docs/schema/errors.md).
+  GraphQL errors. See the [typed errors guide](docs/plugins/errors.md) for names, limitations and how this relates to error masking.
 - **Validation, one-of inputs and resolver info.** `#[graphql(validate)]`,
   `#[graphql(one_of)]`, and `*_with_info` resolver variants.
 - **Reusable builders.** `Schema` is `Clone`; `build_with(BuildOptions)` and
@@ -114,9 +114,18 @@ production/development guidance.
 - **Plugins.** `Schema::plugin` runs build-time hooks over every object, interface
   and root field, with resolver and subscription wrapping. Tracing, mocks and
   response-extension plugins are built in. See
-  [`docs/schema/plugins.md`](docs/schema/plugins.md).
+  [`docs/guide/writing-plugins.md`](docs/guide/writing-plugins.md).
+- **Directives.** Register custom directive definitions and apply them to types,
+  fields, arguments and input fields. See [`docs/plugins/directives.md`](docs/plugins/directives.md).
+- **Relay.** Typed global IDs, `Node`, connections and mutation payloads live in
+  [`gurafi-relay`](crates/gurafi-relay). See [`docs/plugins/relay.md`](docs/plugins/relay.md).
+- **Loaders and request cache.** `Loader` and `RequestCache` are request-scoped
+  and framework-independent. See [`docs/plugins/dataloader.md`](docs/plugins/dataloader.md).
 
-See [`docs/schema/object.md`](docs/schema/object.md) for the full guide.
+The documentation follows the Pothos guide structure with Rust concepts. Start at
+[`docs/README.md`](docs/README.md), or jump to [objects](docs/guide/objects.md),
+[fields](docs/guide/fields.md), [arguments](docs/guide/args.md) and
+[context](docs/guide/context.md).
 
 ## Development
 
