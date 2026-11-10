@@ -62,31 +62,169 @@ use crate::{
 /// anyway.
 pub type BoxFuture<'a, T> = futures::future::BoxFuture<'a, T>;
 
-/// An interface definition created by [`Schema::interface`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct InterfaceRef {
-    name: &'static str,
+/// A reference to an object type whose GraphQL name may be computed at runtime.
+///
+/// An object reference ties a Rust model to a GraphQL type name. The model still drives
+/// `is_type_of` and the resolvers a builder receives; the name is just data. Refs are created by
+/// [`Schema::object_ref`] (or [`Schema::object`] for the derived name) and consumed by
+/// [`Schema::implement`].
+///
+/// The model parameter means a reference cannot be accidentally used with a different model's
+/// resolvers. Two references compare equal when they name the same GraphQL type.
+pub struct ObjectRef<M: ObjectModel> {
+    name: Name,
+    marker: PhantomData<fn() -> M>,
 }
 
-impl InterfaceRef {
-    /// The interface's GraphQL name.
+impl<M: ObjectModel> ObjectRef<M> {
+    fn new(name: Name) -> Self {
+        Self {
+            name,
+            marker: PhantomData,
+        }
+    }
+
+    /// The object's GraphQL name.
     #[must_use]
-    pub fn name(&self) -> &'static str {
-        self.name
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// A reference to this object with no list or nullability wrappers.
+    #[must_use]
+    pub fn type_ref(&self) -> TypeRef {
+        TypeRef::named(Arc::clone(&self.name))
+    }
+
+    /// Whether this object is a possible type of `abstract_type` in `schema`.
+    #[must_use]
+    pub fn is_possible_type(&self, schema: &gql::Schema, abstract_type: &str) -> bool {
+        schema.is_possible_type(abstract_type, self.name())
+    }
+
+    /// The model's compile-time GraphQL name.
+    ///
+    /// The object may be registered under a different runtime name; this is the name
+    /// `#[derive(Object)]` generated.
+    #[must_use]
+    pub fn model_name(&self) -> &'static str {
+        M::NAME
     }
 }
 
-/// A union definition created by [`Schema::union`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+impl<M: ObjectModel> Clone for ObjectRef<M> {
+    fn clone(&self) -> Self {
+        Self::new(Arc::clone(&self.name))
+    }
+}
+
+impl<M: ObjectModel> std::fmt::Debug for ObjectRef<M> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ObjectRef").field(&self.name).finish()
+    }
+}
+
+impl<M: ObjectModel> PartialEq for ObjectRef<M> {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
+impl<M: ObjectModel> Eq for ObjectRef<M> {}
+
+impl<M: ObjectModel> std::hash::Hash for ObjectRef<M> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+    }
+}
+
+impl<M: ObjectModel> From<&ObjectRef<M>> for TypeRef {
+    fn from(reference: &ObjectRef<M>) -> Self {
+        reference.type_ref()
+    }
+}
+
+/// An interface definition created by [`Schema::interface_ref`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct InterfaceRef {
+    name: Name,
+}
+
+impl InterfaceRef {
+    fn new(name: Name) -> Self {
+        Self { name }
+    }
+
+    /// The interface's GraphQL name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// A reference to this interface with no list or nullability wrappers.
+    #[must_use]
+    pub fn type_ref(&self) -> TypeRef {
+        TypeRef::named(Arc::clone(&self.name))
+    }
+
+    /// Whether `object_type` is a possible type of this interface in `schema`.
+    #[must_use]
+    pub fn is_possible_type(&self, schema: &gql::Schema, object_type: &str) -> bool {
+        schema.is_possible_type(self.name(), object_type)
+    }
+
+    /// Every object type that can appear where this interface is expected.
+    #[must_use]
+    pub fn possible_types(&self, schema: &gql::Schema) -> Vec<Name> {
+        schema.possible_types(self.name())
+    }
+}
+
+impl From<&InterfaceRef> for InterfaceRef {
+    fn from(reference: &InterfaceRef) -> Self {
+        reference.clone()
+    }
+}
+
+/// A union definition created by [`Schema::union_ref`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct UnionRef {
-    name: &'static str,
+    name: Name,
 }
 
 impl UnionRef {
+    fn new(name: Name) -> Self {
+        Self { name }
+    }
+
     /// The union's GraphQL name.
     #[must_use]
-    pub fn name(&self) -> &'static str {
-        self.name
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// A reference to this union with no list or nullability wrappers.
+    #[must_use]
+    pub fn type_ref(&self) -> TypeRef {
+        TypeRef::named(Arc::clone(&self.name))
+    }
+
+    /// Whether `object_type` is a possible type of this union in `schema`.
+    #[must_use]
+    pub fn is_possible_type(&self, schema: &gql::Schema, object_type: &str) -> bool {
+        schema.is_possible_type(self.name(), object_type)
+    }
+
+    /// Every object type that can appear where this union is expected.
+    #[must_use]
+    pub fn possible_types(&self, schema: &gql::Schema) -> Vec<Name> {
+        schema.possible_types(self.name())
+    }
+}
+
+impl From<&UnionRef> for UnionRef {
+    fn from(reference: &UnionRef) -> Self {
+        reference.clone()
     }
 }
 
@@ -143,7 +281,7 @@ impl BuildOptions {
 /// A field that inherits its type and arguments from an implemented interface's field.
 #[derive(Clone, Debug)]
 pub(crate) struct PendingInherited {
-    object: &'static str,
+    object: Name,
     field: Name,
     expected_args: Vec<(Name, TypeRef)>,
 }
@@ -180,15 +318,17 @@ pub(crate) struct PendingInherited {
 /// ```
 pub struct Schema<Ctx: 'static = ()> {
     registry: TypeRegistry,
-    objects: IndexMap<&'static str, gql::ObjectType>,
+    objects: IndexMap<Name, gql::ObjectType>,
     /// The Rust model that owns each object name, so two models cannot silently merge.
-    object_owners: IndexMap<&'static str, TypeId>,
+    object_owners: IndexMap<Name, TypeId>,
+    /// Names for which an ownership collision has already been reported.
+    object_conflicts: HashSet<Name>,
     /// Fields declared with `raw_field`/`raw_field_with`, per object. A raw object must not also
     /// carry resolver-backed fields, because those would receive the raw map instead of the
     /// model.
-    raw_fields: IndexMap<&'static str, HashSet<Name>>,
-    interfaces: IndexMap<&'static str, gql::InterfaceType>,
-    unions: IndexMap<&'static str, gql::UnionType>,
+    raw_fields: IndexMap<Name, HashSet<Name>>,
+    interfaces: IndexMap<Name, gql::InterfaceType>,
+    unions: IndexMap<Name, gql::UnionType>,
     query: Vec<gql::Field>,
     mutation: Vec<gql::Field>,
     subscription: Vec<gql::Field>,
@@ -215,6 +355,7 @@ impl<Ctx: 'static> Clone for Schema<Ctx> {
             registry: self.registry.clone(),
             objects: self.objects.clone(),
             object_owners: self.object_owners.clone(),
+            object_conflicts: self.object_conflicts.clone(),
             raw_fields: self.raw_fields.clone(),
             interfaces: self.interfaces.clone(),
             unions: self.unions.clone(),
@@ -268,6 +409,7 @@ impl<Ctx: 'static> Schema<Ctx> {
             registry: TypeRegistry::new(),
             objects: IndexMap::new(),
             object_owners: IndexMap::new(),
+            object_conflicts: HashSet::new(),
             raw_fields: IndexMap::new(),
             interfaces: IndexMap::new(),
             unions: IndexMap::new(),
@@ -314,7 +456,7 @@ impl<Ctx: 'static> Schema<Ctx> {
         self
     }
 
-    /// Register an object type.
+    /// Register an object type under its derived name.
     ///
     /// The GraphQL name and description come from `M`'s [`ObjectModel`] implementation, which
     /// `#[derive(Object)]` generates. Fields are declared in the closure; a field may return
@@ -324,27 +466,69 @@ impl<Ctx: 'static> Schema<Ctx> {
     /// Calling this again for the same model reopens the object and adds fields to it. This is
     /// how a type's definition can live in several modules. A field name declared twice is
     /// still a build error.
+    ///
+    /// The returned [`ObjectRef`] can be used as an output type with
+    /// [`ObjectBuilder::field_ref`] and passed back to [`Schema::implement`].
     pub fn object<M: ObjectModel>(
         &mut self,
         build: impl FnOnce(&mut ObjectBuilder<'_, Ctx, M>),
-    ) -> &mut Self {
-        match self.object_owners.get(M::NAME) {
-            Some(owner) if *owner != TypeId::of::<M>() => {
-                self.errors.push(GraphQLError::new(format!(
-                    "Object type `{}` is registered by more than one Rust type. Give one of \
-                     them a distinct `#[graphql(name = \"...\")]`.",
-                    M::NAME
-                )));
-                return self;
-            }
-            Some(_) => {}
-            None => {
-                self.object_owners.insert(M::NAME, TypeId::of::<M>());
-            }
+    ) -> ObjectRef<M> {
+        let reference = self.object_ref(M::NAME);
+        self.implement(&reference, build);
+        reference
+    }
+
+    /// Create (or reopen) an object type whose GraphQL name is computed at runtime.
+    ///
+    /// The model still supplies `is_type_of`, descriptions and the type a resolver receives, but
+    /// the GraphQL name is `name`. Use it for names that only exist after some application
+    /// decision, such as Relay's `UserPostsConnection` or `CreateUserPayload`:
+    ///
+    /// ```
+    /// # use gurafi::{NoArgs, Object, Schema};
+    /// # struct Ctx;
+    /// # #[derive(Object)] struct User { name: String }
+    /// let mut schema = Schema::<Ctx>::new();
+    /// let admin = schema.object_ref::<User>("AdminUser");
+    /// schema.implement(&admin, |o| {
+    ///     o.expose(gurafi::expose!(User::name));
+    /// });
+    /// schema.query(|q| {
+    ///     q.field_ref(&admin, "admin", |_: NoArgs, _: &Ctx| User {
+    ///         name: "ada".into(),
+    ///     });
+    /// });
+    /// # schema.build().expect("valid schema");
+    /// ```
+    ///
+    /// The name is owned by the schema. Calling this twice with the same name and model merges
+    /// the definitions. A different model claiming the same name is a build error.
+    pub fn object_ref<M: ObjectModel>(&mut self, name: impl Into<Name>) -> ObjectRef<M> {
+        let name = name.into();
+        if self.claim_object_name::<M>(&name) {
+            self.ensure_object::<M>(&name);
         }
-        let existing = self.objects.shift_remove(M::NAME);
-        let existing_auth_error = self.object_auth_error.get(M::NAME).cloned();
-        let raw_fields = self.raw_fields.entry(M::NAME).or_default();
+        ObjectRef::new(name)
+    }
+
+    /// Add fields to an object created by [`Schema::object_ref`] (or reopen a derived object).
+    ///
+    /// The reference carries both the runtime name and the model, so this is the typed
+    /// counterpart of [`Schema::object`]. Reopening merges fields and declarations; it never
+    /// replaces an existing definition.
+    pub fn implement<M: ObjectModel>(
+        &mut self,
+        reference: &ObjectRef<M>,
+        build: impl FnOnce(&mut ObjectBuilder<'_, Ctx, M>),
+    ) -> &mut Self {
+        let name = Arc::clone(&reference.name);
+        if !self.claim_object_name::<M>(&name) {
+            return self;
+        }
+        self.ensure_object::<M>(&name);
+        let existing = self.objects.shift_remove(&name);
+        let existing_auth_error = self.object_auth_error.get(&*name).cloned();
+        let raw_fields = self.raw_fields.entry(Arc::clone(&name)).or_default();
         let mut builder = ObjectBuilder::<Ctx, M>::new(
             existing,
             existing_auth_error,
@@ -352,21 +536,21 @@ impl<Ctx: 'static> Schema<Ctx> {
             &mut self.checks,
             &mut self.pending_inherited,
             raw_fields,
-            M::NAME,
+            name.clone(),
         );
         build(&mut builder);
         let (object, auth, auth_error) = builder.finish();
         if let Some(message) = auth_error {
             self.object_auth_error
-                .insert(M::NAME.to_owned(), Arc::clone(&message));
+                .insert(name.to_string(), Arc::clone(&message));
         }
         if auth.is_empty() {
             // An `auth_error` without a predicate refines the rule already installed by an
             // earlier declaration; it must not make the object less guarded.
-            if let Some(message) = self.object_auth_error.get(M::NAME).cloned() {
+            if let Some(message) = self.object_auth_error.get(&*name).cloned() {
                 if let Some(previous) = self
                     .object_auth
-                    .get_mut(M::NAME)
+                    .get_mut(&*name)
                     .and_then(|guards| guards.last_mut())
                 {
                     *previous = previous.with_message(Some(message));
@@ -374,12 +558,47 @@ impl<Ctx: 'static> Schema<Ctx> {
             }
         } else {
             self.object_auth
-                .entry(M::NAME.to_owned())
+                .entry(name.to_string())
                 .or_default()
                 .extend(auth);
         }
-        self.objects.insert(M::NAME, object);
+        self.objects.insert(name, object);
         self
+    }
+
+    /// Claim an object name for `M`, reporting a collision once.
+    fn claim_object_name<M: ObjectModel>(&mut self, name: &Name) -> bool {
+        match self.object_owners.get(name) {
+            Some(owner) if *owner != TypeId::of::<M>() => {
+                if self.object_conflicts.insert(Arc::clone(name)) {
+                    self.errors.push(GraphQLError::new(format!(
+                        "Object type `{name}` is registered by more than one Rust type. Give one \
+                         of them a distinct GraphQL name, or register this model under its own \
+                         dynamic name."
+                    )));
+                }
+                false
+            }
+            Some(_) => true,
+            None => {
+                self.object_owners
+                    .insert(Arc::clone(name), TypeId::of::<M>());
+                true
+            }
+        }
+    }
+
+    /// Create an empty object definition if the name is not present yet.
+    fn ensure_object<M: ObjectModel>(&mut self, name: &Name) {
+        if self.objects.contains_key(name) {
+            return;
+        }
+        let mut object = gql::ObjectType::new(Arc::clone(name));
+        if let Some(description) = M::description() {
+            object = object.description(description);
+        }
+        object = object.is_type_of(|value| value.as_external::<M>().is_some());
+        self.objects.insert(Arc::clone(name), object);
     }
 
     /// Reopen an object type and add more fields to it.
@@ -389,7 +608,7 @@ impl<Ctx: 'static> Schema<Ctx> {
     pub fn object_fields<M: ObjectModel>(
         &mut self,
         build: impl FnOnce(&mut ObjectBuilder<'_, Ctx, M>),
-    ) -> &mut Self {
+    ) -> ObjectRef<M> {
         self.object::<M>(build)
     }
 
@@ -408,36 +627,27 @@ impl<Ctx: 'static> Schema<Ctx> {
         A: InputObject,
         F: Fn(&M, A, &Ctx) -> T + Send + Sync + 'static,
     {
-        match self.object_owners.get(M::NAME) {
-            Some(owner) if *owner != TypeId::of::<M>() => {
-                self.errors.push(GraphQLError::new(format!(
-                    "Object type `{}` is registered by more than one Rust type. Give one of \
-                     them a distinct `#[graphql(name = \"...\")]`.",
-                    M::NAME
-                )));
-            }
-            Some(_) => {}
-            None => {
-                self.object_owners.insert(M::NAME, TypeId::of::<M>());
-                self.objects.insert(M::NAME, new_object::<M>());
-            }
+        let object_name: Name = Arc::from(M::NAME);
+        if self.claim_object_name::<M>(&object_name) {
+            self.ensure_object::<M>(&object_name);
         }
-        if !self.objects.contains_key(M::NAME) {
-            self.objects.insert(M::NAME, new_object::<M>());
+        if !self.objects.contains_key(&object_name) {
+            self.objects
+                .insert(Arc::clone(&object_name), new_object::<M>());
         }
         let (field, validation) =
             object_field::<M, Ctx, T, A, F>(name, resolver, &mut self.registry);
         let field_name = field.name.clone();
         let object = self
             .objects
-            .get_mut(M::NAME)
+            .get_mut(&object_name)
             .expect("the object was just inserted");
         object.insert_field(field);
         FieldConfig::for_object_checked(
             &mut self.registry,
             &mut object.fields,
             &mut self.checks,
-            M::NAME,
+            object_name.to_string(),
             field_name,
             T::is_optional(),
             std::any::type_name::<T>(),
@@ -448,40 +658,73 @@ impl<Ctx: 'static> Schema<Ctx> {
 
     /// Register an interface type.
     ///
-    /// Returns a [`InterfaceRef`] that object builders use with
+    /// Returns an [`InterfaceRef`] that object builders use with
     /// [`ObjectBuilder::implements`]. Interface fields have no resolvers: execution uses the
     /// concrete object's field resolvers.
     ///
     /// Calling this again for the same name reopens the interface and adds fields.
     pub fn interface(
         &mut self,
-        name: &'static str,
+        name: impl Into<Name>,
         build: impl FnOnce(&mut InterfaceBuilder<'_, Ctx>),
     ) -> InterfaceRef {
-        let existing = self.interfaces.shift_remove(name);
-        let existing_auth_error = self.interface_auth_error.get(name).cloned();
+        let reference = self.interface_ref(name);
+        self.implement_interface(&reference, build);
+        reference
+    }
+
+    /// Create (or reopen) an interface whose GraphQL name may be computed at runtime.
+    ///
+    /// Use [`Schema::implement_interface`] to add fields. Calling this twice with the same name
+    /// reopens the same interface.
+    pub fn interface_ref(&mut self, name: impl Into<Name>) -> InterfaceRef {
+        let name = name.into();
+        if !self.interfaces.contains_key(&name) {
+            self.interfaces.insert(
+                Arc::clone(&name),
+                gql::InterfaceType::new(Arc::clone(&name)),
+            );
+        }
+        InterfaceRef::new(name)
+    }
+
+    /// Add fields to an interface created by [`Schema::interface_ref`].
+    pub fn implement_interface(
+        &mut self,
+        reference: &InterfaceRef,
+        build: impl FnOnce(&mut InterfaceBuilder<'_, Ctx>),
+    ) -> &mut Self {
+        let name = Arc::clone(&reference.name);
+        if !self.interfaces.contains_key(&name) {
+            self.interfaces.insert(
+                Arc::clone(&name),
+                gql::InterfaceType::new(Arc::clone(&name)),
+            );
+        }
+        let existing = self.interfaces.shift_remove(&name);
+        let existing_auth_error = self.interface_auth_error.get(&*name).cloned();
         let field_auth = self
             .interface_field_auth
-            .shift_remove(name)
+            .shift_remove(&*name)
             .unwrap_or_default();
         let mut builder = InterfaceBuilder::<Ctx>::new(
             existing,
             field_auth,
             existing_auth_error,
             &mut self.registry,
-            name,
+            name.clone(),
         );
         build(&mut builder);
         let (interface, auth, auth_error, field_auth) = builder.finish();
         if let Some(message) = auth_error {
             self.interface_auth_error
-                .insert(name.to_owned(), Arc::clone(&message));
+                .insert(name.to_string(), Arc::clone(&message));
         }
         if auth.is_empty() {
-            if let Some(message) = self.interface_auth_error.get(name).cloned() {
+            if let Some(message) = self.interface_auth_error.get(&*name).cloned() {
                 if let Some(previous) = self
                     .interface_auth
-                    .get_mut(name)
+                    .get_mut(&*name)
                     .and_then(|guards| guards.last_mut())
                 {
                     *previous = previous.with_message(Some(message));
@@ -489,14 +732,14 @@ impl<Ctx: 'static> Schema<Ctx> {
             }
         } else {
             self.interface_auth
-                .entry(name.to_owned())
+                .entry(name.to_string())
                 .or_default()
                 .extend(auth);
         }
         self.interface_field_auth
-            .insert(name.to_owned(), field_auth);
+            .insert(name.to_string(), field_auth);
         self.interfaces.insert(name, interface);
-        InterfaceRef { name }
+        self
     }
 
     /// Reopen an interface and add more fields to it.
@@ -504,7 +747,7 @@ impl<Ctx: 'static> Schema<Ctx> {
     /// This is an alias for [`Schema::interface`].
     pub fn interface_fields(
         &mut self,
-        name: &'static str,
+        name: impl Into<Name>,
         build: impl FnOnce(&mut InterfaceBuilder<'_, Ctx>),
     ) -> InterfaceRef {
         self.interface(name, build)
@@ -520,15 +763,43 @@ impl<Ctx: 'static> Schema<Ctx> {
     /// Calling this again for the same name appends members.
     pub fn union(
         &mut self,
-        name: &'static str,
+        name: impl Into<Name>,
         build: impl FnOnce(&mut UnionBuilder<Ctx>),
     ) -> UnionRef {
-        let existing = self.unions.shift_remove(name);
-        let mut builder = UnionBuilder::<Ctx>::new(existing, name, &mut self.registry);
+        let reference = self.union_ref(name);
+        self.implement_union(&reference, build);
+        reference
+    }
+
+    /// Create (or reopen) a union whose GraphQL name may be computed at runtime.
+    ///
+    /// Use [`Schema::implement_union`] to declare members.
+    pub fn union_ref(&mut self, name: impl Into<Name>) -> UnionRef {
+        let name = name.into();
+        if !self.unions.contains_key(&name) {
+            self.unions
+                .insert(Arc::clone(&name), gql::UnionType::new(Arc::clone(&name)));
+        }
+        UnionRef::new(name)
+    }
+
+    /// Add members to a union created by [`Schema::union_ref`].
+    pub fn implement_union(
+        &mut self,
+        reference: &UnionRef,
+        build: impl FnOnce(&mut UnionBuilder<Ctx>),
+    ) -> &mut Self {
+        let name = Arc::clone(&reference.name);
+        if !self.unions.contains_key(&name) {
+            self.unions
+                .insert(Arc::clone(&name), gql::UnionType::new(Arc::clone(&name)));
+        }
+        let existing = self.unions.shift_remove(&name);
+        let mut builder = UnionBuilder::<Ctx>::new(existing, name.clone(), &mut self.registry);
         build(&mut builder);
         let union = builder.finish();
         self.unions.insert(name, union);
-        UnionRef { name }
+        self
     }
 
     /// Register a custom scalar explicitly.
@@ -631,7 +902,8 @@ impl<Ctx: 'static> Schema<Ctx> {
             if !self.objects.contains_key(name) {
                 errors.push(GraphQLError::new(format!(
                     "Object type `{name}` is used by a field but was never registered. Call \
-                     `schema.object::<{name}>(...)` before calling `build()`."
+                     `schema.object::<...>(...)` or \
+                     `schema.object_ref::<...>(\"{name}\")` before calling `build()`."
                 )));
             }
         }
@@ -656,15 +928,14 @@ impl<Ctx: 'static> Schema<Ctx> {
 
         let mut registry_types: Vec<(String, gql::Type)> =
             self.registry.into_types().into_iter().collect();
-        let mut objects: Vec<(&'static str, gql::ObjectType)> = self.objects.into_iter().collect();
-        let mut interfaces: Vec<(&'static str, gql::InterfaceType)> =
-            self.interfaces.into_iter().collect();
-        let mut unions: Vec<(&'static str, gql::UnionType)> = self.unions.into_iter().collect();
+        let mut objects: Vec<(Name, gql::ObjectType)> = self.objects.into_iter().collect();
+        let mut interfaces: Vec<(Name, gql::InterfaceType)> = self.interfaces.into_iter().collect();
+        let mut unions: Vec<(Name, gql::UnionType)> = self.unions.into_iter().collect();
         if options.sort_types {
             registry_types.sort_by(|left, right| left.0.cmp(&right.0));
-            objects.sort_by_key(|(name, _)| *name);
-            interfaces.sort_by_key(|(name, _)| *name);
-            unions.sort_by_key(|(name, _)| *name);
+            objects.sort_by(|left, right| left.0.cmp(&right.0));
+            interfaces.sort_by(|left, right| left.0.cmp(&right.0));
+            unions.sort_by(|left, right| left.0.cmp(&right.0));
         }
         for (_, ty) in registry_types {
             builder.add_type(ty);
@@ -757,11 +1028,11 @@ impl<Ctx: 'static> Schema<Ctx> {
         for (name, interface) in &mut self.interfaces {
             let reachable = reachable_interfaces(&interface.interfaces, &parents);
             for parent in reachable {
-                if parent != *name
+                if parent.as_str() != name.as_ref()
                     && !interface
                         .interfaces
                         .iter()
-                        .any(|existing| existing.as_ref() == parent)
+                        .any(|existing| existing.as_ref() == parent.as_str())
                 {
                     interface.interfaces.push(Arc::from(parent));
                 }
@@ -774,7 +1045,7 @@ impl<Ctx: 'static> Schema<Ctx> {
                 if !object
                     .interfaces
                     .iter()
-                    .any(|existing| existing.as_ref() == name)
+                    .any(|existing| existing.as_ref() == name.as_str())
                 {
                     object.interfaces.push(Arc::from(name));
                 }
@@ -815,7 +1086,7 @@ impl<Ctx: 'static> Schema<Ctx> {
     fn resolve_inherited(&mut self, errors: &mut Vec<GraphQLError>) {
         let parents = interface_parents(&self.interfaces);
         for pending in std::mem::take(&mut self.pending_inherited) {
-            let Some(object) = self.objects.get(pending.object) else {
+            let Some(object) = self.objects.get(pending.object.as_ref()) else {
                 errors.push(GraphQLError::new(format!(
                     "Object `{}` was not registered, but field `{}` inherits from an interface.",
                     pending.object, pending.field
@@ -861,14 +1132,14 @@ impl<Ctx: 'static> Schema<Ctx> {
 
             let object = self
                 .objects
-                .get_mut(pending.object)
+                .get_mut(pending.object.as_ref())
                 .expect("the object was checked above");
             let Some(field) = object.fields.get_mut(&pending.field) else {
                 continue;
             };
             let actual = field.ty.clone();
             self.checks.push(FieldCheck::InheritedType {
-                owner: pending.object.to_owned(),
+                owner: pending.object.to_string(),
                 field: pending.field.clone(),
                 actual,
                 expected: interface_ty.clone(),
@@ -898,7 +1169,7 @@ impl<Ctx: 'static> Schema<Ctx> {
         let parents = interface_parents(&self.interfaces);
         for (object_name, object) in &mut self.objects {
             let reachable = reachable_interfaces(&object.interfaces, &parents);
-            let object_guards = self.object_auth.get(*object_name).cloned();
+            let object_guards = self.object_auth.get(object_name.as_ref()).cloned();
             for field in object.fields.values_mut() {
                 if let Some(guards) = &object_guards {
                     for guard in guards {
@@ -926,13 +1197,13 @@ impl<Ctx: 'static> Schema<Ctx> {
 
 /// The direct super-interfaces of every registered interface, keyed by name.
 fn interface_parents(
-    interfaces: &IndexMap<&'static str, gql::InterfaceType>,
+    interfaces: &IndexMap<Name, gql::InterfaceType>,
 ) -> HashMap<String, Vec<String>> {
     interfaces
         .iter()
         .map(|(name, interface)| {
             (
-                (*name).to_owned(),
+                name.to_string(),
                 interface
                     .interfaces
                     .iter()
@@ -987,7 +1258,7 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
         checks: &'a mut Vec<FieldCheck>,
         pending_inherited: &'a mut Vec<PendingInherited>,
         raw_fields: &'a mut HashSet<Name>,
-        name: &'static str,
+        name: Name,
     ) -> Self {
         let object = existing.unwrap_or_else(|| {
             let mut object = gql::ObjectType::new(name);
@@ -1019,7 +1290,10 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
     }
 
     /// Declare that this object implements an interface.
-    pub fn implements(&mut self, interface: InterfaceRef) -> &mut Self {
+    ///
+    /// Both `node` and `&node` are accepted, so a reference can be reused without cloning.
+    pub fn implements(&mut self, interface: impl Into<InterfaceRef>) -> &mut Self {
+        let interface = interface.into();
         let name: Name = Arc::from(interface.name());
         if !self
             .object
@@ -1237,6 +1511,99 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
         })
     }
 
+    /// Add a synchronous field whose output type is a runtime-named object.
+    ///
+    /// `reference` supplies the GraphQL name; `T` supplies the list and nullability wrappers,
+    /// just as [`FieldConfig::as_object_ref`] does. The resolver returns the object's model (or a
+    /// [`crate::Raw`] of it), so `T`'s named type should be the model the reference was created
+    /// for.
+    ///
+    /// ```
+    /// # use gurafi::{NoArgs, Object, Schema};
+    /// # struct Ctx;
+    /// #[derive(Object)]
+    /// struct User { name: String }
+    ///
+    /// let mut schema = Schema::<Ctx>::new();
+    /// let admin = schema.object_ref::<User>("AdminUser");
+    /// schema.implement(&admin, |o| {
+    ///     o.expose(gurafi::expose!(User::name));
+    /// });
+    /// schema.object::<User>(|o| {
+    ///     o.field_ref(&admin, "bestFriend", |_: &User, _: NoArgs, _: &Ctx| User {
+    ///         name: "ada".into(),
+    ///     });
+    ///     o.field_ref::<Vec<User>, NoArgs, _, _>(
+    ///         &admin,
+    ///         "friends",
+    ///         |_: &User, _: NoArgs, _: &Ctx| vec![User { name: "ada".into() }],
+    ///     )
+    ///     .nullable_items();
+    /// });
+    /// # let _ = schema;
+    /// ```
+    pub fn field_ref<T, A, F, N>(
+        &mut self,
+        reference: &ObjectRef<N>,
+        name: &'static str,
+        resolver: F,
+    ) -> FieldConfig<'_, Ctx>
+    where
+        N: ObjectModel,
+        T: OutputType + IntoValue + Send + 'static,
+        A: InputObject,
+        F: Fn(&M, A, &Ctx) -> T + Send + Sync + 'static,
+    {
+        let (field, validation) = object_field_with_info::<M, Ctx, T, A, _>(
+            name,
+            move |model: &M, args: A, ctx: &Ctx, _| resolver(model, args, ctx),
+            self.registry,
+            false,
+        );
+        let mut config = self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
+        );
+        config.as_object_ref(reference);
+        config
+    }
+
+    /// Add a synchronous field with an explicitly built runtime type reference.
+    ///
+    /// Use this for runtime-named interfaces and unions, or for arbitrary wrapper combinations
+    /// (`TypeRef::named(name).list().non_null()`). `T` still supplies the Rust type used to
+    /// check that the declared wrappers are truthful.
+    pub fn field_ref_type<T, A, F>(
+        &mut self,
+        ty: TypeRef,
+        name: &'static str,
+        resolver: F,
+    ) -> FieldConfig<'_, Ctx>
+    where
+        T: OutputType + IntoValue + Send + 'static,
+        A: InputObject,
+        F: Fn(&M, A, &Ctx) -> T + Send + Sync + 'static,
+    {
+        let (field, validation) = object_field_with_info::<M, Ctx, T, A, _>(
+            name,
+            move |model: &M, args: A, ctx: &Ctx, _| resolver(model, args, ctx),
+            self.registry,
+            false,
+        );
+        let mut config = self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
+        );
+        config.as_dynamic(ty);
+        config
+    }
+
     /// Add a synchronous field whose resolver also receives the [`gql::ResolveInfo`].
     ///
     /// `gql::ResolveInfo` currently exposes the field name, parent type, return type, response
@@ -1253,7 +1620,7 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
         F: for<'r> Fn(&'r M, A, &'r Ctx, &'r gql::ResolveInfo<'r>) -> T + Send + Sync + 'static,
     {
         let (field, validation) =
-            object_field_with_info::<M, Ctx, T, A, F>(name, resolver, self.registry);
+            object_field_with_info::<M, Ctx, T, A, F>(name, resolver, self.registry, true);
         self.push(
             field,
             T::is_optional(),
@@ -1472,7 +1839,7 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
     ///     i.field::<ID>("id");
     /// });
     /// schema.object::<Giraffe>(|o| {
-    ///     o.implements(node);
+    ///     o.implements(&node);
     ///     o.resolve_inherited("id", |g: &Giraffe, _: NoArgs, _: &Ctx| ID::new(g.name.clone()));
     /// });
     /// ```
@@ -1494,14 +1861,14 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
             Err(error) => {
                 self.registry.push_error(GraphQLError::new(format!(
                     "Arguments for inherited field `{}.{name}` could not be built: {}",
-                    M::NAME,
+                    self.object.name,
                     error.message()
                 )));
                 Vec::new()
             }
         };
         self.pending_inherited.push(PendingInherited {
-            object: M::NAME,
+            object: Arc::clone(&self.object.name),
             field: Arc::from(name),
             expected_args,
         });
@@ -1517,12 +1884,13 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
         validation: ValidationSlot<Ctx>,
     ) -> FieldConfig<'_, Ctx> {
         let name = field.name.clone();
+        let owner = self.object.name.to_string();
         self.object.insert_field(field);
         FieldConfig::for_object_checked(
             self.registry,
             &mut self.object.fields,
             self.checks,
-            M::NAME,
+            owner,
             name,
             rust_nullable,
             rust_type_name,
@@ -1556,7 +1924,7 @@ impl<'a, Ctx: 'static> InterfaceBuilder<'a, Ctx> {
         field_auth: IndexMap<Name, Arc<AuthGuard<Ctx>>>,
         existing_auth_error: Option<Arc<str>>,
         registry: &'a mut TypeRegistry,
-        name: &'static str,
+        name: Name,
     ) -> Self {
         Self {
             registry,
@@ -1586,7 +1954,10 @@ impl<'a, Ctx: 'static> InterfaceBuilder<'a, Ctx> {
     }
 
     /// Declare that this interface implements another interface.
-    pub fn implements(&mut self, interface: InterfaceRef) -> &mut Self {
+    ///
+    /// Both `node` and `&node` are accepted.
+    pub fn implements(&mut self, interface: impl Into<InterfaceRef>) -> &mut Self {
+        let interface = interface.into();
         let name: Name = Arc::from(interface.name());
         if !self
             .interface
@@ -1650,6 +2021,53 @@ impl<'a, Ctx: 'static> InterfaceBuilder<'a, Ctx> {
         ))
     }
 
+    /// Add a field whose output type is a runtime-named object.
+    ///
+    /// `T` supplies the list and nullability wrappers; `reference` supplies the name. Use it for
+    /// interface fields that return a dynamically named type such as a connection.
+    pub fn field_ref<T, N>(
+        &mut self,
+        reference: &ObjectRef<N>,
+        name: &'static str,
+    ) -> InterfaceFieldConfig<'_, Ctx>
+    where
+        T: OutputType,
+        N: ObjectModel,
+    {
+        self.interface
+            .insert_field(gql::Field::new(name, T::output_type()));
+        let mut config = FieldConfig::for_interface(
+            self.registry,
+            &mut self.interface.fields,
+            &mut self.field_auth,
+            Arc::from(name),
+            T::is_optional(),
+            std::any::type_name::<T>(),
+        );
+        config.as_object_ref(reference);
+        InterfaceFieldConfig::new(config)
+    }
+
+    /// Add a field with an explicitly built runtime type reference.
+    pub fn field_ref_type<T: OutputType>(
+        &mut self,
+        ty: TypeRef,
+        name: &'static str,
+    ) -> InterfaceFieldConfig<'_, Ctx> {
+        self.interface
+            .insert_field(gql::Field::new(name, T::output_type()));
+        let mut config = FieldConfig::for_interface(
+            self.registry,
+            &mut self.interface.fields,
+            &mut self.field_auth,
+            Arc::from(name),
+            T::is_optional(),
+            std::any::type_name::<T>(),
+        );
+        config.as_dynamic(ty);
+        InterfaceFieldConfig::new(config)
+    }
+
     /// Add a field with arguments.
     pub fn field_with<T, A>(&mut self, name: &'static str) -> InterfaceFieldConfig<'_, Ctx>
     where
@@ -1701,11 +2119,7 @@ pub struct UnionBuilder<'a, Ctx: 'static> {
 }
 
 impl<'a, Ctx: 'static> UnionBuilder<'a, Ctx> {
-    fn new(
-        existing: Option<gql::UnionType>,
-        name: &'static str,
-        registry: &'a mut TypeRegistry,
-    ) -> Self {
+    fn new(existing: Option<gql::UnionType>, name: Name, registry: &'a mut TypeRegistry) -> Self {
         Self {
             union: existing.unwrap_or_else(|| gql::UnionType::new(name)),
             registry,
@@ -1731,6 +2145,37 @@ impl<'a, Ctx: 'static> UnionBuilder<'a, Ctx> {
         self.registry.reference_object(M::NAME);
         let name: Name = Arc::from(M::NAME);
         if !self.union.types.iter().any(|existing| **existing == *name) {
+            self.union.types.push(name);
+        }
+        self
+    }
+
+    /// Add an object created with a runtime name as a union member.
+    ///
+    /// This is [`UnionBuilder::member`] for a [`Schema::object_ref`] definition: the reference's
+    /// dynamic name becomes the member name, and the model still supplies `is_type_of`.
+    pub fn member_ref<M: ObjectModel>(&mut self, reference: &ObjectRef<M>) -> &mut Self {
+        self.registry.reference_object(reference.name());
+        let name: Name = Arc::from(reference.name());
+        if !self.union.types.iter().any(|existing| **existing == *name) {
+            self.union.types.push(name);
+        }
+        self
+    }
+
+    /// Add an object type by GraphQL name, without a Rust model.
+    ///
+    /// The name must match an object registered with [`Schema::object_ref`]; this is the
+    /// escape hatch for members whose model is not in scope.
+    pub fn member_name(&mut self, name: impl Into<Name>) -> &mut Self {
+        let name = name.into();
+        self.registry.reference_object(Arc::clone(&name));
+        if !self
+            .union
+            .types
+            .iter()
+            .any(|existing| existing.as_ref() == name.as_ref())
+        {
             self.union.types.push(name);
         }
         self
@@ -1794,6 +2239,67 @@ impl<'a, Ctx: 'static> RootBuilder<'a, Ctx> {
         self.field_with_info::<T, A, _>(name, move |args: A, ctx: &Ctx, _| resolver(args, ctx))
     }
 
+    /// Add a synchronous root field whose output type is a runtime-named object.
+    ///
+    /// `reference` supplies the GraphQL name; `T` supplies the list and nullability wrappers.
+    pub fn field_ref<T, A, F, N>(
+        &mut self,
+        reference: &ObjectRef<N>,
+        name: &'static str,
+        resolver: F,
+    ) -> FieldConfig<'_, Ctx>
+    where
+        N: ObjectModel,
+        T: OutputType + IntoValue + Send + 'static,
+        A: InputObject,
+        F: Fn(A, &Ctx) -> T + Send + Sync + 'static,
+    {
+        let (field, validation) = root_field_with_info::<Ctx, T, A, _>(
+            name,
+            move |args: A, ctx: &Ctx, _| resolver(args, ctx),
+            self.registry,
+            false,
+        );
+        let mut config = self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
+        );
+        config.as_object_ref(reference);
+        config
+    }
+
+    /// Add a synchronous root field with an explicitly built runtime type reference.
+    pub fn field_ref_type<T, A, F>(
+        &mut self,
+        ty: TypeRef,
+        name: &'static str,
+        resolver: F,
+    ) -> FieldConfig<'_, Ctx>
+    where
+        T: OutputType + IntoValue + Send + 'static,
+        A: InputObject,
+        F: Fn(A, &Ctx) -> T + Send + Sync + 'static,
+    {
+        let (field, validation) = root_field_with_info::<Ctx, T, A, _>(
+            name,
+            move |args: A, ctx: &Ctx, _| resolver(args, ctx),
+            self.registry,
+            false,
+        );
+        let mut config = self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
+        );
+        config.as_dynamic(ty);
+        config
+    }
+
     /// Add a synchronous root field whose resolver also receives the [`gql::ResolveInfo`].
     pub fn field_with_info<T, A, F>(
         &mut self,
@@ -1806,7 +2312,7 @@ impl<'a, Ctx: 'static> RootBuilder<'a, Ctx> {
         F: for<'r> Fn(A, &'r Ctx, &'r gql::ResolveInfo<'r>) -> T + Send + Sync + 'static,
     {
         let (field, validation) =
-            root_field_with_info::<Ctx, T, A, F>(name, resolver, self.registry);
+            root_field_with_info::<Ctx, T, A, F>(name, resolver, self.registry, true);
         self.push(
             field,
             T::is_optional(),
@@ -2067,6 +2573,70 @@ impl<'a, Ctx: 'static> SubscriptionBuilder<'a, Ctx> {
         self.field_with_info::<A, T, _, S>(name, move |args: A, ctx: &Ctx, _| subscribe(args, ctx))
     }
 
+    /// Add a subscription field whose output type is a runtime-named object.
+    ///
+    /// The stream yields the object's model; `reference` supplies the GraphQL name and `T`
+    /// supplies the list and nullability wrappers.
+    pub fn field_ref<A, T, F, S, N>(
+        &mut self,
+        reference: &ObjectRef<N>,
+        name: &'static str,
+        subscribe: F,
+    ) -> FieldConfig<'_, Ctx>
+    where
+        A: InputObject,
+        N: ObjectModel,
+        T: OutputType + IntoValue + Send + 'static,
+        S: Stream<Item = Result<T, GraphQLError>> + Send + 'static,
+        F: Fn(A, &Ctx) -> S + Send + Sync + 'static,
+    {
+        let (field, validation) = subscription_field::<Ctx, A, T, _, S>(
+            name,
+            move |args: A, ctx: &Ctx, _| subscribe(args, ctx),
+            self.registry,
+            false,
+        );
+        let mut config = self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
+        );
+        config.as_object_ref(reference);
+        config
+    }
+
+    /// Add a subscription field with an explicitly built runtime type reference.
+    pub fn field_ref_type<A, T, F, S>(
+        &mut self,
+        ty: TypeRef,
+        name: &'static str,
+        subscribe: F,
+    ) -> FieldConfig<'_, Ctx>
+    where
+        A: InputObject,
+        T: OutputType + IntoValue + Send + 'static,
+        S: Stream<Item = Result<T, GraphQLError>> + Send + 'static,
+        F: Fn(A, &Ctx) -> S + Send + Sync + 'static,
+    {
+        let (field, validation) = subscription_field::<Ctx, A, T, _, S>(
+            name,
+            move |args: A, ctx: &Ctx, _| subscribe(args, ctx),
+            self.registry,
+            false,
+        );
+        let mut config = self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
+        );
+        config.as_dynamic(ty);
+        config
+    }
+
     /// Add a subscription field whose `subscribe` also receives the [`gql::ResolveInfo`].
     pub fn field_with_info<A, T, F, S>(
         &mut self,
@@ -2080,7 +2650,7 @@ impl<'a, Ctx: 'static> SubscriptionBuilder<'a, Ctx> {
         F: for<'r> Fn(A, &'r Ctx, &'r gql::ResolveInfo<'r>) -> S + Send + Sync + 'static,
     {
         let (field, validation) =
-            subscription_field::<Ctx, A, T, F, S>(name, subscribe, self.registry);
+            subscription_field::<Ctx, A, T, F, S>(name, subscribe, self.registry, true);
         self.push(
             field,
             T::is_optional(),
@@ -2271,6 +2841,7 @@ where
         name,
         move |model: &M, args: A, ctx: &Ctx, _| resolver(model, args, ctx),
         registry,
+        true,
     )
 }
 
@@ -2278,6 +2849,7 @@ fn object_field_with_info<M, Ctx, T, A, F>(
     name: &'static str,
     resolver: F,
     registry: &mut TypeRegistry,
+    register_output: bool,
 ) -> (gql::Field, ValidationSlot<Ctx>)
 where
     M: ObjectModel,
@@ -2286,7 +2858,9 @@ where
     A: InputObject,
     F: for<'r> Fn(&'r M, A, &'r Ctx, &'r gql::ResolveInfo<'r>) -> T + Send + Sync + 'static,
 {
-    T::register_output(registry);
+    if register_output {
+        T::register_output(registry);
+    }
     A::register_args(registry);
     let resolver = Arc::new(resolver);
     let validation = ValidationSlot::new();
@@ -2552,6 +3126,7 @@ fn root_field_with_info<Ctx, T, A, F>(
     name: &'static str,
     resolver: F,
     registry: &mut TypeRegistry,
+    register_output: bool,
 ) -> (gql::Field, ValidationSlot<Ctx>)
 where
     Ctx: 'static,
@@ -2559,7 +3134,9 @@ where
     A: InputObject,
     F: for<'r> Fn(A, &'r Ctx, &'r gql::ResolveInfo<'r>) -> T + Send + Sync + 'static,
 {
-    T::register_output(registry);
+    if register_output {
+        T::register_output(registry);
+    }
     A::register_args(registry);
     let resolver = Arc::new(resolver);
     let validation = ValidationSlot::new();
@@ -2780,6 +3357,7 @@ fn subscription_field<Ctx, A, T, F, S>(
     name: &'static str,
     subscribe: F,
     registry: &mut TypeRegistry,
+    register_output: bool,
 ) -> (gql::Field, ValidationSlot<Ctx>)
 where
     Ctx: 'static,
@@ -2788,7 +3366,9 @@ where
     S: Stream<Item = Result<T, GraphQLError>> + Send + 'static,
     F: for<'r> Fn(A, &'r Ctx, &'r gql::ResolveInfo<'r>) -> S + Send + Sync + 'static,
 {
-    T::register_output(registry);
+    if register_output {
+        T::register_output(registry);
+    }
     A::register_args(registry);
     let subscribe = Arc::new(subscribe);
     let validation = ValidationSlot::new();
@@ -2927,6 +3507,48 @@ fn validate_checks(schema: &gql::Schema, checks: &[FieldCheck], errors: &mut Vec
                     )));
                 }
             }
+            FieldCheck::DynamicObject {
+                owner,
+                field,
+                original,
+                model,
+            } => {
+                if original.named_type().as_ref() != *model {
+                    errors.push(GraphQLError::new(format!(
+                        "Field `{owner}.{field}` declares a runtime-named object, but its Rust \
+                         type `{original}` is not `{model}`. Resolve the object's model (or a \
+                         `Raw<{model}>`), or pass the reference for the model that is returned."
+                    )));
+                }
+            }
+            FieldCheck::DynamicType {
+                owner,
+                field,
+                rust,
+                declared,
+            } => {
+                if !wrapper_compatible(rust, declared) {
+                    errors.push(GraphQLError::new(format!(
+                        "Field `{owner}.{field}` declares its type as `{declared}`, which is not \
+                         compatible with the resolver's Rust type `{rust}`. The declared type \
+                         must not make a nullable position non-null, and its list wrappers must \
+                         match the Rust collection."
+                    )));
+                    continue;
+                }
+                let name = declared.named_type();
+                match schema.get_type(name) {
+                    None => errors.push(GraphQLError::new(format!(
+                        "Field `{owner}.{field}` declares `{name}` as its type, but that type is \
+                         not in the schema. Register it before calling `build()`."
+                    ))),
+                    Some(gql::Type::InputObject(_)) => errors.push(GraphQLError::new(format!(
+                        "Field `{owner}.{field}` declares `{name}` as its output type, but it is \
+                         an input object. Input objects cannot be used in output positions."
+                    ))),
+                    Some(_) => {}
+                }
+            }
             FieldCheck::TypeOverride {
                 owner,
                 field,
@@ -2999,6 +3621,12 @@ fn validate_checks(schema: &gql::Schema, checks: &[FieldCheck], errors: &mut Vec
                 errors.push(GraphQLError::new(format!(
                     "Field `{owner}.{field}` calls `nullable_items()`, but its type `{ty}` is not \
                      a list. Use `nullable()` to make the field itself nullable."
+                )));
+            }
+            FieldCheck::NonNullItemsOnNonList { owner, field, ty } => {
+                errors.push(GraphQLError::new(format!(
+                    "Field `{owner}.{field}` calls `non_null_items()`, but its type `{ty}` is not \
+                     a list. Use `non_null()` to make the field itself non-null."
                 )));
             }
             FieldCheck::InheritedType {

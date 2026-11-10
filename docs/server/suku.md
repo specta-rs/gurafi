@@ -75,6 +75,67 @@ already produces `Arc<dyn Any + Send + Sync>`.
 `subscribe` returns `Result<gql::SubscriptionResponse, gql::Response>`. Setup errors arrive as a
 response, exactly like `gql::subscribe`.
 
+## Error formatting and masking
+
+Execution errors can leak details that belong in logs, not responses. Install one formatter with
+`Server::format_error`; it is applied to every error in every response just before the response is
+returned or streamed:
+
+```rust,no_run
+use suku::{Server, mask_internal};
+
+# fn build(schema: gql::Schema) {
+let server = Server::new(schema).format_error(|error, context| {
+    if context.is_execution() {
+        error.clone().with_message("Internal server error")
+    } else {
+        error.clone()
+    }
+});
+
+// A conservative built-in policy.
+let server = Server::new(schema).format_error(mask_internal);
+# let _ = server;
+# }
+```
+
+The callback receives an `ErrorContext`:
+
+| Accessor | Meaning |
+| --- | --- |
+| `kind()` / `is_request()` / `is_execution()` | Request phase versus execution phase. |
+| `operation_name()` | The requested operation name, or the prepared operation's name. |
+| `request_id()` / `prepared_id()` | The persisted-query / prepared-query identifier, if the request carried one. |
+| `path()` | The response path attached to the error, when present. |
+
+Only request-scoped values are exposed; the context never contains the schema, resolver value,
+user context or other server state. `format_error_with(Arc<dyn ErrorFormatter>)` accepts a shared
+trait object when the formatter is a named type.
+
+Coverage is deliberately complete:
+
+* single operations and every response in a batch (in request order);
+* persisted operations, including errors from resolving an identifier;
+* subscription setup errors and every event in the stream;
+* request errors produced by the HTTP layer: malformed JSON, invalid parameters, missing queries,
+  extractor denials, 405/406 responses and Axum body-read failures.
+
+`mask_internal` is a policy, not a blanket redactor:
+
+* an error with `extensions.code` is returned unchanged;
+* a request error is returned unchanged, because parse/validation/coercion messages describe the
+  caller's document;
+* any other error's message becomes `"Internal server error"`, preserving `locations`, `path` and
+  `extensions`.
+
+A resolver that adds an `extensions.code` to an internal error makes that message public, so only
+attach codes to safe messages. When that policy is wrong for an application, supply a custom
+formatter.
+
+The formatter is called synchronously, once per error, in response order. It must be
+`Send + Sync + 'static` and deterministic. Panics are not caught: they unwind through the
+execution future, or fail the subscription stream, exactly like a resolver panic.
+
 ## Persisted operations
 
 A persisted operation moves parsing, validation and operation selection to startup. `gql` stores
@@ -274,5 +335,7 @@ variable-conversion errors). Batching subscriptions is not supported.
 
 - The crate forbids `unsafe` and its request paths avoid `unwrap`/`expect`/panics.
 - SSE is streamed chunk by chunk; the server never buffers an entire subscription.
-- Errors exposed to clients are GraphQL messages, not Rust error chains.
+- Errors exposed to clients are GraphQL messages, not Rust error chains. Install
+  `Server::format_error` (and consider `mask_internal`) to redact resolver details while keeping
+  `extensions.code`, locations and response paths.
 - CORS, tracing, compression and TLS are intentionally left to the application's HTTP framework.

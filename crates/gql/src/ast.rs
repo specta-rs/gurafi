@@ -219,6 +219,94 @@ impl<'a> Field<'a> {
     }
 }
 
+/// The field nodes a resolver is responsible for.
+///
+/// A field can appear several times in one selection set once fragments are expanded, and the
+/// specification merges those nodes into one response key. `FieldNodes` exposes every node behind
+/// the field currently being resolved, in document order.
+///
+/// The nodes are always borrowed; execution lends them for the resolver's lifetime and no
+/// ownership crosses that boundary.
+#[derive(Clone, Copy, Debug)]
+pub struct FieldNodes<'a> {
+    nodes: &'a [&'a Field<'a>],
+}
+
+impl<'a> FieldNodes<'a> {
+    /// No field nodes.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self { nodes: &[] }
+    }
+
+    /// Field nodes borrowed from the execution.
+    #[must_use]
+    pub(crate) const fn borrowed(nodes: &'a [&'a Field<'a>]) -> Self {
+        Self { nodes }
+    }
+
+    /// The nodes as one borrowed slice.
+    #[must_use]
+    pub const fn as_slice(&self) -> &'a [&'a Field<'a>] {
+        self.nodes
+    }
+
+    /// The number of merged field nodes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Whether there are no field nodes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// The first field node.
+    #[must_use]
+    pub fn first(&self) -> Option<&'a Field<'a>> {
+        self.nodes.first().copied()
+    }
+
+    /// The node at `index`.
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<&'a Field<'a>> {
+        self.nodes.get(index).copied()
+    }
+
+    /// Iterate over the merged field nodes in document order.
+    pub fn iter(&self) -> FieldNodesIter<'a> {
+        self.nodes.iter().copied()
+    }
+}
+
+impl<'a> IntoIterator for FieldNodes<'a> {
+    type Item = &'a Field<'a>;
+    type IntoIter = FieldNodesIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a> std::ops::Deref for FieldNodes<'a> {
+    type Target = [&'a Field<'a>];
+
+    fn deref(&self) -> &Self::Target {
+        self.nodes
+    }
+}
+
+impl<'a> AsRef<[&'a Field<'a>]> for FieldNodes<'a> {
+    fn as_ref(&self) -> &[&'a Field<'a>] {
+        self.nodes
+    }
+}
+
+/// An iterator over the merged nodes of a [`FieldNodes`].
+pub type FieldNodesIter<'a> = std::iter::Copied<std::slice::Iter<'a, &'a Field<'a>>>;
+
 /// A named fragment spread.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FragmentSpread<'a> {

@@ -7,7 +7,8 @@
 //!
 //! # Layers
 //!
-//! - [`Server`] executes queries, mutations and subscriptions. It has no HTTP types.
+//! - [`Server`] executes queries, mutations and subscriptions. It has no HTTP types. It also owns
+//!   the optional error formatter that redacts messages before a client sees them.
 //! - [`http`] is a transport-agnostic request handler. Any framework can call it with request
 //!   parts and a body.
 //! - [`axum`] mounts a [`Server`] on an Axum router (enabled by the default `axum` feature).
@@ -42,6 +43,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
 
+mod error;
 pub mod http;
 mod request;
 mod response;
@@ -53,6 +55,7 @@ pub mod prepared;
 pub mod axum;
 
 pub use crate::{
+    error::{ErrorContext, ErrorFormatter, ErrorKind, INTERNAL_ERROR_MESSAGE, mask_internal},
     request::{GraphQLRequest, RequestError, RequestPayload, json_to_graphql},
     response::{
         GraphQLResponse, ResponseExt, error_json_bytes, error_response, to_json, to_json_bytes,

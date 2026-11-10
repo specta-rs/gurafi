@@ -267,10 +267,17 @@ pub type NoArgs = ();
 /// A GraphQL abstract type: an interface or a union.
 ///
 /// Values of this type are cheap witnesses returned by the schema builder; they are used by
-/// [`crate::FieldConfig::as_abstract`] and by [`crate::ObjectBuilder::implements`].
+/// [`crate::FieldConfig::as_abstract`] and by [`crate::ObjectBuilder::implements`]. The name is
+/// borrowed from the witness rather than `'static`, so it can be computed at runtime.
 pub trait AbstractType {
     /// The GraphQL type name.
-    fn abstract_name(&self) -> &'static str;
+    fn abstract_name(&self) -> &str;
+}
+
+impl<T: AbstractType + ?Sized> AbstractType for &T {
+    fn abstract_name(&self) -> &str {
+        (*self).abstract_name()
+    }
 }
 
 /// A safe downcast from the executor's parent value to an object model.

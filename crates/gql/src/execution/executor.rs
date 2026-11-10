@@ -18,7 +18,6 @@ use futures::{
     future::{BoxFuture, Either, FutureExt, ready},
     stream,
 };
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::{
@@ -26,6 +25,7 @@ use crate::{
     ast::{self, OperationKind},
     complexity::{self, ComplexityOptions, StaticComplexity},
     error::{GraphQLError, Location, Path, PathSegment, Response},
+    fragments::Fragments,
     introspection,
     parser::parse_query,
     schema::Schema,
@@ -55,49 +55,6 @@ const SYNC_DEPTH_LIMIT: usize = 12;
 /// [`crate::parser::MAX_DEPTH`] (96) bound was verified against. Well-formed real documents are far
 /// shallower, so this only affects documents at the parser's limit.
 const MAX_PLANNED_DEPTH: usize = 48;
-
-/// A map of fragment definitions keyed by name, borrowed from the parsed document.
-///
-/// Documents usually define only a handful of fragments, and execution looks them up once per
-/// selection set, so an inline list is cheaper than a hash map. Documents that define many
-/// fragments fall back to hashing to keep lookup cost independent of their number.
-pub(crate) enum FragmentMap<'a> {
-    /// Few enough fragments that a linear scan wins.
-    Small(SmallVec<[(&'a str, &'a ast::FragmentDefinition<'a>); 8]>),
-    /// Many fragments, indexed by name.
-    Large(FxHashMap<&'a str, &'a ast::FragmentDefinition<'a>>),
-}
-
-impl<'a> FragmentMap<'a> {
-    /// Build a fragment lookup for a parsed document.
-    pub(crate) fn new(document: &'a ast::Document<'a>) -> Self {
-        let mut small = SmallVec::new();
-        let mut fragments = document.fragments();
-        for fragment in fragments.by_ref() {
-            if small.len() == small.inline_size() {
-                let mut large: FxHashMap<_, _> = small.iter().copied().collect();
-                large.insert(fragment.name, fragment);
-                for fragment in fragments {
-                    large.insert(fragment.name, fragment);
-                }
-                return Self::Large(large);
-            }
-            small.push((fragment.name, fragment));
-        }
-        Self::Small(small)
-    }
-
-    /// Look up a fragment definition by name.
-    pub(crate) fn get(&self, name: &str) -> Option<&'a ast::FragmentDefinition<'a>> {
-        match self {
-            Self::Small(fragments) => fragments
-                .iter()
-                .find(|(known, _)| crate::types::names_eq(known, name))
-                .map(|(_, fragment)| *fragment),
-            Self::Large(fragments) => fragments.get(name).copied(),
-        }
-    }
-}
 
 /// How a field is named in an error message.
 ///
@@ -347,13 +304,13 @@ async fn finish_operation<'doc>(
     };
     let deadline = options.timeout.map(|timeout| Instant::now() + timeout);
 
-    let fragments = FragmentMap::new(document);
+    let fragments = Fragments::new(document);
     run_operation(
         &context,
         fragments,
         plan,
         root_type,
-        &operation.selection_set,
+        operation,
         options.root_value.clone(),
         deadline,
         matches!(operation.kind, OperationKind::Query),
@@ -395,10 +352,10 @@ pub(crate) fn select_operation<'a>(
 /// Execute an operation's root selection set and shape the response.
 pub(crate) async fn run_operation<'doc>(
     context: &'doc ExecutionContext,
-    fragments: FragmentMap<'doc>,
+    fragments: Fragments<'doc>,
     plan: Option<&'doc PreparedPlan<'doc>>,
     root_type: &'doc ObjectType,
-    selection_set: &'doc ast::SelectionSet<'doc>,
+    operation: &'doc ast::OperationDefinition<'doc>,
     parent: Value,
     deadline: Option<Instant>,
     parallel: bool,
@@ -415,14 +372,17 @@ pub(crate) async fn run_operation<'doc>(
         deadline,
         parallel,
         skip_root_authorization,
+        operation,
+        root_value: parent,
     };
+    let parent = &executor.root_value;
     let mut path = Path::new();
     let mut errors = Vec::new();
-    let selection_sets = [selection_set];
+    let selection_sets = [&operation.selection_set];
     let selections = Selections::new(&selection_sets, plan.and_then(PreparedPlan::root));
     let result = match executor.try_execute_fields_sync(
         root_type,
-        &parent,
+        parent,
         &selections,
         &mut path,
         &mut errors,
@@ -434,7 +394,7 @@ pub(crate) async fn run_operation<'doc>(
                 executor
                     .execute_fields_inner_planned(
                         root_type,
-                        &parent,
+                        parent,
                         &selections,
                         &mut path,
                         &mut errors,
@@ -445,7 +405,7 @@ pub(crate) async fn run_operation<'doc>(
                 executor
                     .execute_fields_inner_dynamic(
                         root_type,
-                        &parent,
+                        parent,
                         selections.sets,
                         &mut path,
                         &mut errors,
@@ -505,24 +465,16 @@ pub(crate) async fn execute_subscription_event(
             "Schema is not configured for subscriptions.",
         ));
     };
-    let fragments = FragmentMap::new(&document);
+    let fragments = Fragments::new(&document);
     run_operation(
-        context,
-        fragments,
-        None,
-        root_type,
-        &operation.selection_set,
-        event,
-        deadline,
-        true,
-        true,
+        context, fragments, None, root_type, operation, event, deadline, true, true,
     )
     .await
 }
 
 struct Executor<'doc> {
     context: &'doc ExecutionContext,
-    fragments: FragmentMap<'doc>,
+    fragments: Fragments<'doc>,
     /// The precompiled collection plan of a prepared operation, when there is one.
     plans: Option<&'doc PreparedPlan<'doc>>,
     deadline: Option<Instant>,
@@ -534,12 +486,42 @@ struct Executor<'doc> {
     /// re-executes the same root field, so running the authorizer again would repeat the same
     /// decision once per event. Nested fields are still authorized for every event.
     skip_root_authorization: bool,
+    /// The operation being executed, made available to resolvers through `ResolveInfo`.
+    operation: &'doc ast::OperationDefinition<'doc>,
+    /// The operation's root value, owned here so every resolver can borrow it for its lifetime.
+    root_value: Value,
 }
 
 impl<'doc> Executor<'doc> {
     fn expired(&self) -> bool {
         self.deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    /// Build the resolver-visible information for one field.
+    ///
+    /// Every construction site goes through this so normal, planned, meta and subscription
+    /// execution expose the same operation, fragment, root-value and variable context.
+    fn resolve_info<'s>(
+        &'s self,
+        field_name: &'s str,
+        parent_type: &'s str,
+        return_type: &'s TypeRef,
+        path: &'s [PathSegment],
+        field_nodes: ast::FieldNodes<'s>,
+    ) -> ResolveInfo<'s> {
+        ResolveInfo {
+            field_name,
+            parent_type,
+            return_type,
+            path,
+            schema: &self.context.schema,
+            field_nodes,
+            operation: Some(self.operation),
+            fragments: &self.fragments,
+            root_value: &self.root_value,
+            variables: &self.context.variables,
+        }
     }
 
     async fn execute_fields_inner_planned<'s>(
@@ -1078,13 +1060,13 @@ impl<'doc> Executor<'doc> {
                 name: first.name,
             };
             let empty_args = Object::new();
-            let info = ResolveInfo {
-                field_name: first.name,
-                parent_type: object_type.name.as_ref(),
-                return_type: &ty,
-                path: path.as_slice(),
-                schema: &self.context.schema,
-            };
+            let info = self.resolve_info(
+                first.name,
+                object_type.name.as_ref(),
+                &ty,
+                path.as_slice(),
+                ast::FieldNodes::borrowed(nodes),
+            );
             let denial = match self.context.authorizer.as_ref() {
                 Some(authorizer) => {
                     let authorization = AuthorizationContext {
@@ -1192,13 +1174,13 @@ impl<'doc> Executor<'doc> {
         // object's property. Borrowing that property instead of cloning it is what keeps
         // composite fields free of a full copy of the parent's list or object.
         let resolved = {
-            let info = ResolveInfo {
-                field_name: field.name.as_ref(),
-                parent_type: object_type.name.as_ref(),
-                return_type: &field.ty,
-                path: path.as_slice(),
-                schema: &self.context.schema,
-            };
+            let info = self.resolve_info(
+                field.name.as_ref(),
+                object_type.name.as_ref(),
+                &field.ty,
+                path.as_slice(),
+                ast::FieldNodes::borrowed(nodes),
+            );
             let denial = match self.context.authorizer.as_ref() {
                 Some(authorizer) if !(self.skip_root_authorization && path.len() == 1) => {
                     let authorization = AuthorizationContext {
@@ -1368,13 +1350,13 @@ impl<'doc> Executor<'doc> {
                 name: first.name,
             };
             let empty_args = Object::new();
-            let info = ResolveInfo {
-                field_name: first.name,
-                parent_type: object_type.name.as_ref(),
-                return_type: &ty,
-                path: path.as_slice(),
-                schema: &self.context.schema,
-            };
+            let info = self.resolve_info(
+                first.name,
+                object_type.name.as_ref(),
+                &ty,
+                path.as_slice(),
+                ast::FieldNodes::borrowed(nodes),
+            );
             let denial = match self.context.authorizer.as_ref() {
                 Some(authorizer) => {
                     let authorization = AuthorizationContext {
@@ -1463,13 +1445,13 @@ impl<'doc> Executor<'doc> {
         // object's property. Borrowing that property instead of cloning it is what keeps
         // composite fields free of a full copy of the parent's list or object.
         let resolved = {
-            let info = ResolveInfo {
-                field_name: field.name.as_ref(),
-                parent_type: object_type.name.as_ref(),
-                return_type: &field.ty,
-                path: path.as_slice(),
-                schema: &self.context.schema,
-            };
+            let info = self.resolve_info(
+                field.name.as_ref(),
+                object_type.name.as_ref(),
+                &field.ty,
+                path.as_slice(),
+                ast::FieldNodes::borrowed(nodes),
+            );
             let denial = match self.context.authorizer.as_ref() {
                 Some(authorizer) if !(self.skip_root_authorization && path.len() == 1) => {
                     let authorization = AuthorizationContext {
@@ -1785,6 +1767,9 @@ impl<'doc> Executor<'doc> {
             &selection_sets,
             group.child.filter(|_| self.plans.is_some()),
         );
+        // The plan owns its nodes as `Arc`s; collect references once so `ResolveInfo` can expose
+        // the same slice shape as the dynamic path.
+        let field_nodes = group.nodes.field_node_refs();
 
         if self.expired() {
             return Err(
@@ -1802,13 +1787,13 @@ impl<'doc> Executor<'doc> {
                 name: first.name,
             };
             let empty_args = Object::new();
-            let info = ResolveInfo {
-                field_name: first.name,
-                parent_type: object_type.name.as_ref(),
-                return_type: &ty,
-                path: path.as_slice(),
-                schema: &self.context.schema,
-            };
+            let info = self.resolve_info(
+                first.name,
+                object_type.name.as_ref(),
+                &ty,
+                path.as_slice(),
+                ast::FieldNodes::borrowed(&field_nodes),
+            );
             let denial = match self.context.authorizer.as_ref() {
                 Some(authorizer) => {
                     let authorization = AuthorizationContext {
@@ -1908,13 +1893,13 @@ impl<'doc> Executor<'doc> {
         // object's property. Borrowing that property instead of cloning it is what keeps
         // composite fields free of a full copy of the parent's list or object.
         let resolved = {
-            let info = ResolveInfo {
-                field_name: field.name.as_ref(),
-                parent_type: object_type.name.as_ref(),
-                return_type: &field.ty,
-                path: path.as_slice(),
-                schema: &self.context.schema,
-            };
+            let info = self.resolve_info(
+                field.name.as_ref(),
+                object_type.name.as_ref(),
+                &field.ty,
+                path.as_slice(),
+                ast::FieldNodes::borrowed(&field_nodes),
+            );
             let denial = match self.context.authorizer.as_ref() {
                 Some(authorizer) if !(self.skip_root_authorization && path.len() == 1) => {
                     let authorization = AuthorizationContext {

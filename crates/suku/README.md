@@ -69,6 +69,66 @@ let server = suku::Server::new(schema)
 `Server` is cheap to clone and safe to share. Wrap it in `Arc` only if that suits your
 application; cloning is equivalent.
 
+## Error formatting and masking
+
+Resolver errors often carry details that are useful in logs but unsafe for clients: database
+messages, filesystem paths, internal type names. `Server::format_error` installs one formatter
+that runs over every error in every response, immediately before the response is returned or
+streamed:
+
+```rust,no_run
+# fn build(schema: gql::Schema) {
+use suku::{Server, mask_internal};
+
+let server = Server::new(schema).format_error(|error, context| {
+    if context.is_execution() && context.operation_name() == Some("AdminReport") {
+        error.clone().with_message("Internal server error")
+    } else {
+        error.clone()
+    }
+});
+
+// Or use the conservative built-in policy.
+let server = Server::new(schema).format_error(mask_internal);
+# let _ = server;
+# }
+```
+
+The formatter receives an `ErrorContext` with:
+
+| Accessor | Meaning |
+| --- | --- |
+| `kind()` / `is_request()` / `is_execution()` | Whether the error happened before execution or during it. |
+| `operation_name()` | The requested operation name, or the prepared operation's name. |
+| `request_id()` / `prepared_id()` | The persisted-query / prepared-query identifier, when the request carried one. |
+| `path()` | The response path attached to the error, when it has one. |
+
+The context never exposes the schema, resolver value, user context or other server internals.
+`format_error_with(Arc<dyn ErrorFormatter>)` is available when the formatter is a named type or
+shared with other endpoints.
+
+Formatting is applied to single operations, every response in a batch (in request order),
+persisted operations, subscription setup errors and every subscription event. It also covers
+request errors raised by the HTTP layer, including malformed JSON, missing queries, extractor
+denials and content-negotiation/method rejections. Transport-level body-read failures in the Axum
+adapter are formatted too.
+
+`mask_internal` has explicit rules:
+
+* errors with `extensions.code` are left untouched (the code marks an intentionally public error);
+* request errors are left untouched (parse, validation and coercion messages describe the
+  caller's document);
+* every other error's message becomes `"Internal server error"`, while source locations,
+  response path and extensions are preserved.
+
+A resolver that attaches an `extensions.code` to an internal error opts that message back in, so
+attach codes only to errors that are safe to expose. Use `format_error` when the default policy is
+not enough.
+
+Formatting runs synchronously and deterministically, once per error, in response order.
+Formatters must be `Send + Sync + 'static`. A panic is not caught: it unwinds through the
+execution future (or fails the subscription stream) exactly like a panic in a resolver.
+
 ## Executing without HTTP
 
 ```rust,no_run

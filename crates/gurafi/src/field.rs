@@ -11,7 +11,8 @@ use indexmap::IndexMap;
 
 use crate::{
     registry::TypeRegistry,
-    traits::{AbstractType, InputObject, OutputType},
+    schema::ObjectRef,
+    traits::{AbstractType, InputObject, ObjectModel, OutputType},
 };
 
 /// A deferred check that a field's declared type is compatible with its Rust type.
@@ -43,6 +44,12 @@ pub(crate) enum FieldCheck {
         field: Name,
         ty: TypeRef,
     },
+    /// `.non_null_items()` was applied to a field that is not a list.
+    NonNullItemsOnNonList {
+        owner: String,
+        field: Name,
+        ty: TypeRef,
+    },
     /// A `.resolve_inherited(...)` field's Rust type must be a covariant match for the
     /// interface field it inherits.
     InheritedType {
@@ -50,6 +57,20 @@ pub(crate) enum FieldCheck {
         field: Name,
         actual: TypeRef,
         expected: TypeRef,
+    },
+    /// `.as_object_ref(...)` declared a runtime-named object output.
+    DynamicObject {
+        owner: String,
+        field: Name,
+        original: TypeRef,
+        model: &'static str,
+    },
+    /// `.as_dynamic(...)` declared an explicit runtime-named output type.
+    DynamicType {
+        owner: String,
+        field: Name,
+        rust: TypeRef,
+        declared: TypeRef,
     },
 }
 
@@ -524,18 +545,79 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
     /// The resolver still returns concrete model values; the executor's `is_type_of` check (or
     /// the abstract type's `resolve_type`) selects the concrete type per value. List and
     /// nullability wrappers are preserved.
+    ///
+    /// The compatibility check uses the field's current named type, so it composes with
+    /// [`FieldConfig::as_object_ref`]: declare a runtime-named object first, then widen it to an
+    /// interface or union that lists that object as a possible type.
     pub fn as_abstract(&mut self, reference: impl AbstractType) -> &mut Self {
         let abstract_name: Name = Arc::from(reference.abstract_name());
+        let original = self
+            .sink
+            .get_mut(&self.name)
+            .map_or_else(|| self.original.clone(), |field| field.ty.clone());
         if let Some(checks) = &mut self.checks {
             checks.push(FieldCheck::Abstract {
                 owner: self.owner.clone(),
                 field: self.name.clone(),
-                original: self.original.clone(),
+                original,
                 abstract_name: abstract_name.clone(),
             });
         }
         if let Some(field) = self.sink.get_mut(&self.name) {
             field.ty = replace_named_type(&field.ty, abstract_name);
+        }
+        self
+    }
+
+    /// Declare the field's output type as a runtime-named object.
+    ///
+    /// The named type is replaced, keeping the list and nullability wrappers of the field's Rust
+    /// type. This is what [`crate::ObjectBuilder::field_ref`] uses internally; it is public for
+    /// fields whose type is declared separately, such as `raw_field`.
+    ///
+    /// The Rust type must be the model the reference was created for (`M` itself, or a wrapper
+    /// such as [`crate::Raw<M>`] that delegates its output type to `M`). A mismatch is a build
+    /// error.
+    pub fn as_object_ref<M: ObjectModel>(&mut self, reference: &ObjectRef<M>) -> &mut Self {
+        self.registry.reference_object(reference.name());
+        if let Some(checks) = &mut self.checks {
+            checks.push(FieldCheck::DynamicObject {
+                owner: self.owner.clone(),
+                field: self.name.clone(),
+                original: self.original.clone(),
+                model: M::NAME,
+            });
+        }
+        if let Some(field) = self.sink.get_mut(&self.name) {
+            field.ty = replace_named_type(&field.ty, Arc::from(reference.name()));
+        }
+        self
+    }
+
+    /// Replace the field's GraphQL type with an explicitly built runtime type reference.
+    ///
+    /// Use this when the output type's name is computed at runtime and there is no object model
+    /// to pass to [`FieldConfig::as_object_ref`] — for example a runtime-named interface or
+    /// union, or a list such as `TypeRef::named(name).list().non_null()`.
+    ///
+    /// The wrappers must still be truthful for the resolver's Rust type: nullability may be
+    /// loosened and never tightened, and the list shape must match. The named type must exist in
+    /// the schema by build time.
+    pub fn as_dynamic(&mut self, ty: TypeRef) -> &mut Self {
+        let current = self
+            .sink
+            .get_mut(&self.name)
+            .map_or_else(|| self.original.clone(), |field| field.ty.clone());
+        if let Some(checks) = &mut self.checks {
+            checks.push(FieldCheck::DynamicType {
+                owner: self.owner.clone(),
+                field: self.name.clone(),
+                rust: current,
+                declared: ty.clone(),
+            });
+        }
+        if let Some(field) = self.sink.get_mut(&self.name) {
+            field.ty = ty;
         }
         self
     }
@@ -638,6 +720,34 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
                 let ty = field.ty.clone();
                 if let Some(checks) = &mut self.checks {
                     checks.push(FieldCheck::NullableItemsOnNonList {
+                        owner: self.owner.clone(),
+                        field: self.name.clone(),
+                        ty,
+                    });
+                }
+            }
+        }
+        self
+    }
+
+    /// Add the item-level non-null wrapper to a list field.
+    ///
+    /// `[Giraffe]!` becomes `[Giraffe!]!`; the field's own nullability is unchanged. Applying
+    /// this to a field that is not a list is a schema build error.
+    ///
+    /// Only use this when the Rust collection's items cannot be `None`. Rust's type system is
+    /// not reflected in the GraphQL wrapper, so this cannot be checked automatically: a
+    /// `Vec<Option<T>>` must not be declared with non-null items.
+    pub fn non_null_items(&mut self) -> &mut Self {
+        let Some(field) = self.sink.get_mut(&self.name) else {
+            return self;
+        };
+        match non_null_items(&field.ty) {
+            Some(ty) => field.ty = ty,
+            None => {
+                let ty = field.ty.clone();
+                if let Some(checks) = &mut self.checks {
+                    checks.push(FieldCheck::NonNullItemsOnNonList {
                         owner: self.owner.clone(),
                         field: self.name.clone(),
                         ty,
@@ -847,6 +957,18 @@ fn replace_named_type(ty: &TypeRef, name: Name) -> TypeRef {
         TypeRef::Named(_) => TypeRef::Named(name),
         TypeRef::List(inner) => TypeRef::List(Box::new(replace_named_type(inner, name))),
         TypeRef::NonNull(inner) => TypeRef::NonNull(Box::new(replace_named_type(inner, name))),
+    }
+}
+
+/// Add the item non-null to a list type, preserving the outer nullability.
+fn non_null_items(ty: &TypeRef) -> Option<TypeRef> {
+    match ty {
+        TypeRef::NonNull(inner) => non_null_items(inner).map(|ty| TypeRef::NonNull(Box::new(ty))),
+        TypeRef::List(inner) => Some(TypeRef::List(match inner.as_ref() {
+            TypeRef::NonNull(_) => inner.clone(),
+            other => Box::new(TypeRef::NonNull(Box::new(other.clone()))),
+        })),
+        TypeRef::Named(_) => None,
     }
 }
 

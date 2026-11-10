@@ -71,7 +71,7 @@ fn main() {
     });
 
     schema.object::<Giraffe>(|o| {
-        o.implements(node);
+        o.implements(&node);
         // The type and arguments come from `Node`; only the resolver is new.
         o.resolve_inherited("id", |g: &Giraffe, _: NoArgs, _: &Ctx| {
             ID::new(g.name.clone())
@@ -83,7 +83,7 @@ fn main() {
     });
 
     schema.object::<Zookeeper>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.field("id", |z: &Zookeeper, _: NoArgs, _: &Ctx| {
             ID::new(z.name.clone())
         });
@@ -127,7 +127,7 @@ fn main() {
         q.field_result("search", |_: NoArgs, _: &Ctx| {
             Result::Ok(SearchResult::Zookeeper(Zookeeper { name: "Bob".into() }))
         })
-        .as_abstract(search);
+        .as_abstract(&search);
 
         q.field("myName", |_: NoArgs, ctx: &Ctx| ctx.user.map(str::to_owned))
             .auth(|ctx: &Ctx| ctx.user.is_some())

@@ -12,7 +12,7 @@ documentation.
 | [`gql`](crates/gql) | A GraphQL reference implementation for Rust. Implements the October 2021 specification: parser, type system, validation, execution, introspection, subscriptions, complexity analysis and schema compatibility checking. It is transport- and framework-agnostic. |
 | [`gurafi`](crates/gurafi) | An intuitive, type-safe, code-first GraphQL schema builder built on `gql`. Rust types drive the GraphQL type system; `gurafi` only adds developer experience. |
 | [`gurafi-macros`](crates/gurafi-macros) | Procedural macros for `gurafi` (`Object`, `Input`, `Args`, `Enum`, `Scalar`, `Union`). |
-| [`suku`](crates/suku) | A production GraphQL-over-HTTP server for a `gql::Schema`, with batching, SSE subscriptions and pluggable authentication. |
+| [`suku`](crates/suku) | A production GraphQL-over-HTTP server for a `gql::Schema`, with batching, SSE subscriptions, error masking and pluggable authentication. |
 | [`shiri`](crates/shiri) | Serde-compatible serialization experiments. Not part of the GraphQL stack. |
 
 The layers are deliberately decoupled:
@@ -66,6 +66,10 @@ Serve the schema over HTTP with `suku`; see [`examples/axum`](examples/axum).
 - **Splittable definitions.** `object`/`interface` reopen an existing type, and
   `object_fields`/`interface_fields`/`query_fields` make that intent explicit.
   Declarations from different modules merge; duplicate field names still fail.
+- **Runtime-named types.** `object_ref`/`interface_ref`/`union_ref` compute a
+  GraphQL name at runtime while keeping the Rust model for resolvers and
+  `is_type_of`; `field_ref` uses it in output positions. Relay connection and
+  payload names need no code generation.
 - **Checked type control.** `nullable`, `non_null`, `nullable_items` and
   `as_type`/`returns` are validated at build time, so an override cannot claim a
   non-null value from an `Option` resolver.

@@ -139,7 +139,7 @@ fn build_full_schema() -> gql::Schema {
 
     schema.object::<Giraffe>(|o| {
         o.description("Long necks.");
-        o.implements(node);
+        o.implements(&node);
         o.expose(expose!(Giraffe::name));
         o.expose(expose!(Giraffe::height as "heightMeters"));
         o.expose(expose!(Giraffe::height))
@@ -169,7 +169,7 @@ fn build_full_schema() -> gql::Schema {
     });
 
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.expose(expose!(User::name));
         o.field("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
     });
@@ -189,16 +189,16 @@ fn build_full_schema() -> gql::Schema {
             .auth(|ctx: &Ctx| ctx.is_logged_in)
             .complexity(2);
         q.field("node", |_: NoArgs, _: &Ctx| giraffe())
-            .as_abstract(node)
+            .as_abstract(&node)
             .description("Resolved through an interface.");
         q.field("search", |_: NoArgs, _: &Ctx| {
             SearchResult::User(User {
                 name: "Oscar".into(),
             })
         })
-        .as_abstract(search);
+        .as_abstract(&search);
         q.field("nodes", |_: NoArgs, _: &Ctx| vec![giraffe()])
-            .as_abstract(node);
+            .as_abstract(&node);
         q.field("parent", |_: NoArgs, _: &Ctx| Parent {
             label: "parent".into(),
         });
@@ -636,7 +636,7 @@ fn interface_and_union_closures_use_statement_style() {
         u.member::<User>().member::<Post>();
     });
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.field("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
         o.expose(expose!(User::name));
     });
@@ -772,11 +772,11 @@ fn as_abstract_must_match_the_resolvers_rust_type() {
         i.field::<String>("name");
     });
     schema.object::<Thing>(|o| {
-        o.implements(thing);
+        o.implements(&thing);
         o.expose(expose!(Thing::name));
     });
     schema.object::<Other>(|o| {
-        o.implements(thing);
+        o.implements(&thing);
         o.expose(expose!(Other::name));
     });
     let search = schema.union("Search", |u| {
@@ -785,7 +785,7 @@ fn as_abstract_must_match_the_resolvers_rust_type() {
     schema.query(|q| {
         // A String can never be a possible type of the `Search` union.
         q.field("broken", |_: NoArgs, _: &()| "not a model".to_owned())
-            .as_abstract(search);
+            .as_abstract(&search);
     });
     let error = schema
         .build()

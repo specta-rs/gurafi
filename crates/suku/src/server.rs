@@ -1,15 +1,16 @@
 //! The transport-independent GraphQL server.
 //!
 //! [`Server`] owns a [`gql::Schema`] and the defaults applied to every operation: introspection,
-//! depth and complexity limits, timeouts and batch settings. It has no opinion about HTTP; mount
-//! it with [`crate::http`] or [`crate::axum`].
+//! depth and complexity limits, timeouts, batch settings and the optional error formatter. It has
+//! no opinion about HTTP; mount it with [`crate::http`] or [`crate::axum`].
 //!
 //! Cloning a `Server` is cheap (everything lives behind one `Arc`), so wrapping it in another
 //! `Arc` is unnecessary.
 
 use core::fmt;
-use std::{any::Any, sync::Arc, time::Duration};
+use std::{any::Any, future::Future, sync::Arc, time::Duration};
 
+use futures::StreamExt as _;
 use gql::{
     Authorizer, ExecutionOptions, GraphQLError, Response, Schema, SubscriptionResponse, Value,
     ast::OperationKind,
@@ -17,6 +18,7 @@ use gql::{
 };
 
 use crate::{
+    error::{ErrorContext, ErrorFormatter, ErrorKind, ResponseMeta, format_response_errors},
     prepared::{PreparedQueries, persisted_query_not_found, persisted_query_not_found_error},
     request::GraphQLRequest,
 };
@@ -130,9 +132,13 @@ struct ServerInner {
     authorizer: Option<Arc<dyn Authorizer>>,
     prepared: Option<PreparedQueryRegistry>,
     require_prepared: bool,
+    error_formatter: Option<Arc<dyn ErrorFormatter>>,
 }
 
 /// A GraphQL server.
+///
+/// Configuration is immutable and copy-on-write, so cloning a server is cheap. Install an error
+/// formatter with [`Server::format_error`] to redact messages before they reach a client.
 #[derive(Clone)]
 pub struct Server {
     inner: Arc<ServerInner>,
@@ -158,6 +164,7 @@ impl fmt::Debug for Server {
                 &self.inner.prepared.as_ref().map_or(0, |r| r.len()),
             )
             .field("require_prepared", &self.inner.require_prepared)
+            .field("error_formatter", &self.inner.error_formatter.is_some())
             .finish()
     }
 }
@@ -187,6 +194,7 @@ impl Server {
                 authorizer: None,
                 prepared: None,
                 require_prepared: false,
+                error_formatter: None,
             }),
         }
     }
@@ -386,6 +394,53 @@ impl Server {
         self.inner.require_prepared
     }
 
+    /// Install an error formatter that runs over every error in every response.
+    ///
+    /// The formatter is called once per error, just before the response is returned or streamed.
+    /// It applies to single operations, batches, persisted operations, subscription setup errors
+    /// and subscription events, and to request errors produced by [`crate::http`]. It receives an
+    /// [`ErrorContext`] describing the phase, operation name, persisted-query identifier and
+    /// response path.
+    ///
+    /// The formatter must be deterministic and thread-safe. It is called synchronously; a panic
+    /// propagates to the caller (or fails the subscription stream) and is not caught.
+    ///
+    /// [`mask_internal`](crate::mask_internal) is a conservative formatter that hides messages
+    /// which are neither request diagnostics nor tagged with an `extensions.code`.
+    ///
+    /// ```no_run
+    /// use suku::{Server, mask_internal};
+    ///
+    /// # fn build(schema: gql::Schema) {
+    /// let server = Server::new(schema).format_error(mask_internal);
+    /// # let _ = server;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn format_error<F>(mut self, formatter: F) -> Self
+    where
+        F: for<'a> Fn(&GraphQLError, &ErrorContext<'a>) -> GraphQLError + Send + Sync + 'static,
+    {
+        self.inner_mut().error_formatter = Some(Arc::new(formatter) as Arc<dyn ErrorFormatter>);
+        self
+    }
+
+    /// Install a pre-built error formatter.
+    ///
+    /// This is the trait-object form of [`Server::format_error`], useful when the formatter is a
+    /// named type or is shared with other endpoints.
+    #[must_use]
+    pub fn format_error_with(mut self, formatter: Arc<dyn ErrorFormatter>) -> Self {
+        self.inner_mut().error_formatter = Some(formatter);
+        self
+    }
+
+    /// Whether an error formatter is installed.
+    #[must_use]
+    pub fn has_error_formatter(&self) -> bool {
+        self.inner.error_formatter.is_some()
+    }
+
     /// The schema this server executes.
     #[must_use]
     pub fn schema(&self) -> &Schema {
@@ -407,12 +462,13 @@ impl Server {
     /// Execute a query or mutation.
     ///
     /// Parse, validation, variable coercion and resolver errors all come back inside the returned
-    /// response, exactly as the GraphQL specification requires.
+    /// response, exactly as the GraphQL specification requires. If an error formatter is
+    /// installed, every error in the response has already passed through it.
     #[tracing::instrument(skip(self, request, context), level = "debug")]
     pub async fn execute(&self, request: &GraphQLRequest, context: Context) -> gql::Response {
         let variables = match request.variables_object() {
             Ok(variables) => variables,
-            Err(error) => return error.into_response(),
+            Err(error) => return self.request_response(request, error.into_response()),
         };
         let options = self.execution_options(context);
 
@@ -422,38 +478,38 @@ impl Server {
                     if let Some(error) =
                         prepared_operation_name_error(prepared, request.operation_name.as_deref())
                     {
-                        return Response::error(error);
+                        return self.request_response(request, Response::error(error));
                     }
+                    let meta = ResponseMeta::from_request(request)
+                        .with_operation_name(prepared.operation_name());
                     let future = prepared.execute(variables.as_ref(), &options);
-                    return match options.timeout {
-                        Some(timeout) => timed(timeout, future).await,
-                        None => future.await,
-                    };
+                    return self.await_execute(meta, options.timeout, future).await;
                 }
                 Ok(None) => {}
-                Err(error) => return Response::error(error),
+                Err(error) => {
+                    return self.request_response(request, Response::error(error));
+                }
             }
             if self.inner.require_prepared || request.query.trim().is_empty() {
-                return persisted_query_not_found(id);
+                return self.request_response(request, persisted_query_not_found(id));
             }
         } else if self.inner.require_prepared {
-            return persisted_query_not_found("");
+            return self.request_response(request, persisted_query_not_found(""));
         } else if request.query.trim().is_empty() {
-            return missing_query_response();
+            return self.request_response(request, missing_query_response());
         }
 
         let gql_request = request.as_gql(variables.as_ref());
         let future = gql::execute(&self.inner.schema, gql_request, &options);
-        match options.timeout {
-            Some(timeout) => timed(timeout, future).await,
-            None => future.await,
-        }
+        self.await_execute(ResponseMeta::from_request(request), options.timeout, future)
+            .await
     }
 
     /// Execute an array of requests concurrently, preserving their order.
     ///
     /// Concurrency is bounded by [`Server::batch_concurrency`]. A request with invalid variables
-    /// produces its own error response; it does not fail the batch.
+    /// produces its own error response; it does not fail the batch. Each response is formatted
+    /// independently, so a formatter never reorders a batch.
     pub async fn execute_batch(
         &self,
         requests: &[GraphQLRequest],
@@ -475,6 +531,9 @@ impl Server {
 
     /// Start a subscription.
     ///
+    /// Setup errors and every response in the returned event stream pass through the installed
+    /// error formatter before they are observed.
+    ///
     /// # Errors
     ///
     /// Returns a fully formed error response when the request is not a valid subscription or the
@@ -487,7 +546,7 @@ impl Server {
     ) -> Result<SubscriptionResponse, gql::Response> {
         let variables = match request.variables_object() {
             Ok(variables) => variables,
-            Err(error) => return Err(error.into_response()),
+            Err(error) => return Err(self.request_response(request, error.into_response())),
         };
         let options = self.execution_options(context);
 
@@ -497,32 +556,31 @@ impl Server {
                     if let Some(error) =
                         prepared_operation_name_error(prepared, request.operation_name.as_deref())
                     {
-                        return Err(Response::error(error));
+                        return Err(self.request_response(request, Response::error(error)));
                     }
+                    let meta = ResponseMeta::from_request(request)
+                        .with_operation_name(prepared.operation_name());
                     let future = prepared.subscribe(variables.as_ref(), &options);
-                    return match options.timeout {
-                        Some(timeout) => timed_subscribe(timeout, future).await,
-                        None => future.await,
-                    };
+                    return self.await_subscribe(meta, options.timeout, future).await;
                 }
                 Ok(None) => {}
-                Err(error) => return Err(Response::error(error)),
+                Err(error) => {
+                    return Err(self.request_response(request, Response::error(error)));
+                }
             }
             if self.inner.require_prepared || request.query.trim().is_empty() {
-                return Err(persisted_query_not_found(id));
+                return Err(self.request_response(request, persisted_query_not_found(id)));
             }
         } else if self.inner.require_prepared {
-            return Err(persisted_query_not_found(""));
+            return Err(self.request_response(request, persisted_query_not_found("")));
         } else if request.query.trim().is_empty() {
-            return Err(missing_query_response());
+            return Err(self.request_response(request, missing_query_response()));
         }
 
         let gql_request = request.as_gql(variables.as_ref());
         let future = gql::subscribe(&self.inner.schema, gql_request, &options);
-        match options.timeout {
-            Some(timeout) => timed_subscribe(timeout, future).await,
-            None => future.await,
-        }
+        self.await_subscribe(ResponseMeta::from_request(request), options.timeout, future)
+            .await
     }
 
     /// Determine the operation kind a request will execute.
@@ -573,6 +631,116 @@ impl Server {
             max_concurrency: inner.max_concurrency,
             timeout: inner.timeout,
         }
+    }
+
+    /// Apply the installed formatter to every error in a response.
+    pub(crate) fn format_response(
+        &self,
+        response: &mut gql::Response,
+        meta: ResponseMeta<'_>,
+        default_kind: ErrorKind,
+    ) {
+        let Some(formatter) = self.inner.error_formatter.as_deref() else {
+            return;
+        };
+        format_response_errors(
+            formatter,
+            response,
+            meta.operation_name,
+            meta.request_id,
+            default_kind,
+        );
+    }
+
+    /// Format a response built for a request error.
+    fn request_response(&self, request: &GraphQLRequest, response: gql::Response) -> gql::Response {
+        let mut response = response;
+        self.format_response(
+            &mut response,
+            ResponseMeta::from_request(request),
+            ErrorKind::Request,
+        );
+        response
+    }
+
+    /// Await execution and format its result.
+    ///
+    /// Responses from `gql::execute` mix request errors (parse, validation, coercion) with
+    /// execution errors. [`format_response`] classifies each error by its response path, so a
+    /// no-path error defaults to a request error. A wall-clock timeout is constructed here and
+    /// explicitly classified as an execution error.
+    async fn await_execute<F>(
+        &self,
+        meta: ResponseMeta<'_>,
+        timeout: Option<Duration>,
+        future: F,
+    ) -> gql::Response
+    where
+        F: Future<Output = gql::Response>,
+    {
+        let (mut response, kind) = match timeout {
+            Some(timeout) => match timed(timeout, future).await {
+                Some(response) => (response, ErrorKind::Request),
+                None => (operation_timeout_response(timeout), ErrorKind::Execution),
+            },
+            None => (future.await, ErrorKind::Request),
+        };
+        self.format_response(&mut response, meta, kind);
+        response
+    }
+
+    /// Await subscription setup, format failures and wrap the event stream.
+    #[allow(clippy::result_large_err)]
+    async fn await_subscribe<F>(
+        &self,
+        meta: ResponseMeta<'_>,
+        timeout: Option<Duration>,
+        future: F,
+    ) -> Result<SubscriptionResponse, gql::Response>
+    where
+        F: Future<Output = Result<SubscriptionResponse, gql::Response>>,
+    {
+        let outcome = match timeout {
+            Some(timeout) => timed_subscribe(timeout, future).await,
+            None => future
+                .await
+                .map_err(|response| (response, ErrorKind::Request)),
+        };
+        match outcome {
+            Ok(subscription) => Ok(self.format_subscription(subscription, meta)),
+            Err((mut response, kind)) => {
+                self.format_response(&mut response, meta, kind);
+                Err(response)
+            }
+        }
+    }
+
+    /// Format every response in a subscription's event stream.
+    ///
+    /// Mapping a stream preserves its order, so events keep the order the source produced them in.
+    fn format_subscription(
+        &self,
+        subscription: SubscriptionResponse,
+        meta: ResponseMeta<'_>,
+    ) -> SubscriptionResponse {
+        let Some(formatter) = self.inner.error_formatter.clone() else {
+            return subscription;
+        };
+        let meta = meta.into_owned();
+        let stream = subscription
+            .stream
+            .map(move |mut response| {
+                format_response_errors(
+                    formatter.as_ref(),
+                    &mut response,
+                    meta.operation_name.as_deref(),
+                    meta.request_id.as_deref(),
+                    ErrorKind::Execution,
+                );
+                response
+            })
+            .boxed();
+        SubscriptionResponse { stream }
     }
 }
 
@@ -637,57 +805,69 @@ fn operation_kind_from_text(
 /// that never yields would otherwise run forever. Transports that have a timer runtime wrap the
 /// future and turn an expiry into a normal GraphQL error response.
 #[cfg(feature = "axum")]
+#[allow(clippy::result_large_err)]
 async fn timed_subscribe<F>(
     timeout: Duration,
     future: F,
-) -> Result<gql::SubscriptionResponse, gql::Response>
+) -> Result<gql::SubscriptionResponse, (gql::Response, ErrorKind)>
 where
     F: std::future::Future<Output = Result<gql::SubscriptionResponse, gql::Response>>,
 {
     // `tokio::time` panics without a runtime; core `Server` execution must still work under a
     // plain futures executor. Without a reactor we fall back to gql's cooperative deadline.
     if tokio::runtime::Handle::try_current().is_err() {
-        return future.await;
+        return future
+            .await
+            .map_err(|response| (response, ErrorKind::Request));
     }
     match tokio::time::timeout(timeout, future).await {
-        Ok(response) => response,
-        Err(_) => Err(gql::Response::error(gql::GraphQLError::new(format!(
-            "The subscription timed out while starting after {timeout:?}."
-        )))),
+        Ok(response) => response.map_err(|response| (response, ErrorKind::Request)),
+        Err(_) => Err((subscribe_timeout_response(timeout), ErrorKind::Execution)),
     }
 }
 
 #[cfg(not(feature = "axum"))]
+#[allow(clippy::result_large_err)]
 async fn timed_subscribe<F>(
     _timeout: Duration,
     future: F,
-) -> Result<gql::SubscriptionResponse, gql::Response>
+) -> Result<gql::SubscriptionResponse, (gql::Response, ErrorKind)>
 where
     F: std::future::Future<Output = Result<gql::SubscriptionResponse, gql::Response>>,
 {
-    future.await
+    future
+        .await
+        .map_err(|response| (response, ErrorKind::Request))
 }
 
 #[cfg(feature = "axum")]
-async fn timed<F>(timeout: Duration, future: F) -> gql::Response
+async fn timed<F>(timeout: Duration, future: F) -> Option<gql::Response>
 where
     F: std::future::Future<Output = gql::Response>,
 {
     if tokio::runtime::Handle::try_current().is_err() {
-        return future.await;
+        return Some(future.await);
     }
-    match tokio::time::timeout(timeout, future).await {
-        Ok(response) => response,
-        Err(_) => gql::Response::error(gql::GraphQLError::new(format!(
-            "The operation timed out after {timeout:?}."
-        ))),
-    }
+    tokio::time::timeout(timeout, future).await.ok()
 }
 
 #[cfg(not(feature = "axum"))]
-async fn timed<F>(_timeout: Duration, future: F) -> gql::Response
+async fn timed<F>(_timeout: Duration, future: F) -> Option<gql::Response>
 where
     F: std::future::Future<Output = gql::Response>,
 {
-    future.await
+    Some(future.await)
+}
+
+fn operation_timeout_response(timeout: Duration) -> gql::Response {
+    gql::Response::error(gql::GraphQLError::new(format!(
+        "The operation timed out after {timeout:?}."
+    )))
+}
+
+#[cfg(feature = "axum")]
+fn subscribe_timeout_response(timeout: Duration) -> gql::Response {
+    gql::Response::error(gql::GraphQLError::new(format!(
+        "The subscription timed out while starting after {timeout:?}."
+    )))
 }

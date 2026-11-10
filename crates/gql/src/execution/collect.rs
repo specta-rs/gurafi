@@ -14,12 +14,12 @@ use smallvec::SmallVec;
 use crate::{
     Object, Value, ast,
     error::GraphQLError,
+    fragments::Fragments,
     schema::Schema,
     types::{ObjectType, names_eq},
 };
 
 use super::{
-    executor::FragmentMap,
     plan::{FieldPlan, GroupNodes, GroupView, PreparedPlan},
     selection::type_condition_matches,
 };
@@ -137,7 +137,7 @@ type FieldIndex<'a> = Option<FxHashMap<&'a str, usize>>;
 #[inline(always)]
 pub(crate) fn collect_fields_multi<'a>(
     schema: &Schema,
-    fragments: &FragmentMap<'a>,
+    fragments: &Fragments<'a>,
     variables: &Object,
     object_type: &'a ObjectType,
     selections: &Selections<'_, 'a>,
@@ -166,7 +166,7 @@ pub(crate) fn collect_fields_multi<'a>(
 #[inline(always)]
 pub(crate) fn collect_dynamic<'a>(
     schema: &Schema,
-    fragments: &FragmentMap<'a>,
+    fragments: &Fragments<'a>,
     variables: &Object,
     object_type: &'a ObjectType,
     selection_sets: &[&'a ast::SelectionSet<'a>],
@@ -198,7 +198,7 @@ pub(crate) fn collect_dynamic<'a>(
 /// contiguous, so the driver takes an iterator rather than a slice.
 fn collect_dynamic_iter<'a>(
     schema: &Schema,
-    fragments: &FragmentMap<'a>,
+    fragments: &Fragments<'a>,
     variables: &Object,
     object_type: &'a ObjectType,
     selection_sets: impl IntoIterator<Item = &'a ast::SelectionSet<'a>>,
@@ -227,7 +227,7 @@ fn collect_dynamic_iter<'a>(
 #[allow(clippy::too_many_arguments)]
 fn collect_into<'a>(
     schema: &Schema,
-    fragments: &FragmentMap<'a>,
+    fragments: &Fragments<'a>,
     variables: &Object,
     object_type: &'a ObjectType,
     selection_set: &'a ast::SelectionSet<'a>,

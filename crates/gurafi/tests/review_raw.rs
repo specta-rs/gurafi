@@ -364,13 +364,13 @@ fn interface_auth_schema() -> gql::Schema {
         i.field::<f32>("height");
     });
     schema.object::<Giraffe>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.raw_field::<String>("name");
         o.raw_field::<f32>("height");
     });
     schema.query(|q| {
         q.field("node", |_: NoArgs, _: &Ctx| raw_giraffe("Melman"))
-            .as_abstract(node);
+            .as_abstract(&node);
     });
     schema.build().expect("interface auth schema builds")
 }
@@ -401,13 +401,13 @@ fn interface_field_auth_applies_to_raw_fields() {
         i.field::<String>("id");
     });
     schema.object::<Giraffe>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.raw_field::<Option<String>>("name");
         o.raw_field::<String>("id");
     });
     schema.query(|q| {
         q.field("node", |_: NoArgs, _: &Ctx| raw_giraffe("Melman"))
-            .as_abstract(node);
+            .as_abstract(&node);
     });
     let schema = schema.build().expect("schema builds");
 
@@ -661,14 +661,14 @@ fn raw_abstract_value_without_a_type_marker_is_an_error() {
         i.field::<String>("name");
     });
     schema.object::<Giraffe>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.raw_field::<String>("name");
     });
     schema.query(|q| {
         q.field("node", |_: NoArgs, _: &Ctx| {
             Raw::<Giraffe>::object(RawObject::new().field("name", "Melman").build())
         })
-        .as_abstract(node);
+        .as_abstract(&node);
     });
     let schema = schema.build().expect("schema builds");
     let response = run(&schema, "{ node { name } }");
@@ -701,7 +701,7 @@ fn explicit_typename_wins_and_the_internal_key_is_ignored() {
                     .build(),
             )
         })
-        .as_abstract(search);
+        .as_abstract(&search);
     });
     let schema = schema.build().expect("schema builds");
     let response = run(
@@ -1021,7 +1021,7 @@ fn internal_typename_key_cannot_contradict_a_resolve_type_result() {
                     .build(),
             )
         })
-        .as_abstract(search);
+        .as_abstract(&search);
     });
     let schema = schema.build().expect("schema builds");
     let response = run(
@@ -1136,7 +1136,7 @@ fn a_raw_list_of_abstract_values_resolves_each_item() {
         i.field::<String>("name");
     });
     schema.object::<Giraffe>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.raw_field::<String>("name");
         o.raw_field::<f32>("height");
     });
@@ -1153,7 +1153,7 @@ fn a_raw_list_of_abstract_values_resolves_each_item() {
                 ),
             ])
         })
-        .as_abstract(node);
+        .as_abstract(&node);
     });
     let schema = schema.build().expect("schema builds");
     let response = run(
@@ -1225,12 +1225,12 @@ fn internal_typename_key_cannot_switch_to_a_less_protected_possible_type() {
         i.field::<String>("name");
     });
     schema.object::<Secret>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.auth(|_: &Ctx| false);
         o.raw_field::<String>("name");
     });
     schema.object::<Public>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.raw_field::<String>("name");
     });
     schema.query(|q| {
@@ -1245,7 +1245,7 @@ fn internal_typename_key_cannot_switch_to_a_less_protected_possible_type() {
                     .build(),
             )
         })
-        .as_abstract(node);
+        .as_abstract(&node);
     });
     let schema = schema.build().expect("schema builds");
     let response = run(
@@ -1275,7 +1275,7 @@ fn raw_objects_and_interface_fields_with_arguments() {
         i.field_with::<String, PictureArgs>("picture");
     });
     schema.object::<Giraffe>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.raw_field::<String>("name");
         // `raw_field_with` declares the argument type and installs a resolver, so the object
         // still satisfies the interface field while the value comes from the map.
@@ -1283,7 +1283,7 @@ fn raw_objects_and_interface_fields_with_arguments() {
     });
     schema.query(|q| {
         q.field("node", |_: NoArgs, _: &Ctx| raw_giraffe("Melman"))
-            .as_abstract(node);
+            .as_abstract(&node);
     });
     let schema = schema.build().expect("schema builds");
     let response = run(&schema, "{ node { name picture(width: 1280) } }");
@@ -1304,14 +1304,14 @@ fn abstract_resolution_failure_has_a_path() {
         i.field::<String>("name");
     });
     schema.object::<Giraffe>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.raw_field::<String>("name");
     });
     schema.query(|q| {
         q.field("node", |_: NoArgs, _: &Ctx| {
             Raw::<Giraffe>::object(RawObject::new().field("name", "Melman").build())
         })
-        .as_abstract(node);
+        .as_abstract(&node);
     });
     let schema = schema.build().expect("schema builds");
     let response = run(&schema, "{ alias: node { name } }");
@@ -1377,11 +1377,11 @@ fn a_raw_object_field_can_be_declared_abstract() {
         i.field::<String>("name");
     });
     schema.object::<Giraffe>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.raw_field::<String>("name");
     });
     schema.object::<Wrapper>(|o| {
-        o.raw_field::<Giraffe>("node").as_abstract(node);
+        o.raw_field::<Giraffe>("node").as_abstract(&node);
     });
     schema.query(|q| {
         q.field("wrapper", |_: NoArgs, _: &Ctx| {

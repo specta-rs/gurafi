@@ -43,7 +43,7 @@ fn schema() -> gql::Schema {
         i.field::<String>("description");
     });
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.field("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()))
             .description("The user's id.");
         o.expose(expose!(User::name));
@@ -52,7 +52,7 @@ fn schema() -> gql::Schema {
         });
     });
     schema.object::<Post>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.field("id", |p: &Post, _: NoArgs, _: &Ctx| {
             ID::new(p.title.clone())
         });
@@ -70,7 +70,7 @@ fn schema() -> gql::Schema {
             name: "ada".into(),
             age: 36,
         })
-        .as_abstract(node);
+        .as_abstract(&node);
         q.field("users", |f: Filter, _: &Ctx| {
             vec![User {
                 name: format!("ada{}", f.limit),
@@ -83,7 +83,7 @@ fn schema() -> gql::Schema {
                 age: 36,
             })
         })
-        .as_abstract(search_result);
+        .as_abstract(&search_result);
     });
     schema.build().expect("valid schema")
 }

@@ -152,6 +152,9 @@ o.field("name", |g: &Giraffe, _: NoArgs, _: &Ctx| g.name.clone())
 o.field("tags", |g: &Giraffe, _: NoArgs, _: &Ctx| g.tags.clone())
     .nullable_items();    // [String!]! becomes [String]!
 
+o.field("tags", |g: &Giraffe, _: NoArgs, _: &Ctx| g.tags.clone())
+    .non_null_items();    // [String]! becomes [String!]!, when items cannot be None
+
 o.field("date", |g: &Giraffe, _: NoArgs, _: &Ctx| g.date_string.clone())
     .returns::<Date>();   // checked replacement (as_type is an alias)
 ```
@@ -310,7 +313,7 @@ let node = schema.interface("Node", |i| {
 });
 
 schema.object::<User>(|o| {
-    o.implements(node);
+    o.implements(&node);
     o.expose(expose!(User::id));
     // ...
 });
@@ -322,7 +325,7 @@ from the interface needs only a resolver:
 
 ```rust
 schema.object::<User>(|o| {
-    o.implements(node);
+    o.implements(&node);
     o.resolve_inherited("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
 });
 ```
@@ -334,7 +337,7 @@ checks that the resolver's args type matches the interface declaration.
 
 Interfaces implemented indirectly are added automatically: if `Resource`
 implements `Node`, an object that implements `Resource` also gets `Node`
-without repeating `o.implements(node)`. Reopening an interface or object with
+without repeating `o.implements(&node)`. Reopening an interface or object with
 another `auth(...)` rule composes with the earlier rule (all must allow); a
 later `auth_error(...)` refines the message instead of replacing the rule.
 
@@ -349,7 +352,7 @@ schema.query(|q| {
     q.field_result("search", |args: SearchArgs, ctx: &Ctx| {
         gurafi::Result::Ok(search_results(args, ctx))
     })
-    .as_abstract(search);
+    .as_abstract(&search);
 });
 ```
 
@@ -357,6 +360,84 @@ Concrete models travel through the executor as `Value::External`; the object's
 generated `is_type_of` check tells the engine which member it is. `member::<M>()`
 registers a reference to `M`, so forgetting `schema.object::<M>(...)` is
 reported as the usual "never registered" build error.
+
+## Runtime-named types
+
+Most types have a name the derive can see. Relay wraps every list in a
+generated connection type (`UserPostsConnection`) and every mutation in a
+payload (`CreateUserPayload`), and those names only exist once the application
+decides they do. A reference separates the name from the model: the model still
+supplies `is_type_of`, descriptions and the value a resolver receives, while the
+name is plain runtime data (`Arc<str>` internally).
+
+```rust
+let admin = schema.object_ref::<User>("AdminUser");
+schema.implement(&admin, |o| {
+    o.field("id", |u: &User, _: NoArgs, _: &Ctx| u.name.clone());
+    o.expose(expose!(User::name));
+});
+
+schema.query(|q| {
+    q.field_ref(&admin, "admin", |_: NoArgs, _: &Ctx| current_admin());
+});
+```
+
+`object_ref` creates the object if the name is new, and `implement` reopens it,
+exactly like `object`/`object_fields`. The same name and model merge; a
+different Rust model claiming the name is a build error. Returned references are
+`Clone` but not `Copy`, so a reference can be stored and reused.
+
+`field_ref` takes the nullability and list wrappers from the resolver's Rust
+type, replacing only the named type: `User` becomes `AdminUser`, `Vec<User>`
+becomes `[AdminUser]!`, and `Option<Vec<User>>` becomes `[AdminUser]`. Use the
+usual `non_null`, `nullable`, `nullable_items` and `non_null_items` options
+afterwards. `field_ref` is available on object and root builders, plus a
+resolver-free form on interfaces.
+
+When the name is an interface or union, or the wrappers need to be explicit,
+build the type reference directly:
+
+```rust
+q.field_ref_type::<Vec<User>, NoArgs, _>(
+    admin.type_ref().non_null().list().non_null(),
+    "admins",
+    |_: NoArgs, _: &Ctx| all_admins(),
+);
+```
+
+`field_ref_type` checks that the wrappers are truthful for the Rust type and
+that the named type exists at build time. `FieldConfig::as_dynamic` is the same
+operation for fields whose builder is not available (`raw_field`, for example).
+`FieldConfig::as_object_ref` is the wrapper-preserving object form.
+
+Interfaces and unions have the same runtime API:
+
+```rust
+let node = schema.interface_ref("Node");
+schema.implement_interface(&node, |i| {
+    i.field::<ID>("id");
+});
+
+let search = schema.union_ref("SearchResult");
+schema.implement_union(&search, |u| {
+    u.member_ref(&admin);       // a runtime-named object
+    u.member::<Post>();         // a derived object
+});
+```
+
+An object reference cannot name an abstract type, so a field that resolves
+through an interface or union is declared with `field_ref(...)` and then widened
+with `as_abstract(&node)` / `as_abstract(&search)`. The abstract check uses the
+field's current named type, which makes that composition work even though the
+model's derived name is not in the schema. `possible_types` and
+`is_possible_type` on the reference answer the same questions as the built
+schema.
+
+A runtime-named union may differ from a derived `Union` type's name. Declare the
+field with `field_ref_type(union.type_ref(), ...)` and return the `Union` enum;
+the members still resolve through their `is_type_of` checks. For derived object,
+interface and union names nothing changes: `object`, `interface` and `union`
+return the same references and keep their current behaviour.
 
 ## Resolving a whole object (raw values)
 
@@ -469,7 +550,7 @@ let node = schema.interface("Node", |i| {
 
 // The object implements Node, so it declares the same fields (as raw fields here).
 schema.object::<Giraffe>(|o| {
-    o.implements(node);
+    o.implements(&node);
     o.raw_field::<gurafi::ID>("id");
     o.raw_field::<String>("name");
     o.raw_field::<f32>("height");
@@ -486,11 +567,11 @@ schema.query(|q| {
                 .build(),
         )
     })
-    .as_abstract(node);
+    .as_abstract(&node);
 });
 ```
 
-For a union, declare the union and add `.as_abstract(union)` to the field. If the union has a
+For a union, declare the union and add `.as_abstract(&union)` to the field. If the union has a
 `resolve_type` resolver it wins; otherwise `gql` reads `__typename` from the object map. The
 fallback `is_type_of` checks cannot see a raw map's Rust type, so a raw abstract value without
 either `__typename` or `resolve_type` is an execution error.

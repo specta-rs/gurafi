@@ -45,14 +45,14 @@ fn a_transitively_implemented_interface_is_added_for_the_object() {
         i.field::<ID>("id");
     });
     let resource = schema.interface("Resource", |i| {
-        i.implements(node);
+        i.implements(&node);
         // The specification requires the child interface to redeclare the parent's fields.
         i.field::<ID>("id");
         i.field::<String>("url");
     });
     schema.object::<User>(|o| {
         // `Node` is intentionally not declared again: the builder must add it.
-        o.implements(resource);
+        o.implements(&resource);
         o.field("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
         o.field("url", |u: &User, _: NoArgs, _: &Ctx| {
             format!("https://example.com/{}", u.name)
@@ -328,7 +328,7 @@ fn repeated_interface_auth_composes_across_reopens() {
         i.auth(|_: &Ctx| true);
     });
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.field("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
     });
     schema.query(|q| {
@@ -353,7 +353,7 @@ fn a_later_interface_auth_error_refines_the_existing_rule() {
         i.auth_error("Sign in to read nodes");
     });
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.field("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
     });
     schema.query(|q| {

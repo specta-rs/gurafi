@@ -108,13 +108,13 @@ pub(crate) async fn execute_event<'a>(
             "Schema is not configured for subscriptions.",
         ));
     };
-    let fragments = executor::FragmentMap::new(&prepared.document);
+    let fragments = crate::fragments::Fragments::new(&prepared.document);
     executor::run_operation(
         context,
         fragments,
         Some(&prepared.plan),
         root_type,
-        &operation.selection_set,
+        operation,
         event,
         deadline,
         true,

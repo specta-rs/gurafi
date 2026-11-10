@@ -44,7 +44,7 @@ let node = schema.interface("Node", |i| {
 
 schema.object::<Giraffe>(|o| {
     o.description("Long necks.");
-    o.implements(node);
+    o.implements(&node);
     o.expose(expose!(Giraffe::name));
     o.expose(expose!(Giraffe::height)).deprecated("Use heightMeters");
     o.field("id", |g: &Giraffe, _: NoArgs, _: &Ctx| ID::new(g.name.clone()));
@@ -329,7 +329,7 @@ implementing `Display`, `FromStr`, `Deref<Target = str>` and the conversion trai
 
 ## Interfaces and unions
 
-Interfaces are declared first and returned as a copyable `InterfaceRef`:
+Interfaces are declared first and returned as a cloneable `InterfaceRef`:
 
 ```rust
 let node = schema.interface("Node", |i| {
@@ -337,7 +337,7 @@ let node = schema.interface("Node", |i| {
 });
 
 schema.object::<Giraffe>(|o| {
-    o.implements(node);
+    o.implements(&node);
     o.field("id", |g: &Giraffe, _: NoArgs, _: &Ctx| ID::new(g.name.clone()));
     // ...
 });
@@ -372,13 +372,52 @@ let search = schema.union("SearchResult", |u| {
 });
 
 q.field("search", |_: NoArgs, _: &Ctx| SearchResult::User(User { name: "Oscar".into() }))
-    .as_abstract(search);
+    .as_abstract(&search);
 ```
 
 Runtime type resolution uses the `is_type_of` check that the object derive installs: every object
 model travels as `Value::External`, and the object type's check is a downcast to the model type.
 Override it per abstract type with `resolve_type` on the interface or union builder if you need
 custom resolution.
+
+## Runtime-named types
+
+Derived names are static, but some names are only known once the application builds the schema —
+Relay's `UserPostsConnection` and `CreateUserPayload` are the common case. A reference separates
+the GraphQL name from the Rust model: the model still drives `is_type_of` and resolvers, while
+the name is owned runtime data.
+
+```rust
+let admin = schema.object_ref::<User>("AdminUser");
+schema.implement(&admin, |o| {
+    o.expose(expose!(User::name));
+    o.field("id", |u: &User, _: NoArgs, _: &Ctx| u.name.clone());
+});
+
+schema.query(|q| {
+    q.field_ref(&admin, "admin", |_: NoArgs, _: &Ctx| current_admin());
+});
+```
+
+`object_ref` creates the object and `implement` reopens it, just like `object`/`object_fields`.
+The same model and name merge; a different model claiming the name is a build error. References
+are `Clone` (not `Copy`) and can be stored and reused. `interface_ref`/`implement_interface` and
+`union_ref`/`implement_union` are the interface and union equivalents; a union adds runtime-named
+members with `member_ref`.
+
+`field_ref` replaces only the named type, preserving the wrappers of the resolver's Rust type:
+`User` becomes `AdminUser`, `Vec<User>` becomes `[AdminUser]!`, and `Option<Vec<User>>` becomes
+`[AdminUser]`. Use `field_ref_type` (or `FieldConfig::as_dynamic`) when the name is an interface
+or union, or when the wrappers need to be explicit. Widening a runtime-named object to an
+interface or union composes with `as_abstract`:
+
+```rust
+q.field_ref(&admin, "node", |_: NoArgs, _: &Ctx| current_admin())
+    .as_abstract(&node);
+```
+
+Derived `object`, `interface` and `union` declarations are unchanged and now also return their
+reference.
 
 ## Resolving a whole object at once
 
@@ -414,7 +453,7 @@ q.field("giraffe", |_: NoArgs, _: &Ctx| {
 `Raw<Vec<Giraffe>>::list([...])` resolves a list, and `Raw<Option<Giraffe>>` (or
 `Raw::null()`) makes a nullable value. Nested objects are just another `RawObject` field.
 
-For an interface or union field, add `.as_abstract(node)` and either include
+For an interface or union field, add `.as_abstract(&node)` and either include
 `RawObject::typename("Giraffe")` in the map or install `resolve_type` on the abstract type.
 `gql` cannot infer the concrete type from a raw map, so one of the two is required.
 

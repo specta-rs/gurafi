@@ -21,6 +21,11 @@
 //!   complexity estimates, authorization, nullability and checked type overrides.
 //! - A type's definition can be split across modules with [`Schema::object_fields`],
 //!   [`Schema::interface_fields`] and the root `*_fields` methods; declarations merge.
+//! - Object, interface and union names can be computed at runtime with [`Schema::object_ref`],
+//!   [`Schema::interface_ref`] and [`Schema::union_ref`]. The reference keeps the model for
+//!   resolvers and `is_type_of`, while [`ObjectBuilder::field_ref`] and
+//!   [`FieldConfig::as_dynamic`] declare the runtime name in output positions. This is how
+//!   Relay-style `UserPostsConnection` and `CreateUserPayload` types are expressed.
 //!
 //! # Example
 //!
@@ -61,7 +66,7 @@
 //!
 //! schema.object::<Giraffe>(|o| {
 //!     o.description("Long necks.");
-//!     o.implements(node);
+//!     o.implements(&node);
 //!     o.expose(expose!(Giraffe::name));
 //!     o.expose(expose!(Giraffe::height)).deprecated("Use heightMeters");
 //!     o.field("id", |g: &Giraffe, _: NoArgs, _: &Ctx| ID::new(g.name.clone()));
@@ -157,14 +162,26 @@
 //! through unchanged, and mixing a raw field with a resolver-backed field is a build error. See
 //! [`Raw`] and [`RawObject`] for lists, abstract types, reserved `__gql_*` keys and the
 //! performance tradeoff.
+//!
+//! # Batching and per-request caches
+//!
+//! [`Loader`] collects loads issued in the same scheduler tick into one call of a user-supplied
+//! batch function, deduplicates keys that are already in flight, and caches each result for the
+//! rest of the request. It is spawn-free and executor-agnostic, so it needs no timer and no
+//! runtime-specific API. [`RequestCache`] is a type-keyed store scoped to one request, which is
+//! where loaders and other request-wide state belong: put both in the context passed to
+//! [`gql::ExecutionOptions::with_context`] and every resolver in that request shares them, while
+//! the next request starts empty.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod cache;
 mod error;
 mod expose;
 mod field;
 mod id;
+mod loader;
 mod raw;
 mod registry;
 mod schema;
@@ -173,17 +190,19 @@ mod value;
 
 pub use gql;
 
+pub use cache::RequestCache;
 pub use error::SchemaError;
 pub use expose::{__expose_name, Expose};
 pub use field::{FieldConfig, InterfaceFieldConfig};
 pub use gql::{GraphQLError, Value};
 pub use gurafi_macros::{Args, Enum, Input, Object, Scalar, Union};
 pub use id::ID;
+pub use loader::{Loader, LoaderConfig};
 pub use raw::{Raw, RawObject};
 pub use registry::TypeRegistry;
 pub use schema::{
-    BoxFuture, BuildOptions, InterfaceBuilder, InterfaceRef, ObjectBuilder, RootBuilder, Schema,
-    SubscriptionBuilder, UnionBuilder, UnionRef, type_ref,
+    BoxFuture, BuildOptions, InterfaceBuilder, InterfaceRef, ObjectBuilder, ObjectRef, RootBuilder,
+    Schema, SubscriptionBuilder, UnionBuilder, UnionRef, type_ref,
 };
 pub use traits::{
     AbstractType, EnumModel, FromValue, InputObject, InputType, IntoValue, NoArgs, ObjectModel,

@@ -27,6 +27,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::{
     Context, Server,
+    error::{ErrorKind, ResponseMeta},
     request::{GraphQLRequest, RequestError, RequestPayload},
     response::ResponseExt as _,
 };
@@ -182,6 +183,10 @@ impl From<GraphQLError> for HttpError {
 }
 
 /// Configuration for one HTTP mount point.
+///
+/// This configures transport behaviour only. Error formatting is configured once on [`Server`]
+/// with [`Server::format_error`] and applies to every mount, including request errors produced by
+/// this module.
 #[derive(Clone, Debug)]
 pub struct HttpConfig {
     /// The path the GraphQL endpoint is mounted at. Defaults to `/graphql`.
@@ -343,7 +348,7 @@ where
     match parts.method {
         Method::GET => handle_get(server, config, parts, &accept, extract_context).await,
         Method::POST => handle_post(server, config, parts, body, &accept, extract_context).await,
-        _ => HttpResult::Response(method_not_allowed()),
+        _ => HttpResult::Response(method_not_allowed(server)),
     }
 }
 
@@ -365,9 +370,11 @@ where
         .unwrap_or_else(|| server.max_body_bytes_limit());
     if max_query_bytes != 0 && parts.uri.query().map_or(0, str::len) > max_query_bytes {
         return request_error(
+            server,
             accept,
             StatusCode::PAYLOAD_TOO_LARGE,
             format!("Request query string exceeds the {max_query_bytes} byte limit."),
+            None,
         );
     }
 
@@ -376,7 +383,7 @@ where
     // discarded for the HTML response.
     let context = match extract_context(ContextRequest::from_parts(parts)).await {
         Ok(context) => context,
-        Err(error) => return context_error_response(accept, error),
+        Err(error) => return context_error_response(server, accept, error),
     };
 
     if config.graphiql && accept.html {
@@ -388,9 +395,11 @@ where
             Ok(parameters) => parameters,
             Err(error) => {
                 return request_error(
+                    server,
                     accept,
                     StatusCode::BAD_REQUEST,
                     format!("Invalid query string: {error}"),
+                    None,
                 );
             }
         };
@@ -405,7 +414,15 @@ where
 
     let mut request = match get_request(query, id, variables, operation_name, extensions) {
         Ok(request) => request,
-        Err(error) => return request_error(accept, StatusCode::BAD_REQUEST, error.message()),
+        Err(error) => {
+            return request_error(
+                server,
+                accept,
+                StatusCode::BAD_REQUEST,
+                error.message(),
+                None,
+            );
+        }
     };
     apply_header_id(&mut request, &parts.headers);
 
@@ -414,9 +431,11 @@ where
     // header can supply it too. Both are visible through `prepared_id()`.
     if request.query.trim().is_empty() && request.prepared_id().is_none() {
         return request_error(
+            server,
             accept,
             StatusCode::BAD_REQUEST,
             "Missing required `query` parameter.",
+            Some(&request),
         );
     }
 
@@ -430,7 +449,7 @@ where
             gql::ast::OperationKind::Mutation | gql::ast::OperationKind::Subscription
         ))
     ) {
-        return HttpResult::Response(method_not_allowed());
+        return HttpResult::Response(method_not_allowed(server));
     }
 
     process_payload(server, accept, RequestPayload::Single(request), context).await
@@ -450,9 +469,11 @@ where
 {
     if !is_json_content_type(parts.headers.get(header::CONTENT_TYPE)) {
         return request_error(
+            server,
             accept,
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "POST requests must use `Content-Type: application/json`.",
+            None,
         );
     }
 
@@ -461,15 +482,17 @@ where
         .unwrap_or_else(|| server.max_body_bytes_limit());
     if max_body_bytes != 0 && body.len() > max_body_bytes {
         return request_error(
+            server,
             accept,
             StatusCode::PAYLOAD_TOO_LARGE,
             format!("Request body exceeds the {max_body_bytes} byte limit."),
+            None,
         );
     }
 
     let context = match extract_context(ContextRequest::from_parts(parts)).await {
         Ok(context) => context,
-        Err(error) => return context_error_response(accept, error),
+        Err(error) => return context_error_response(server, accept, error),
     };
 
     let max_batch_size = config
@@ -477,7 +500,15 @@ where
         .unwrap_or_else(|| server.max_batch_size_limit());
     let payload = match RequestPayload::from_json_slice(body, max_batch_size) {
         Ok(payload) => payload,
-        Err(error) => return request_error(accept, StatusCode::BAD_REQUEST, error.message()),
+        Err(error) => {
+            return request_error(
+                server,
+                accept,
+                StatusCode::BAD_REQUEST,
+                error.message(),
+                None,
+            );
+        }
     };
     let mut payload = payload;
     apply_header_id_to_payload(&mut payload, &parts.headers);
@@ -502,24 +533,35 @@ async fn process_payload(
                     // `text/event-stream` is the only acceptable type. A malformed document or an
                     // unknown persisted identifier is still a request error, returned as JSON
                     // before any stream is opened.
+                    let mut response = Response::error(error.clone());
+                    server.format_response(
+                        &mut response,
+                        ResponseMeta::from_request(&request),
+                        ErrorKind::Request,
+                    );
                     return HttpResult::Response(json_response(
                         StatusCode::BAD_REQUEST,
                         accept,
-                        &Response::error(error.clone()),
+                        &response,
                     ));
                 }
             }
 
             if matches!(&kind, Ok(Some(gql::ast::OperationKind::Subscription))) {
-                let response = crate::response::error_response(
+                let mut response = crate::response::error_response(
                     "Subscriptions require `Accept: text/event-stream`.",
+                );
+                server.format_response(
+                    &mut response,
+                    ResponseMeta::from_request(&request),
+                    ErrorKind::Request,
                 );
                 let status = execution_status(&response, accept.json_or_legacy());
                 return HttpResult::Response(json_response(status, accept, &response));
             }
 
             if accept.json.is_none() {
-                return not_acceptable();
+                return not_acceptable(server);
             }
 
             let response = server.execute(&request, context).await;
@@ -536,14 +578,16 @@ async fn process_payload(
                 })
             {
                 return request_error(
+                    server,
                     accept,
                     StatusCode::BAD_REQUEST,
                     "Subscriptions cannot be batched.",
+                    None,
                 );
             }
 
             if accept.json.is_none() {
-                return not_acceptable();
+                return not_acceptable(server);
             }
 
             let responses = server.execute_batch(&requests, context).await;
@@ -640,38 +684,52 @@ fn json_batch_response(accept: &Accept, responses: &[Response]) -> HttpResponse 
     http
 }
 
-fn request_error(accept: &Accept, status: StatusCode, message: impl Into<String>) -> HttpResult {
-    HttpResult::Response(json_response(
-        status,
-        accept,
-        &crate::response::error_response(message),
-    ))
+fn request_error(
+    server: &Server,
+    accept: &Accept,
+    status: StatusCode,
+    message: impl Into<String>,
+    request: Option<&GraphQLRequest>,
+) -> HttpResult {
+    let mut response = crate::response::error_response(message);
+    let meta = request.map_or_else(ResponseMeta::none, ResponseMeta::from_request);
+    server.format_response(&mut response, meta, ErrorKind::Request);
+    HttpResult::Response(json_response(status, accept, &response))
 }
 
-fn context_error_response(accept: &Accept, error: HttpError) -> HttpResult {
+fn context_error_response(server: &Server, accept: &Accept, mut error: HttpError) -> HttpResult {
+    server.format_response(
+        &mut error.response,
+        ResponseMeta::none(),
+        ErrorKind::Request,
+    );
     let mut http = json_response(error.status, accept, &error.response);
     http.headers.extend(error.headers);
     HttpResult::Response(http)
 }
 
-fn method_not_allowed() -> HttpResponse {
+fn method_not_allowed(server: &Server) -> HttpResponse {
+    let mut response = crate::response::error_response("Only GET and POST are supported.");
+    server.format_response(&mut response, ResponseMeta::none(), ErrorKind::Request);
     let mut http = HttpResponse::with_body(
         StatusCode::METHOD_NOT_ALLOWED,
         "application/json; charset=utf-8",
-        crate::response::error_json_bytes("Only GET and POST are supported."),
+        response.to_json_bytes(),
     );
     http.headers
         .insert(header::ALLOW, HeaderValue::from_static("GET, POST"));
     http
 }
 
-fn not_acceptable() -> HttpResult {
+fn not_acceptable(server: &Server) -> HttpResult {
+    let mut response = crate::response::error_response(
+        "No acceptable response type; use `application/json` or `application/graphql-response+json`.",
+    );
+    server.format_response(&mut response, ResponseMeta::none(), ErrorKind::Request);
     HttpResult::Response(HttpResponse::with_body(
         StatusCode::NOT_ACCEPTABLE,
         "application/json; charset=utf-8",
-        crate::response::error_json_bytes(
-            "No acceptable response type; use `application/json` or `application/graphql-response+json`.",
-        ),
+        response.to_json_bytes(),
     ))
 }
 

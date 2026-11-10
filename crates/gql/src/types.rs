@@ -19,6 +19,7 @@ use crate::{
     Value, ast,
     error::{GraphQLError, PathSegment},
     execution::ExecutionContext,
+    fragments::Fragments,
     schema::Schema,
 };
 
@@ -1029,6 +1030,100 @@ pub struct ResolveInfo<'a> {
     pub path: &'a [PathSegment],
     /// The schema being executed.
     pub schema: &'a Schema,
+    /// Every field node merged into the field currently being resolved.
+    ///
+    /// Duplicate selections, aliases and fields reached through fragments all contribute a node
+    /// here, in document order. This is the selection information a resolver needs to implement
+    /// projections, batched loaders or other selection-aware behaviour.
+    pub field_nodes: ast::FieldNodes<'a>,
+    /// The operation definition being executed.
+    ///
+    /// `None` only for the rare synthetic resolver context that has no document, such as a
+    /// manually constructed [`ResolveInfo::new`] used by a test helper.
+    pub operation: Option<&'a ast::OperationDefinition<'a>>,
+    /// The document's fragment definitions, for resolving a spread named in
+    /// [`ResolveInfo::field_nodes`].
+    pub fragments: &'a Fragments<'a>,
+    /// The operation's root value, as supplied by the request.
+    ///
+    /// Root field resolvers receive this same value as `parent`. Subscription events use the
+    /// source event as their root value, matching the specification.
+    pub root_value: &'a Value,
+    /// The coerced variable values for this request, including defaults.
+    pub variables: &'a crate::Object,
+}
+
+/// An empty root value used by [`ResolveInfo::new`].
+static EMPTY_ROOT_VALUE: Value = Value::Null;
+/// Empty variables used by [`ResolveInfo::new`].
+static EMPTY_VARIABLES: std::sync::LazyLock<crate::Object> =
+    std::sync::LazyLock::new(crate::Object::new);
+/// An empty fragment lookup used by [`ResolveInfo::new`].
+static EMPTY_FRAGMENTS: std::sync::LazyLock<Fragments<'static>> =
+    std::sync::LazyLock::new(Fragments::empty);
+
+impl<'a> ResolveInfo<'a> {
+    /// Build field information without selection context.
+    ///
+    /// Execution populates the selection fields itself. This constructor is for callers that
+    /// invoke a resolver directly (introspection tooling, tests, custom dispatchers); chain the
+    /// `with_*` methods to attach context.
+    #[must_use]
+    pub fn new(
+        field_name: &'a str,
+        parent_type: &'a str,
+        return_type: &'a TypeRef,
+        path: &'a [PathSegment],
+        schema: &'a Schema,
+    ) -> Self {
+        Self {
+            field_name,
+            parent_type,
+            return_type,
+            path,
+            schema,
+            field_nodes: ast::FieldNodes::empty(),
+            operation: None,
+            fragments: &EMPTY_FRAGMENTS,
+            root_value: &EMPTY_ROOT_VALUE,
+            variables: &EMPTY_VARIABLES,
+        }
+    }
+
+    /// Attach the merged field nodes being resolved.
+    #[must_use]
+    pub fn with_field_nodes(mut self, field_nodes: ast::FieldNodes<'a>) -> Self {
+        self.field_nodes = field_nodes;
+        self
+    }
+
+    /// Attach the operation definition being executed.
+    #[must_use]
+    pub fn with_operation(mut self, operation: &'a ast::OperationDefinition<'a>) -> Self {
+        self.operation = Some(operation);
+        self
+    }
+
+    /// Attach the document's fragment definitions.
+    #[must_use]
+    pub fn with_fragments(mut self, fragments: &'a Fragments<'a>) -> Self {
+        self.fragments = fragments;
+        self
+    }
+
+    /// Attach the operation's root value.
+    #[must_use]
+    pub fn with_root_value(mut self, root_value: &'a Value) -> Self {
+        self.root_value = root_value;
+        self
+    }
+
+    /// Attach the request's coerced variables.
+    #[must_use]
+    pub fn with_variables(mut self, variables: &'a crate::Object) -> Self {
+        self.variables = variables;
+        self
+    }
 }
 
 /// Everything a resolver can see about the current field.

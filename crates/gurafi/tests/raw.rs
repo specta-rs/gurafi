@@ -91,7 +91,7 @@ fn build_raw_schema() -> gql::Schema {
     });
 
     schema.object::<Giraffe>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.raw_field::<ID>("id");
         o.raw_field::<String>("name");
         o.raw_field::<f32>("height");
@@ -139,7 +139,7 @@ fn build_raw_schema() -> gql::Schema {
         q.field("node", |_: NoArgs, _: &Ctx| {
             raw_interface_giraffe("Melman", 3.4)
         })
-        .as_abstract(node);
+        .as_abstract(&node);
 
         q.field("search", |_: NoArgs, _: &Ctx| {
             Raw::<User>::object(
@@ -149,7 +149,7 @@ fn build_raw_schema() -> gql::Schema {
                     .build(),
             )
         })
-        .as_abstract(search);
+        .as_abstract(&search);
 
         // No `__typename`: the union's `resolve_type` reads the extra `kind` field instead.
         q.field("searchByKind", |_: NoArgs, _: &Ctx| {
@@ -160,7 +160,7 @@ fn build_raw_schema() -> gql::Schema {
                     .build(),
             )
         })
-        .as_abstract(search);
+        .as_abstract(&search);
 
         // A declared object whose value is not an object: the executor reports a field error.
         q.field("wrongShape", |_: NoArgs, _: &Ctx| {
@@ -595,7 +595,7 @@ fn a_raw_abstract_value_cannot_select_its_type_with_the_internal_key() {
                 ("title", Value::from("attacker chosen")),
             ])))
         })
-        .as_abstract(search);
+        .as_abstract(&search);
     });
     let schema = schema.build().expect("schema builds");
 
@@ -676,7 +676,7 @@ fn raw_field_with_satisfies_an_interface_field_with_arguments() {
         i.field_with::<String, PictureArgs>("picture");
     });
     schema.object::<Giraffe>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.raw_field::<String>("name");
         o.raw_field_with::<String, PictureArgs>("picture");
     });
@@ -690,7 +690,7 @@ fn raw_field_with_satisfies_an_interface_field_with_arguments() {
                     .build(),
             )
         })
-        .as_abstract(node);
+        .as_abstract(&node);
     });
     let schema = schema.build().expect("schema builds");
 

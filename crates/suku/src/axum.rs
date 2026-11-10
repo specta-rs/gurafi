@@ -46,6 +46,7 @@ use crate::{
         ContextRequest, ExtractContext, HttpConfig, HttpError, HttpResponse, HttpResult,
         SseResponse,
     },
+    response::ResponseExt as _,
 };
 
 /// An Axum integration builder for a GraphQL server.
@@ -197,6 +198,7 @@ async fn handler(State(state): State<Arc<HandlerState>>, request: Request) -> Ax
         Ok(body) => body,
         Err(_) => {
             return error_response(
+                &state.server,
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "Request body could not be read or exceeded the size limit.",
             );
@@ -233,8 +235,14 @@ fn stream_response(response: SseResponse) -> AxumResponse {
     out
 }
 
-fn error_response(status: StatusCode, message: &str) -> AxumResponse {
-    let mut response = AxumResponse::new(Body::from(crate::response::error_json_bytes(message)));
+fn error_response(server: &Server, status: StatusCode, message: &str) -> AxumResponse {
+    let mut error = crate::response::error_response(message);
+    server.format_response(
+        &mut error,
+        crate::error::ResponseMeta::none(),
+        crate::error::ErrorKind::Request,
+    );
+    let mut response = AxumResponse::new(Body::from(error.to_json_bytes()));
     *response.status_mut() = status;
     response.headers_mut().insert(
         header::CONTENT_TYPE,

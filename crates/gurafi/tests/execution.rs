@@ -124,7 +124,7 @@ fn build_schema() -> gql::Schema {
     });
 
     schema.object::<Giraffe>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.field("id", |g: &Giraffe, _: NoArgs, _: &Ctx| {
             ID::new(match g.name.as_str() {
                 "Melman" => "1",
@@ -147,7 +147,7 @@ fn build_schema() -> gql::Schema {
     });
 
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.field("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
         o.expose(expose!(User::name));
     });
@@ -200,10 +200,10 @@ fn build_schema() -> gql::Schema {
                 name: "Oscar".into(),
             })
         })
-        .as_abstract(search);
+        .as_abstract(&search);
 
         q.field("node", |_: NoArgs, _: &Ctx| Giraffe::sample("Melman"))
-            .as_abstract(node);
+            .as_abstract(&node);
 
         q.field_result(
             "fail",

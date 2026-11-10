@@ -238,13 +238,13 @@ fn call(
         _ => panic!("{parent_type} is not a composite type"),
     };
     let definition = fields.get(field_name).expect("field definition exists");
-    let info = ResolveInfo {
-        field_name: definition.name.as_ref(),
+    let info = ResolveInfo::new(
+        definition.name.as_ref(),
         parent_type,
-        return_type: &definition.ty,
-        path: &[],
+        &definition.ty,
+        &[],
         schema,
-    };
+    );
     let resolver = definition.resolve.as_ref().expect("field has a resolver");
     let resolver_context = ResolverContext {
         parent,

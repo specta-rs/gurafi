@@ -7,6 +7,7 @@
 use std::{
     any::TypeId,
     collections::{HashMap, HashSet},
+    sync::Arc,
 };
 
 use gql::{GraphQLError, InputObjectType, Type};
@@ -26,9 +27,9 @@ use crate::{
 pub struct TypeRegistry {
     types: IndexMap<String, Type>,
     /// Object names referenced by fields but registered separately by `schema.object`.
-    referenced_objects: HashSet<&'static str>,
+    referenced_objects: HashSet<Arc<str>>,
     /// Union names referenced by an output type but registered by `schema.union`.
-    referenced_unions: HashSet<&'static str>,
+    referenced_unions: HashSet<Arc<str>>,
     /// Input types currently being registered, used to stop recursion on self-referential
     /// input objects.
     in_progress: HashSet<String>,
@@ -57,14 +58,14 @@ impl TypeRegistry {
 
     /// Record that an object type is used by an output position.
     #[doc(hidden)]
-    pub fn reference_object(&mut self, name: &'static str) {
-        self.referenced_objects.insert(name);
+    pub fn reference_object(&mut self, name: impl Into<Arc<str>>) {
+        self.referenced_objects.insert(name.into());
     }
 
     /// Record that a union type is used by an output position.
     #[doc(hidden)]
-    pub fn reference_union(&mut self, name: &'static str) {
-        self.referenced_unions.insert(name);
+    pub fn reference_union(&mut self, name: impl Into<Arc<str>>) {
+        self.referenced_unions.insert(name.into());
     }
 
     /// Register an enum type.
@@ -212,12 +213,12 @@ impl TypeRegistry {
     }
 
     /// The names of object types referenced by output positions.
-    pub(crate) fn referenced_objects(&self) -> &HashSet<&'static str> {
+    pub(crate) fn referenced_objects(&self) -> &HashSet<Arc<str>> {
         &self.referenced_objects
     }
 
     /// The names of union types referenced by output positions.
-    pub(crate) fn referenced_unions(&self) -> &HashSet<&'static str> {
+    pub(crate) fn referenced_unions(&self) -> &HashSet<Arc<str>> {
         &self.referenced_unions
     }
 
@@ -228,13 +229,13 @@ impl TypeRegistry {
 }
 
 impl AbstractType for crate::schema::InterfaceRef {
-    fn abstract_name(&self) -> &'static str {
+    fn abstract_name(&self) -> &str {
         self.name()
     }
 }
 
 impl AbstractType for crate::schema::UnionRef {
-    fn abstract_name(&self) -> &'static str {
+    fn abstract_name(&self) -> &str {
         self.name()
     }
 }

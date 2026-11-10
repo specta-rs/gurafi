@@ -191,7 +191,7 @@ where
         extensions: std::sync::Mutex::new(None),
     };
 
-    let fragments = executor::FragmentMap::new(document);
+    let fragments = crate::fragments::Fragments::new(document);
     let plan = prepared.as_ref().map(|prepared| prepared.plan);
     let selection_sets = [&operation.selection_set];
     let selections = collect::Selections::new(&selection_sets, plan.and_then(|plan| plan.root()));
@@ -256,12 +256,18 @@ where
         .map_err(Response::error)?;
 
     let path = vec![PathSegment::field(response_key)];
+    let field_nodes = [node];
     let info = ResolveInfo {
         field_name: field.name.as_ref(),
         parent_type: subscription_type.name.as_ref(),
         return_type: &field.ty,
         path: &path,
         schema,
+        field_nodes: ast::FieldNodes::borrowed(&field_nodes),
+        operation: Some(operation),
+        fragments: &fragments,
+        root_value: &options.root_value,
+        variables: &context.variables,
     };
 
     if let Some(authorizer) = &context.authorizer {

@@ -125,15 +125,15 @@ fn interface_auth_is_inherited_through_a_parent_interface() {
         i.field::<ID>("id");
     });
     let resource = schema.interface("Resource", |i| {
-        i.implements(node);
+        i.implements(&node);
         // An interface that implements another must redeclare its fields (spec 3.6).
         i.field::<ID>("id");
         i.field::<String>("url");
     });
     schema.object::<User>(|o| {
-        o.implements(resource);
+        o.implements(&resource);
         // Transitive interfaces must be declared too (spec validator rule).
-        o.implements(node);
+        o.implements(&node);
         o.field("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
         o.field("url", |u: &User, _: NoArgs, _: &Ctx| {
             format!("https://example.com/{}", u.name)
@@ -169,7 +169,7 @@ fn auth_declared_on_a_reopened_interface_field_is_inherited() {
         i.field::<String>("secret").auth(|ctx: &Ctx| ctx.logged_in);
     });
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.field("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
         o.field("secret", |_u: &User, _: NoArgs, _: &Ctx| "shh".to_owned());
     });
@@ -245,7 +245,7 @@ fn object_auth_guards_inherited_interface_resolvers() {
     });
     schema.object::<User>(|o| {
         o.auth(|ctx: &Ctx| ctx.logged_in);
-        o.implements(node);
+        o.implements(&node);
         o.resolve_inherited("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
     });
     schema.query(|q| {
@@ -270,7 +270,7 @@ fn async_interface_auth_is_inherited() {
         i.field::<ID>("id");
     });
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.field("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
     });
     schema.query(|q| {
@@ -502,7 +502,7 @@ fn resolve_inherited_accepts_a_non_null_override_of_a_nullable_interface_field()
         i.field::<Option<String>>("label");
     });
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.resolve_inherited("label", |u: &User, _: NoArgs, _: &Ctx| u.name.clone());
     });
     schema.query(|q| {
@@ -528,13 +528,13 @@ fn resolve_inherited_walks_parent_interfaces() {
         i.field::<ID>("id");
     });
     let resource = schema.interface("Resource", |i| {
-        i.implements(node);
+        i.implements(&node);
         i.field::<ID>("id");
         i.field::<String>("url");
     });
     schema.object::<User>(|o| {
-        o.implements(resource);
-        o.implements(node);
+        o.implements(&resource);
+        o.implements(&node);
         o.resolve_inherited("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
         o.resolve_inherited("url", |u: &User, _: NoArgs, _: &Ctx| {
             format!("https://example.com/{}", u.name)
@@ -566,7 +566,7 @@ fn resolve_inherited_keeps_the_interface_arguments_and_defaults() {
         i.field_with::<String, Page>("page").description("A page.");
     });
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.resolve_inherited("page", |u: &User, args: Page, _: &Ctx| {
             format!("{}:{}", u.name, args.first)
         });
@@ -604,7 +604,7 @@ fn resolve_inherited_rejects_a_nullable_resolver_for_a_non_null_interface_field(
         i.field::<ID>("id");
     });
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.resolve_inherited("id", |_u: &User, _: NoArgs, _: &Ctx| Some(ID::new("x")));
     });
     schema.query(|q| {
@@ -638,7 +638,7 @@ fn reopening_preserves_object_is_type_of_and_interface_resolve_type() {
         i.description("A pet.");
     });
     schema.object::<Cat>(|o| {
-        o.implements(pet);
+        o.implements(&pet);
         o.expose(expose!(Cat::name));
     });
     schema.object_fields::<Cat>(|o| {
@@ -646,7 +646,7 @@ fn reopening_preserves_object_is_type_of_and_interface_resolve_type() {
     });
     schema.query(|q| {
         q.field("pet", |_: NoArgs, _: &Ctx| Cat { name: "Tom".into() })
-            .as_abstract(pet);
+            .as_abstract(&pet);
     });
     let schema = schema.build().expect("schema builds");
     assert_eq!(
@@ -688,7 +688,7 @@ fn reopening_a_union_preserves_description_members_and_resolve_type() {
     });
     schema.query(|q| {
         q.field("pet", |_: NoArgs, _: &Ctx| Dog { name: "Rex".into() })
-            .as_abstract(pet);
+            .as_abstract(&pet);
     });
     let schema = schema.build().expect("schema builds");
     let union = schema.union_type("Pet").expect("Pet");
@@ -814,7 +814,7 @@ fn unnamed_input_used_as_interface_field_arguments_works() {
         i.field_with::<String, ListArgs>("label");
     });
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.field("label", |u: &User, args: ListArgs, _: &Ctx| {
             format!("{}:{:?}", u.name, args.limit)
         });
@@ -1058,7 +1058,7 @@ fn building_from_a_clone_does_not_leak_guards_or_inheritance() {
     });
     schema.object::<User>(|o| {
         o.auth(|ctx: &Ctx| ctx.logged_in);
-        o.implements(node);
+        o.implements(&node);
         o.resolve_inherited("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
         o.expose(expose!(User::name));
     });
@@ -1197,7 +1197,7 @@ fn union_resolve_type_survives_reopening() {
     });
     schema.query(|q| {
         q.field("pet", |_: NoArgs, _: &Ctx| Cat { name: "Tom".into() })
-            .as_abstract(pet);
+            .as_abstract(&pet);
     });
     let schema = schema.build().expect("schema builds");
     let response = run(&schema, "{ pet { __typename } }", Ctx::anonymous());
@@ -1223,12 +1223,12 @@ fn interface_resolve_type_survives_reopening() {
         i.field::<i32>("age");
     });
     schema.object::<Cat>(|o| {
-        o.implements(pet);
+        o.implements(&pet);
         o.expose(expose!(Cat::name));
         o.field("age", |_: &Cat, _: NoArgs, _: &Ctx| 9i32);
     });
     schema.object::<User>(|o| {
-        o.implements(pet);
+        o.implements(&pet);
         o.expose(expose!(User::name));
         o.field("age", |u: &User, _: NoArgs, _: &Ctx| u.age);
     });
@@ -1237,7 +1237,7 @@ fn interface_resolve_type_survives_reopening() {
     });
     schema.query(|q| {
         q.field("pet", |_: NoArgs, _: &Ctx| Cat { name: "Tom".into() })
-            .as_abstract(pet);
+            .as_abstract(&pet);
     });
     let schema = schema.build().expect("schema builds");
     let response = run(&schema, "{ pet { __typename } }", Ctx::anonymous());
@@ -1503,13 +1503,13 @@ fn resolve_inherited_accepts_an_abstract_covariant_return() {
         i.field::<ID>("id");
     });
     let resource = schema.interface("Resource", |i| {
-        i.implements(node);
+        i.implements(&node);
         i.field::<ID>("id");
         i.field::<Option<ID>>("owner");
     });
     schema.object::<User>(|o| {
-        o.implements(resource);
-        o.implements(node);
+        o.implements(&resource);
+        o.implements(&node);
         o.field("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
         // Interface says `owner: ID`, the resolver returns a concrete object is nonsense, so
         // this checks the simpler case: the interface declares `Option<ID>` and the object's
@@ -1542,7 +1542,7 @@ fn resolve_inherited_copies_the_interface_deprecation() {
         i.field::<String>("oldName").deprecated("Use `name`.");
     });
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.resolve_inherited("oldName", |u: &User, _: NoArgs, _: &Ctx| u.name.clone());
     });
     schema.query(|q| {
@@ -1851,7 +1851,7 @@ fn object_auth_applies_when_the_object_is_reached_through_a_union() {
         q.field("thing", |_: NoArgs, _: &Ctx| Secret {
             value: "shh".into(),
         })
-        .as_abstract(thing);
+        .as_abstract(&thing);
     });
     let schema = schema.build().expect("schema builds");
 
@@ -2055,7 +2055,7 @@ fn resolve_inherited_finds_interface_fields_added_after_the_object() {
         i.field::<ID>("id");
     });
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.field("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
         o.resolve_inherited("label", |u: &User, _: NoArgs, _: &Ctx| u.name.clone());
     });
@@ -2086,7 +2086,7 @@ fn as_abstract_preserves_list_wrappers_and_resolves_each_item() {
         i.field::<ID>("id");
     });
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.field("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
         o.expose(expose!(User::name));
     });
@@ -2103,14 +2103,14 @@ fn as_abstract_preserves_list_wrappers_and_resolves_each_item() {
                 },
             ]
         })
-        .as_abstract(node);
+        .as_abstract(&node);
         q.field("maybeNodes", |_: NoArgs, _: &Ctx| {
             Some(vec![User {
                 name: "c".into(),
                 age: 3,
             }])
         })
-        .as_abstract(node);
+        .as_abstract(&node);
     });
     let schema = schema.build().expect("schema builds");
     let query_type = schema.object_type("Query").expect("Query");

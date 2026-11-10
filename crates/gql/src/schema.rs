@@ -6,6 +6,10 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 use rustc_hash::{FxBuildHasher, FxHashSet};
 
+mod composition;
+
+pub use composition::{FieldTransform, SchemaTransform};
+
 use crate::{
     Value,
     error::GraphQLError,

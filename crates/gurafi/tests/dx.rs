@@ -197,7 +197,7 @@ fn types_and_roots_can_be_reopened() {
     });
 
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.expose(expose!(User::name));
         o.field("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
         o.field("label", |u: &User, _: NoArgs, _: &Ctx| u.name.clone());
@@ -393,7 +393,7 @@ fn as_type_from_a_model_to_an_abstract_type_checks_possible_types() {
         i.field::<ID>("id");
     });
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.field("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
         o.expose(expose!(User::name));
     });
@@ -545,7 +545,7 @@ fn interface_level_auth_is_inherited_by_objects() {
         i.field::<ID>("id");
     });
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.field("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
         o.expose(expose!(User::name));
     });
@@ -556,7 +556,7 @@ fn interface_level_auth_is_inherited_by_objects() {
                 age: 36,
             })
         })
-        .as_abstract(node);
+        .as_abstract(&node);
     });
     let schema = schema.build().expect("schema builds");
 
@@ -589,7 +589,7 @@ fn interface_field_auth_is_inherited_by_objects() {
         i.field::<ID>("id").auth(|ctx: &Ctx| ctx.logged_in);
     });
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.field("id", |u: &User, _: NoArgs, _: &Ctx| ID::new(u.name.clone()));
         o.expose(expose!(User::name));
     });
@@ -875,7 +875,7 @@ fn resolve_inherited_copies_type_and_arguments_from_the_interface() {
             .description("Inherited label.");
     });
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.resolve_inherited("label", |u: &User, _: IdArgs, _: &Ctx| {
             format!("user:{}", u.name)
         });
@@ -915,7 +915,7 @@ fn resolve_inherited_reports_missing_fields_and_argument_mismatches() {
         i.field_with::<String, OtherArgs>("label");
     });
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.resolve_inherited("label", |u: &User, _: IdArgs, _: &Ctx| u.name.clone());
     });
     schema.query(|q| {
@@ -937,7 +937,7 @@ fn resolve_inherited_reports_missing_fields_and_argument_mismatches() {
         i.field::<ID>("id");
     });
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         o.resolve_inherited("missing", |u: &User, _: NoArgs, _: &Ctx| u.name.clone());
     });
     schema.query(|q| {
@@ -957,7 +957,7 @@ fn resolve_inherited_reports_missing_fields_and_argument_mismatches() {
         i.field::<String>("label");
     });
     schema.object::<User>(|o| {
-        o.implements(node);
+        o.implements(&node);
         // The interface declares String, but the resolver returns an integer.
         o.resolve_inherited("label", |u: &User, _: NoArgs, _: &Ctx| u.age);
     });

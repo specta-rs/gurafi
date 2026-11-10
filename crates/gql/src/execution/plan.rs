@@ -243,6 +243,14 @@ impl<'s, 'a> GroupNodes<'s, 'a> {
         }
     }
 
+    /// The merged nodes as references, used to build resolver-visible field information.
+    pub(crate) fn field_node_refs(&self) -> SmallVec<[&'a ast::Field<'a>; 2]> {
+        match self {
+            Self::Borrowed(nodes) => nodes.iter().copied().collect(),
+            Self::Planned(nodes) => nodes.iter().map(|node| &**node).collect(),
+        }
+    }
+
     /// The nodes' sub-selections, merged in document order.
     #[inline]
     pub(crate) fn selection_sets(&self) -> SmallVec<[&'a ast::SelectionSet<'a>; 2]> {

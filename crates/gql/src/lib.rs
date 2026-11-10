@@ -38,6 +38,7 @@ pub mod ast;
 pub mod complexity;
 mod error;
 pub mod execution;
+mod fragments;
 mod introspection;
 pub mod parser;
 pub mod prepared;
@@ -48,17 +49,20 @@ mod types;
 pub mod validation;
 mod value;
 
+pub use ast::{FieldNodes, FieldNodesIter};
 pub use error::{GraphQLError, Location, PathSegment, Response, Result};
 pub use execution::{
     AuthorizationContext, Authorizer, ExecutionContext, ExecutionOptions, Request, ResponseStream,
     SubscriptionResponse, execute, subscribe,
 };
+pub use fragments::Fragments;
 pub use prepared::{
     PreparedQuery, PreparedQueryError, PreparedQueryRegistry, PreparedQueryRegistryError,
     execute_prepared,
 };
 pub use schema::{
-    Schema, SchemaBuilder, SchemaChange, SchemaDiff, SchemaError, diff, is_output_subtype,
+    FieldTransform, Schema, SchemaBuilder, SchemaChange, SchemaDiff, SchemaError, SchemaTransform,
+    diff, is_output_subtype,
 };
 pub use sdl_schema::schema_from_sdl;
 pub use types::{
