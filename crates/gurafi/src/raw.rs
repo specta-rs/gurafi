@@ -138,7 +138,7 @@ impl<T> Raw<T> {
     ///
     /// The value's shape is otherwise not inspected. If it does not have the shape `T` describes,
     /// execution reports a field error (except for custom scalar values, which pass through
-    /// unchanged; see the [module docs](self)).
+    /// unchanged; see the module documentation).
     #[must_use]
     pub fn new(value: Value) -> Self {
         Self {

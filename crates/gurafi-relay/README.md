@@ -311,6 +311,20 @@ MutationConfig::new().client_mutation_id(ClientMutationId::Required);
 - `Connection::from_slice` clones items into edges; use cheap/`Clone` node values, or build edges
   directly for large payloads.
 
+## Observability
+
+`gurafi-relay` has an optional `tracing` feature that propagates to `gurafi` and `gql`:
+
+```toml
+[dependencies]
+gurafi-relay = { version = "0.0.1", features = ["tracing"] }
+```
+
+It adds DEBUG spans for `relay.node`, `relay.nodes`, `relay.connection.page` and
+`relay.mutation`, with requested/resolved/null/error counts, cache hits, loader calls, page-info
+flags and edge counts. Cursor and local-ID values are never recorded. See
+[`docs/observability.md`](../../docs/observability.md).
+
 ## Tests
 
 ```sh

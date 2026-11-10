@@ -524,6 +524,22 @@ fn cache_key(typename: &str, local: &str) -> String {
     format!("{typename}:{local}")
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        skip_all,
+        level = "debug",
+        name = "relay.node",
+        fields(
+            requested = 1usize,
+            allow_local,
+            cache_hit = tracing::field::Empty,
+            loader_calls = tracing::field::Empty,
+            resolved = tracing::field::Empty,
+            errors = tracing::field::Empty,
+        )
+    )
+)]
 async fn resolve_one<Ctx: 'static>(
     entries: &[NodeTypeEntry<Ctx>],
     cache: Option<&Arc<NodeResultCache>>,
@@ -544,9 +560,28 @@ async fn resolve_one<Ctx: 'static>(
             };
             let key = cache_key(&entry.typename, &decoded.local_id);
             if let Some(cached) = cache.and_then(|cache| cache.get(&key)) {
+                #[cfg(feature = "tracing")]
+                {
+                    let span = tracing::Span::current();
+                    if !span.is_disabled() {
+                        span.record("cache_hit", true);
+                    }
+                }
                 return cached;
             }
             let value = (entry.load_one)(decoded.local_id, ctx).await;
+            #[cfg(feature = "tracing")]
+            {
+                let span = tracing::Span::current();
+                if !span.is_disabled() {
+                    span.record("cache_hit", false);
+                    span.record("loader_calls", 1usize);
+                    span.record("resolved", matches!(&value, Ok(Some(_))));
+                    if value.is_err() {
+                        span.record("errors", 1usize);
+                    }
+                }
+            }
             if let Some(cache) = cache {
                 cache.insert(key, value.clone());
             }
@@ -580,6 +615,23 @@ async fn resolve_one<Ctx: 'static>(
     }
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        skip_all,
+        level = "debug",
+        name = "relay.nodes",
+        fields(
+            requested = ids.len(),
+            allow_local,
+            cache_hits = tracing::field::Empty,
+            loader_calls = tracing::field::Empty,
+            resolved = tracing::field::Empty,
+            nulls = tracing::field::Empty,
+            errors = tracing::field::Empty,
+        )
+    )
+)]
 async fn resolve_many<Ctx: 'static>(
     entries: &[NodeTypeEntry<Ctx>],
     cache: Option<&Arc<NodeResultCache>>,
@@ -587,6 +639,10 @@ async fn resolve_many<Ctx: 'static>(
     ids: &[ID],
     allow_local: bool,
 ) -> Result<Vec<Option<Value>>, GraphQLError> {
+    #[cfg(feature = "tracing")]
+    let mut cache_hits = 0usize;
+    #[cfg(feature = "tracing")]
+    let mut loader_calls = 0usize;
     let mut results: Vec<Option<Value>> = vec![None; ids.len()];
     let mut resolved = vec![false; ids.len()];
     let mut global: Vec<(&str, Vec<(usize, String)>)> = Vec::new();
@@ -606,6 +662,10 @@ async fn resolve_many<Ctx: 'static>(
                 };
                 let key = cache_key(&entry.typename, &decoded.local_id);
                 if let Some(cached) = cache.and_then(|cache| cache.get(&key)) {
+                    #[cfg(feature = "tracing")]
+                    {
+                        cache_hits += 1;
+                    }
                     match cached {
                         Ok(value) => {
                             results[index] = value;
@@ -641,6 +701,10 @@ async fn resolve_many<Ctx: 'static>(
             if !unique.contains(local_id) {
                 unique.push(local_id.clone());
             }
+        }
+        #[cfg(feature = "tracing")]
+        {
+            loader_calls += 1;
         }
         let values = (entry.load_many)(unique.clone(), ctx).await?;
         let by_id: HashMap<&str, &Option<Value>> = unique
@@ -698,6 +762,10 @@ async fn resolve_many<Ctx: 'static>(
                 break;
             }
 
+            #[cfg(feature = "tracing")]
+            {
+                loader_calls += 1;
+            }
             let values = (entry.load_many)(unique.clone(), ctx).await?;
             for (index, local_id) in &local {
                 if resolved[*index] {
@@ -719,5 +787,16 @@ async fn resolve_many<Ctx: 'static>(
         }
     }
 
+    #[cfg(feature = "tracing")]
+    {
+        let span = tracing::Span::current();
+        if !span.is_disabled() {
+            let resolved = results.iter().filter(|value| value.is_some()).count();
+            span.record("cache_hits", cache_hits);
+            span.record("loader_calls", loader_calls);
+            span.record("resolved", resolved);
+            span.record("nulls", results.len().saturating_sub(resolved));
+        }
+    }
     Ok(results)
 }

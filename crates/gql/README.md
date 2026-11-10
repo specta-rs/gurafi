@@ -87,4 +87,21 @@ request variables.
 | Feature | Default | Description |
 | --- | --- | --- |
 | `serde` | yes | `serde::Serialize` for `Value`, `Object`, `GraphQLError` and `Response` |
-| `tracing` | no | tracing spans around parsing and execution |
+| `tracing` | no | optional spans for parsing, validation, execution, fields, subscriptions and schema construction |
+
+
+## Observability
+
+Enable the optional feature to instrument parsing, validation, variable coercion, field execution,
+subscriptions and schema construction:
+
+```toml
+[dependencies]
+gql = { version = "0.2", features = ["tracing"] }
+```
+
+Spans are hierarchical (`gql.execute` → `gql.execute_operation` → `gql.field`) and record shapes,
+counts and timings rather than variable values, arguments or document text. Field spans are DEBUG
+and collection spans are TRACE; enable them while investigating an operation, and keep INFO for
+request summaries. See [`docs/observability.md`](../../docs/observability.md) for the full catalog
+and the recommended `tracing-subscriber` setup.

@@ -108,9 +108,17 @@ impl RequestCache {
     {
         let entry = {
             let entries = self.entries.read().unwrap_or_else(PoisonError::into_inner);
-            Arc::clone(entries.get(&TypeId::of::<T>())?)
+            entries.get(&TypeId::of::<T>()).map(Arc::clone)
         };
-        entry.downcast::<T>().ok()
+        #[cfg(feature = "tracing")]
+        if tracing::enabled!(target: "gurafi::cache", tracing::Level::TRACE) {
+            tracing::trace!(
+                target: "gurafi::cache",
+                hit = entry.is_some(),
+                "gurafi.cache.lookup"
+            );
+        }
+        entry?.downcast::<T>().ok()
     }
 
     /// Return the stored value of type `T`, building it with `init` if it is absent.
@@ -138,6 +146,15 @@ impl RequestCache {
 
         let value = Arc::new(init());
         entries.insert(TypeId::of::<T>(), Arc::clone(&value) as Stored);
+        #[cfg(feature = "tracing")]
+        if tracing::enabled!(target: "gurafi::cache", tracing::Level::TRACE) {
+            tracing::trace!(
+                target: "gurafi::cache",
+                hit = false,
+                inserted = true,
+                "gurafi.cache.lookup"
+            );
+        }
         value
     }
 

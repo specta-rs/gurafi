@@ -464,7 +464,21 @@ impl Server {
     /// Parse, validation, variable coercion and resolver errors all come back inside the returned
     /// response, exactly as the GraphQL specification requires. If an error formatter is
     /// installed, every error in the response has already passed through it.
-    #[tracing::instrument(skip(self, request, context), level = "debug")]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            level = "debug",
+            name = "suku.execute",
+            fields(
+                operation = request.operation_name.as_deref().unwrap_or("<anonymous>"),
+                prepared = request.prepared_id().is_some(),
+                document_bytes = request.query.len(),
+                variable_count = request.variables.as_ref().map_or(0, serde_json::Map::len),
+                errors = tracing::field::Empty,
+            )
+        )
+    )]
     pub async fn execute(&self, request: &GraphQLRequest, context: Context) -> gql::Response {
         let variables = match request.variables_object() {
             Ok(variables) => variables,
@@ -510,6 +524,15 @@ impl Server {
     /// Concurrency is bounded by [`Server::batch_concurrency`]. A request with invalid variables
     /// produces its own error response; it does not fail the batch. Each response is formatted
     /// independently, so a formatter never reorders a batch.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            level = "debug",
+            name = "suku.execute_batch",
+            fields(batch_size = requests.len(), concurrency = self.inner.batch_concurrency)
+        )
+    )]
     pub async fn execute_batch(
         &self,
         requests: &[GraphQLRequest],
@@ -538,7 +561,18 @@ impl Server {
     ///
     /// Returns a fully formed error response when the request is not a valid subscription or the
     /// source stream could not be created.
-    #[tracing::instrument(skip(self, request, context), level = "debug")]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            level = "debug",
+            name = "suku.subscription",
+            fields(
+                operation = request.operation_name.as_deref().unwrap_or("<anonymous>"),
+                prepared = request.prepared_id().is_some(),
+            )
+        )
+    )]
     pub async fn subscribe(
         &self,
         request: &GraphQLRequest,

@@ -10,6 +10,7 @@ Rust crates for building GraphQL servers.
 - [Typed error result unions](schema/errors.md) — exposing `Result<T, E>` as a GraphQL union of success and error payloads
 - [Serving over HTTP](server/suku.md) — requests, batches, subscriptions, limits, auth
 - [Schema evolution](schema/evolution.md) — compatibility diffing and SDL snapshots
+- [Observability](observability.md) — the optional `tracing` feature, span tree and performance tips
 
 ## Define a schema
 

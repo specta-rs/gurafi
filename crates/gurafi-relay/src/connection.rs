@@ -142,6 +142,24 @@ impl<T> Connection<T> {
     ///
     /// Returns a GraphQL error for negative `first`/`last` values, malformed cursors, or cursors
     /// that are not present in `items`.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            level = "debug",
+            name = "relay.connection.page",
+            fields(
+                items = items.len(),
+                first = args.first.is_some(),
+                after = args.after.is_some(),
+                last = args.last.is_some(),
+                before = args.before.is_some(),
+                edges = tracing::field::Empty,
+                has_next_page = tracing::field::Empty,
+                has_previous_page = tracing::field::Empty,
+            )
+        )
+    )]
     pub fn from_slice<F, C>(
         items: &[T],
         args: &ConnectionArgs,
@@ -213,6 +231,15 @@ impl<T> Connection<T> {
             end_cursor: edges.last().map(|edge| edge.cursor.clone()),
         };
 
+        #[cfg(feature = "tracing")]
+        {
+            let span = tracing::Span::current();
+            if !span.is_disabled() {
+                span.record("edges", edges.len());
+                span.record("has_next_page", page_info.has_next_page);
+                span.record("has_previous_page", page_info.has_previous_page);
+            }
+        }
         Ok(Self {
             edges,
             page_info,
@@ -248,6 +275,24 @@ impl<T> Connection<T> {
     /// # Errors
     ///
     /// Same as [`Connection::from_slice`].
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            level = "debug",
+            name = "relay.connection.page",
+            fields(
+                items = items.len(),
+                first = args.first.is_some(),
+                after = args.after.is_some(),
+                last = args.last.is_some(),
+                before = args.before.is_some(),
+                edges = tracing::field::Empty,
+                has_next_page = tracing::field::Empty,
+                has_previous_page = tracing::field::Empty,
+            )
+        )
+    )]
     pub fn from_slice_by_index(items: &[T], args: &ConnectionArgs) -> Result<Self, GraphQLError>
     where
         T: Clone,
@@ -308,6 +353,15 @@ impl<T> Connection<T> {
             start_cursor: edges.first().map(|edge| edge.cursor.clone()),
             end_cursor: edges.last().map(|edge| edge.cursor.clone()),
         };
+        #[cfg(feature = "tracing")]
+        {
+            let span = tracing::Span::current();
+            if !span.is_disabled() {
+                span.record("edges", edges.len());
+                span.record("has_next_page", page_info.has_next_page);
+                span.record("has_previous_page", page_info.has_previous_page);
+            }
+        }
         Ok(Self {
             edges,
             page_info,

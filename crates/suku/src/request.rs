@@ -213,6 +213,15 @@ impl RequestPayload {
     ///
     /// Returns a request error for malformed JSON, an invalid payload shape, or a batch that
     /// violates the configured limits.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            level = "debug",
+            name = "suku.parse",
+            fields(body_bytes = body.len(), max_batch_size)
+        )
+    )]
     pub fn from_json_slice(body: &[u8], max_batch_size: usize) -> Result<Self, RequestError> {
         let is_batch = body
             .iter()

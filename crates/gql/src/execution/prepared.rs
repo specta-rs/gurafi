@@ -138,6 +138,15 @@ pub(crate) enum BuildPreparedError {
 /// Parsing, validation and operation selection happen here, once. The operation index and the
 /// introspection compatibility errors are stored alongside the document so per-request execution
 /// only has to borrow them.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        skip_all,
+        level = "info",
+        name = "gql.prepare",
+        fields(source_bytes = source.len(), operation = operation_name.unwrap_or("<anonymous>"))
+    )
+)]
 pub(crate) fn build<'a>(
     schema: &Schema,
     source: &'a str,

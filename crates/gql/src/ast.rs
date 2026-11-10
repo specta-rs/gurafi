@@ -241,7 +241,7 @@ impl<'a> FieldNodes<'a> {
 
     /// Field nodes borrowed from a document.
     ///
-    /// This is public so custom dispatchers and test helpers can build a [`ResolveInfo`]
+    /// This is public so custom dispatchers and test helpers can build a [`crate::ResolveInfo`]
     /// equivalent to the one execution produces.
     #[must_use]
     pub const fn new(nodes: &'a [&'a Field<'a>]) -> Self {

@@ -157,6 +157,15 @@ pub(crate) struct PluginTargets<'a> {
 ///
 /// Object- and interface-level authorization is installed after this function, so those rules
 /// remain outside the plugin chain.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        skip_all,
+        level = "debug",
+        name = "gurafi.schema.plugins",
+        fields(plugins = plugins.len(), fields_visited = tracing::field::Empty)
+    )
+)]
 pub(crate) fn apply_plugins<Ctx: 'static>(
     plugins: &[Arc<dyn Plugin<Ctx>>],
     targets: PluginTargets<'_>,
@@ -164,6 +173,24 @@ pub(crate) fn apply_plugins<Ctx: 'static>(
     if plugins.is_empty() {
         return;
     }
+
+    #[cfg(feature = "tracing")]
+    let fields_visited = {
+        let targets = &targets;
+        targets
+            .objects
+            .values()
+            .map(|object| object.fields.len())
+            .sum::<usize>()
+            + targets
+                .interfaces
+                .values()
+                .map(|interface| interface.fields.len())
+                .sum::<usize>()
+            + targets.query.len()
+            + targets.mutation.len()
+            + targets.subscription.len()
+    };
 
     let PluginTargets {
         objects,
@@ -194,6 +221,14 @@ pub(crate) fn apply_plugins<Ctx: 'static>(
     }
     for field in subscription.iter_mut() {
         apply_to_field(plugins, subscription_name, field, true, true, true);
+    }
+
+    #[cfg(feature = "tracing")]
+    {
+        let span = tracing::Span::current();
+        if !span.is_disabled() {
+            span.record("fields_visited", fields_visited);
+        }
     }
 }
 

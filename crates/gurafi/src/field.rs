@@ -137,6 +137,10 @@ impl<Ctx: 'static> AuthGuard<Ctx> {
         })
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, level = "trace", name = "gurafi.auth")
+    )]
     fn check<'r>(&self, context: &'r Ctx) -> BoxFuture<'r, Result<(), GraphQLError>> {
         let message = Arc::clone(&self.message);
         match &self.predicate {
@@ -232,6 +236,15 @@ impl<Ctx: 'static> ValidationSlot<Ctx> {
     }
 
     /// Run the installed validator, if any.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            level = "trace",
+            name = "gurafi.validator",
+            fields(args = std::any::type_name::<A>())
+        )
+    )]
     pub(crate) fn run<A: 'static>(&self, args: &A, ctx: &Ctx) -> Result<(), GraphQLError> {
         match self.hook.get() {
             Some(hook) => hook(args, ctx),
@@ -922,7 +935,14 @@ pub(crate) fn apply_auth_guard<Ctx: 'static>(field: &mut Field, guard: Arc<AuthG
             Box::pin(async move {
                 let ctx = context.context.require_data::<Ctx>()?;
                 guard.check(ctx).await?;
-                resolve(context).await
+                let _span = crate::telemetry::span_if_enabled!(
+                    tracing::Level::TRACE,
+                    "gurafi",
+                    "gurafi.resolver",
+                    parent_type = context.info.parent_type,
+                    field = context.info.field_name,
+                );
+                crate::telemetry::instrument_span!(_span.clone(), resolve(context)).await
             })
         }));
     }

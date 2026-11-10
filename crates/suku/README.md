@@ -259,6 +259,22 @@ headers, cookies and HTTP extensions.
 Batches must be non-empty. `Server::max_batch_size` (or `HttpConfig::max_batch_size`) rejects
 oversized arrays, and `Server::batch_concurrency` bounds how many operations run at once.
 
+## Observability
+
+`suku` has an optional `tracing` feature; it also enables `gql/tracing`, so a request span is
+followed by the parser/executor tree:
+
+```toml
+[dependencies]
+suku = { version = "0.0.1", features = ["tracing"] }
+```
+
+`suku.request` is INFO and records method, path, body size, operation, request id, batch size and
+status. Its children cover parsing, execution, serialization and subscriptions. Transport and
+extractor failures are WARN events with a status and code. Bodies, headers, tokens and variable
+values are never recorded. See [`docs/observability.md`](../../docs/observability.md) for the span
+tree and the recommended `tracing-subscriber` setup.
+
 ## Tests
 
 ```sh

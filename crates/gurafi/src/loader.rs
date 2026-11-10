@@ -256,6 +256,9 @@ struct State<K, V, E> {
     /// In-flight batches, keyed by id.
     batches: HashMap<u64, SharedBatch<V, E>>,
     next_batch: u64,
+    /// Loads that joined a key already queued or in flight, for the batch event.
+    #[cfg(feature = "tracing")]
+    deduplicated: usize,
 }
 
 struct Inner<K, V, E> {
@@ -349,6 +352,8 @@ impl<K, V, E> Loader<K, V, E> {
                 queued: HashSet::new(),
                 batches: HashMap::new(),
                 next_batch: 0,
+                #[cfg(feature = "tracing")]
+                deduplicated: 0,
             }),
             weak: weak.clone(),
         });
@@ -494,16 +499,29 @@ where
     fn enqueue(&self, key: K) {
         let mut state = self.lock();
         if state.entries.contains_key(&key) {
+            #[cfg(feature = "tracing")]
+            {
+                state.deduplicated += 1;
+            }
             return;
         }
         if state.queue.len() >= self.config.max_queue {
             self.flush_locked(&mut state);
             if state.entries.contains_key(&key) {
+                #[cfg(feature = "tracing")]
+                {
+                    state.deduplicated += 1;
+                }
                 return;
             }
         }
         if state.queued.insert(key.clone()) {
             state.queue.push_back(key);
+        } else {
+            #[cfg(feature = "tracing")]
+            {
+                state.deduplicated += 1;
+            }
         }
     }
 
@@ -518,7 +536,12 @@ where
 
     fn flush_locked(&self, state: &mut State<K, V, E>) {
         while !state.queue.is_empty() {
-            let take = state.queue.len().min(self.config.max_batch_size);
+            let queued = state.queue.len();
+            #[cfg(feature = "tracing")]
+            let deduplicated = std::mem::take(&mut state.deduplicated);
+            #[cfg(not(feature = "tracing"))]
+            let deduplicated = 0usize;
+            let take = queued.min(self.config.max_batch_size);
             let keys: Vec<K> = state.queue.drain(..take).collect();
             for key in &keys {
                 state.queued.remove(key);
@@ -532,7 +555,7 @@ where
                     .insert(key.clone(), Entry::Pending { batch, index });
             }
 
-            let shared = self.start_batch(batch, keys);
+            let shared = self.start_batch(batch, keys, queued, deduplicated);
             state.batches.insert(batch, shared);
         }
     }
@@ -541,10 +564,18 @@ where
     ///
     /// The closure is only invoked once a waiter polls this future, so no user code runs while
     /// the state lock is held (Flush constructs the future under the lock).
-    fn start_batch(&self, batch: u64, keys: Vec<K>) -> SharedBatch<V, E> {
+    fn start_batch(
+        &self,
+        batch: u64,
+        keys: Vec<K>,
+        _queued: usize,
+        _deduplicated: usize,
+    ) -> SharedBatch<V, E> {
         let batch_fn = Arc::clone(&self.batch_fn);
         let weak = self.weak.clone();
         async move {
+            #[cfg(feature = "tracing")]
+            let started = std::time::Instant::now();
             let results: BatchOutput<V, E> = Arc::new(
                 batch_fn(keys.clone())
                     .await
@@ -552,6 +583,27 @@ where
                     .map(Arc::new)
                     .collect(),
             );
+            #[cfg(feature = "tracing")]
+            if tracing::enabled!(target: "gurafi::loader", tracing::Level::DEBUG) {
+                let errors = results.iter().filter(|result| result.is_err()).count();
+                tracing::debug!(
+                    target: "gurafi::loader",
+                    queue_len = _queued,
+                    batch_size = keys.len(),
+                    deduplicated = _deduplicated,
+                    duration_us = started.elapsed().as_micros() as u64,
+                    errors,
+                    "gurafi.loader.batch"
+                );
+                if errors > 0 {
+                    tracing::debug!(
+                        target: "gurafi::loader",
+                        batch_size = keys.len(),
+                        errors,
+                        "gurafi.loader.error"
+                    );
+                }
+            }
             if let Some(inner) = weak.upgrade() {
                 inner.complete(batch, &keys, &results);
             }
@@ -608,9 +660,36 @@ where
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            level = "debug",
+            name = "gurafi.loader.load",
+            fields(
+                key_type = std::any::type_name::<K>(),
+                cache_hit = tracing::field::Empty,
+            )
+        )
+    )]
     async fn load(self: Arc<Self>, key: K) -> Result<V, E> {
         if let Some(result) = self.cached(&key) {
+            #[cfg(feature = "tracing")]
+            {
+                let span = tracing::Span::current();
+                if !span.is_disabled() {
+                    span.record("cache_hit", true);
+                }
+            }
             return (*result).clone();
+        }
+
+        #[cfg(feature = "tracing")]
+        {
+            let span = tracing::Span::current();
+            if !span.is_disabled() {
+                span.record("cache_hit", false);
+            }
         }
 
         self.enqueue(key.clone());

@@ -538,6 +538,15 @@ pub(crate) fn build_empty<'a>() -> PreparedPlan<'a> {
 ///
 /// Planning never fails: anything it cannot model exactly simply stays unplanned, and the executor
 /// falls back to dynamic collection for that selection.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        skip_all,
+        level = "debug",
+        name = "gql.plan",
+        fields(operation = operation.name.unwrap_or("<anonymous>"), root_type = root_type.name.as_ref())
+    )
+)]
 pub(crate) fn build<'a>(
     schema: &Schema,
     document: &ast::Document<'a>,
