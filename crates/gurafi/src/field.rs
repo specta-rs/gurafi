@@ -6,7 +6,7 @@ use std::{
 };
 
 use futures::future::BoxFuture;
-use gql::{ComplexityFn, Field, GraphQLError, Name, TypeRef};
+use gql::{AppliedDirective, ComplexityFn, Field, GraphQLError, Name, TypeRef};
 use indexmap::IndexMap;
 
 use crate::{
@@ -290,6 +290,7 @@ pub struct FieldConfig<'a, Ctx: 'static> {
     name: Name,
     description: Option<Arc<str>>,
     deprecation: Option<Arc<str>>,
+    directives: Vec<AppliedDirective>,
     complexity: Option<Complexity>,
     auth: Option<GuardPredicate<Ctx>>,
     auth_error: Option<Arc<str>>,
@@ -406,6 +407,7 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
             name,
             description: None,
             deprecation: None,
+            directives: Vec::new(),
             complexity: None,
             auth: None,
             auth_error: None,
@@ -446,6 +448,17 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
     /// Mark the field as deprecated with a reason shown by introspection.
     pub fn deprecated(&mut self, reason: impl Into<Arc<str>>) -> &mut Self {
         self.deprecation = Some(reason.into());
+        self
+    }
+
+    /// Apply a directive to this field.
+    ///
+    /// Each call adds an application in declaration order, so a repeatable directive can appear
+    /// more than once. The application is checked against its definition when the schema is
+    /// built; see [`crate::Schema::directive`]. Field directives print in SDL and are visible to
+    /// [`crate::Plugin::field`] through `gql::Field::directives`.
+    pub fn directive(&mut self, directive: AppliedDirective) -> &mut Self {
+        self.directives.push(directive);
         self
     }
 
@@ -813,6 +826,9 @@ impl<Ctx: 'static> Drop for FieldConfig<'_, Ctx> {
         if let Some(deprecation) = self.deprecation.take() {
             field.deprecation_reason = Some(deprecation);
         }
+        if !self.directives.is_empty() {
+            field.directives.append(&mut self.directives);
+        }
         if let Some(complexity) = self.complexity.take() {
             field.complexity = Some(match complexity {
                 Complexity::Fixed(value) => Arc::new(move |_| value),
@@ -860,6 +876,16 @@ impl<'a, Ctx: 'static> InterfaceFieldConfig<'a, Ctx> {
     /// Mark the field as deprecated with a reason shown by introspection.
     pub fn deprecated(&mut self, reason: impl Into<Arc<str>>) -> &mut Self {
         self.inner.deprecated(reason);
+        self
+    }
+
+    /// Apply a directive to this interface field.
+    ///
+    /// The directive stays on the interface field. An implementing object that declares the
+    /// field through [`crate::ObjectBuilder::resolve_inherited`] copies the interface field's
+    /// directives that it does not already carry.
+    pub fn directive(&mut self, directive: AppliedDirective) -> &mut Self {
+        self.inner.directive(directive);
         self
     }
 

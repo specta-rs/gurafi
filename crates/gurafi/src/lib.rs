@@ -192,6 +192,70 @@
 //! and [`MockPlugin`] replaces named fields for tests. See the [`plugin`] module for ordering,
 //! coverage and the full hook documentation.
 //!
+//! # Custom directives
+//!
+//! A directive is registered once with [`Schema::directive`] and applied where it belongs. The
+//! definition is the `gql` model, so descriptions, arguments, repeatability and locations come
+//! from the usual builders:
+//!
+//! ```
+//! use gurafi::{NoArgs, Object, Schema};
+//!
+//! struct Ctx;
+//!
+//! #[derive(Object)]
+//! struct Giraffe {
+//!     name: String,
+//! }
+//!
+//! let mut schema = Schema::<Ctx>::new();
+//! schema.directive(
+//!     gql::DirectiveDefinition::new("tag")
+//!         .description("A documentation tag.")
+//!         .location(gql::ast::DirectiveLocation::Object)
+//!         .location(gql::ast::DirectiveLocation::FieldDefinition)
+//!         .repeatable()
+//!         .arg(gql::InputValue::new("name", gql::TypeRef::string())),
+//! );
+//!
+//! // Apply by name; the type may be registered before or after this call.
+//! schema.type_directive(
+//!     "Giraffe",
+//!     gql::AppliedDirective::new("tag").argument("name", "animal"),
+//! );
+//!
+//! schema.object::<Giraffe>(|o| {
+//!     o.directive(gql::AppliedDirective::new("tag").argument("name", "declared"));
+//!     o.field("name", |g: &Giraffe, _: NoArgs, _: &Ctx| g.name.clone())
+//!         .directive(gql::AppliedDirective::new("tag").argument("name", "public"));
+//! });
+//! schema.query(|q| {
+//!     q.field("giraffe", |_: NoArgs, _: &Ctx| Giraffe { name: "Melman".into() });
+//! });
+//!
+//! let sdl = schema.build().expect("valid schema").sdl();
+//! assert!(sdl.contains("type Giraffe @tag(name: \"declared\") @tag(name: \"animal\")"));
+//! assert!(sdl.contains("name: String! @tag(name: \"public\")"));
+//! ```
+//!
+//! Applications attach at the declaration site with [`ObjectBuilder::directive`],
+//! [`InterfaceBuilder::directive`], [`UnionBuilder::directive`], [`FieldConfig::directive`] and
+//! [`InterfaceFieldConfig::directive`]. Types registered elsewhere use
+//! [`Schema::type_directive`], which accepts an object, interface, union, scalar, enum, input
+//! object or root operation type and works whether the type already exists or is registered
+//! later. Field arguments and input object fields use [`Schema::argument_directive`] and
+//! [`Schema::input_field_directive`].
+//!
+//! Definitions are validated by the same rules as SDL: an unknown directive, a location the
+//! definition does not allow, a wrong argument type, a missing required argument and a repeated
+//! use of a non-repeatable directive are build errors. Definitions appear in SDL and in
+//! introspection's `__schema.directives`; applications appear in SDL. Standard introspection has
+//! no field for *applied* directives, so a client that needs them reads the SDL.
+//!
+//! The `#[graphql(directive = "...")]` derive attribute is not implemented. A directive on a
+//! derived type or field is declared on the builder instead, which keeps every application in
+//! the schema where the rest of the type's shape is defined.
+//!
 //! # Batching and per-request caches
 //!
 //! [`Loader`] collects loads issued in the same scheduler tick into one call of a user-supplied

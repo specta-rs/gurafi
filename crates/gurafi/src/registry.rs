@@ -329,6 +329,15 @@ impl TypeRegistry {
         &self.referenced_unions
     }
 
+    /// The named definitions registered so far.
+    ///
+    /// Used by [`crate::Schema::build`] to apply directives declared before the type existed.
+    /// Scalars, enums and input objects live here; objects, interfaces and unions are held by the
+    /// schema itself.
+    pub(crate) fn types_mut(&mut self) -> &mut IndexMap<String, Type> {
+        &mut self.types
+    }
+
     /// Consume the registry into its named definitions, in registration order.
     pub(crate) fn into_types(self) -> IndexMap<String, Type> {
         self.types

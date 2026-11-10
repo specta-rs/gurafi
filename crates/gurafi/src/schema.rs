@@ -37,7 +37,7 @@ use std::{
 };
 
 use futures::{Stream, StreamExt};
-use gql::{GraphQLError, Name, TypeRef};
+use gql::{AppliedDirective, DirectiveDefinition, GraphQLError, Name, TypeRef};
 use indexmap::IndexMap;
 
 use crate::{
@@ -348,6 +348,15 @@ pub struct Schema<Ctx: 'static = ()> {
     interface_auth_error: IndexMap<String, Arc<str>>,
     interface_field_auth: IndexMap<String, IndexMap<Name, Arc<AuthGuard<Ctx>>>>,
     pending_inherited: Vec<PendingInherited>,
+    /// Custom directive definitions registered with [`Schema::directive`].
+    directive_definitions: Vec<DirectiveDefinition>,
+    /// Directive applications for named types, kept by name so a type registered later still
+    /// receives them.
+    type_directives: IndexMap<Name, Vec<AppliedDirective>>,
+    /// Directive applications for field arguments, keyed by type, field and argument name.
+    argument_directives: Vec<(Name, Name, Name, AppliedDirective)>,
+    /// Directive applications for input object fields, keyed by type and field name.
+    input_field_directives: Vec<(Name, Name, AppliedDirective)>,
     /// Build-time extensions, applied to every field once when the schema is built.
     plugins: Vec<Arc<dyn Plugin<Ctx>>>,
     marker: PhantomData<fn() -> Ctx>,
@@ -378,6 +387,10 @@ impl<Ctx: 'static> Clone for Schema<Ctx> {
             interface_auth_error: self.interface_auth_error.clone(),
             interface_field_auth: self.interface_field_auth.clone(),
             pending_inherited: self.pending_inherited.clone(),
+            directive_definitions: self.directive_definitions.clone(),
+            type_directives: self.type_directives.clone(),
+            argument_directives: self.argument_directives.clone(),
+            input_field_directives: self.input_field_directives.clone(),
             plugins: self.plugins.clone(),
             marker: PhantomData,
         }
@@ -434,6 +447,10 @@ impl<Ctx: 'static> Schema<Ctx> {
             interface_auth_error: IndexMap::new(),
             interface_field_auth: IndexMap::new(),
             pending_inherited: Vec::new(),
+            directive_definitions: Vec::new(),
+            type_directives: IndexMap::new(),
+            argument_directives: Vec::new(),
+            input_field_directives: Vec::new(),
             plugins: Vec::new(),
             marker: PhantomData,
         }
@@ -480,6 +497,224 @@ impl<Ctx: 'static> Schema<Ctx> {
     /// ```
     pub fn plugin<P: Plugin<Ctx>>(&mut self, plugin: P) -> &mut Self {
         self.plugins.push(Arc::new(plugin));
+        self
+    }
+
+    /// Register a custom directive definition.
+    ///
+    /// The definition supplies the name, description, permitted locations, arguments and whether
+    /// the directive is repeatable. Every application is checked against it when the schema is
+    /// built: an unknown directive, a location the definition does not allow, an argument of the
+    /// wrong type and a duplicate application of a non-repeatable directive are all build errors.
+    ///
+    /// Definitions are printed by [`gql::Schema::sdl`] and exposed through introspection's
+    /// `__schema.directives`, so a client can discover them. The built-in directives (`@skip`,
+    /// `@include`, `@deprecated`, `@specifiedBy` and `@oneOf`) are already registered; defining
+    /// one again is a build error.
+    ///
+    /// Apply the directive with [`Schema::type_directive`] for a named type, or with the
+    /// declaration-site methods ([`ObjectBuilder::directive`], [`InterfaceBuilder::directive`],
+    /// [`UnionBuilder::directive`] and [`FieldConfig::directive`]).
+    ///
+    /// ```
+    /// use gurafi::{NoArgs, Object, Schema};
+    ///
+    /// struct Ctx;
+    ///
+    /// #[derive(Object)]
+    /// struct Giraffe {
+    ///     name: String,
+    /// }
+    ///
+    /// let mut schema = Schema::<Ctx>::new();
+    /// schema.directive(
+    ///     gql::DirectiveDefinition::new("tag")
+    ///         .description("A documentation tag.")
+    ///         .location(gql::ast::DirectiveLocation::Object)
+    ///         .location(gql::ast::DirectiveLocation::FieldDefinition)
+    ///         .arg(gql::InputValue::new("name", gql::TypeRef::string())),
+    /// );
+    /// schema.type_directive(
+    ///     "Giraffe",
+    ///     gql::AppliedDirective::new("tag").argument("name", "animal"),
+    /// );
+    /// schema.object::<Giraffe>(|o| {
+    ///     o.expose(gurafi::expose!(Giraffe::name));
+    /// });
+    /// schema.query(|q| {
+    ///     q.field("giraffe", |_: NoArgs, _: &Ctx| Giraffe { name: "Melman".into() })
+    ///         .directive(gql::AppliedDirective::new("tag").argument("name", "entry"));
+    /// });
+    /// # let _ = schema.build().expect("valid schema");
+    /// ```
+    pub fn directive(&mut self, definition: DirectiveDefinition) -> &mut Self {
+        self.directive_definitions.push(definition);
+        self
+    }
+
+    /// Apply `directive` to the type named `name`, whatever its kind.
+    ///
+    /// The name may refer to an object, interface, union, scalar, enum, input object or a root
+    /// operation type. The type does not have to exist yet: applications are recorded by name and
+    /// attached when the schema is built, so this works for a type registered in another module
+    /// or after this call. A name that is never registered is a build error.
+    ///
+    /// Calling this more than once adds each application, which is how a repeatable directive is
+    /// used. A non-repeatable directive applied twice to the same type is reported by schema
+    /// validation.
+    ///
+    /// ```
+    /// use gurafi::{NoArgs, Object, Schema};
+    ///
+    /// struct Ctx;
+    ///
+    /// #[derive(Object)]
+    /// struct Giraffe {
+    ///     name: String,
+    /// }
+    ///
+    /// let mut schema = Schema::<Ctx>::new();
+    /// schema.directive(
+    ///     gql::DirectiveDefinition::new("tag")
+    ///         .location(gql::ast::DirectiveLocation::Object)
+    ///         .arg(gql::InputValue::new("name", gql::TypeRef::string())),
+    /// );
+    /// schema.type_directive(
+    ///     "Giraffe",
+    ///     gql::AppliedDirective::new("tag").argument("name", "animal"),
+    /// );
+    /// # schema.object::<Giraffe>(|o| {
+    /// #     o.expose(gurafi::expose!(Giraffe::name));
+    /// # });
+    /// # schema.query(|q| {
+    /// #     q.field("giraffe", |_: NoArgs, _: &Ctx| Giraffe { name: "Melman".into() });
+    /// # });
+    /// # schema.build().expect("valid schema");
+    /// ```
+    pub fn type_directive(
+        &mut self,
+        name: impl Into<Name>,
+        directive: AppliedDirective,
+    ) -> &mut Self {
+        self.type_directives
+            .entry(name.into())
+            .or_default()
+            .push(directive);
+        self
+    }
+
+    /// Apply `directive` to one argument of one field.
+    ///
+    /// `type_name` may name an object or interface, or a root operation type (`Query` by
+    /// default). `field_name` is the field's GraphQL name and `argument_name` is one of its
+    /// arguments. The field and argument do not have to exist yet; they are resolved when the
+    /// schema is built, and a missing type, field or argument is a build error.
+    ///
+    /// This covers field arguments, including root fields. Directive-definition arguments are
+    /// not covered: set them directly on [`gql::InputValue`] before passing the definition to
+    /// [`Schema::directive`]. Use [`Schema::input_field_directive`] for input object fields.
+    ///
+    /// ```
+    /// use gurafi::{Input, NoArgs, Object, Schema};
+    ///
+    /// struct Ctx;
+    ///
+    /// #[derive(Object)]
+    /// struct Giraffe {
+    ///     name: String,
+    /// }
+    ///
+    /// #[derive(Input)]
+    /// struct NameArgs {
+    ///     name: String,
+    /// }
+    ///
+    /// let mut schema = Schema::<Ctx>::new();
+    /// schema.directive(
+    ///     gql::DirectiveDefinition::new("tag")
+    ///         .location(gql::ast::DirectiveLocation::ArgumentDefinition)
+    ///         .arg(gql::InputValue::new("name", gql::TypeRef::string())),
+    /// );
+    /// schema.object::<Giraffe>(|o| {
+    ///     o.field("name", |g: &Giraffe, _: NameArgs, _: &Ctx| g.name.clone());
+    /// });
+    /// schema.argument_directive(
+    ///     "Giraffe",
+    ///     "name",
+    ///     "name",
+    ///     gql::AppliedDirective::new("tag").argument("name", "public"),
+    /// );
+    /// # schema.query(|q| {
+    /// #     q.field("giraffe", |_: NoArgs, _: &Ctx| Giraffe { name: "Melman".into() });
+    /// # });
+    /// # schema.build().expect("valid schema");
+    /// ```
+    pub fn argument_directive(
+        &mut self,
+        type_name: impl Into<Name>,
+        field_name: impl Into<Name>,
+        argument_name: impl Into<Name>,
+        directive: AppliedDirective,
+    ) -> &mut Self {
+        self.argument_directives.push((
+            type_name.into(),
+            field_name.into(),
+            argument_name.into(),
+            directive,
+        ));
+        self
+    }
+
+    /// Apply `directive` to one field of an input object.
+    ///
+    /// The input object and field do not have to exist yet; both are resolved when the schema is
+    /// built, and a missing type or field is a build error. Input objects are registered by using
+    /// them as an argument type or through `#[derive(Input)]`'s name, so this is the way to tag
+    /// an input field without redefining the Rust type.
+    ///
+    /// ```
+    /// use gurafi::{Input, NoArgs, Object, Schema};
+    ///
+    /// struct Ctx;
+    ///
+    /// #[derive(Object)]
+    /// struct Giraffe {
+    ///     name: String,
+    /// }
+    ///
+    /// #[derive(Input)]
+    /// #[graphql(name = "FilterInput")]
+    /// struct Filter {
+    ///     name: Option<String>,
+    /// }
+    ///
+    /// let mut schema = Schema::<Ctx>::new();
+    /// schema.directive(
+    ///     gql::DirectiveDefinition::new("tag")
+    ///         .location(gql::ast::DirectiveLocation::InputFieldDefinition)
+    ///         .arg(gql::InputValue::new("name", gql::TypeRef::string())),
+    /// );
+    /// schema.object::<Giraffe>(|o| {
+    ///     o.field("name", |g: &Giraffe, _: Filter, _: &Ctx| g.name.clone());
+    /// });
+    /// schema.input_field_directive(
+    ///     "FilterInput",
+    ///     "name",
+    ///     gql::AppliedDirective::new("tag").argument("name", "public"),
+    /// );
+    /// # schema.query(|q| {
+    /// #     q.field("giraffe", |_: NoArgs, _: &Ctx| Giraffe { name: "Melman".into() });
+    /// # });
+    /// # schema.build().expect("valid schema");
+    /// ```
+    pub fn input_field_directive(
+        &mut self,
+        type_name: impl Into<Name>,
+        field_name: impl Into<Name>,
+        directive: AppliedDirective,
+    ) -> &mut Self {
+        self.input_field_directives
+            .push((type_name.into(), field_name.into(), directive));
         self
     }
 
@@ -995,6 +1230,16 @@ impl<Ctx: 'static> Schema<Ctx> {
         self.expand_transitive_interfaces();
         self.resolve_inherited(&mut errors);
 
+        // Directive applications are stored by name until the type (or field or argument) they
+        // refer to exists. Applying them here, after every declaration has been merged, means a
+        // `type_directive` call may come before or after the type it names.
+        let mut pending_type_directives = std::mem::take(&mut self.type_directives);
+        self.apply_named_type_directives(&mut pending_type_directives);
+        let argument_directives = std::mem::take(&mut self.argument_directives);
+        self.apply_argument_directives(argument_directives, &mut errors);
+        let input_field_directives = std::mem::take(&mut self.input_field_directives);
+        self.apply_input_field_directives(input_field_directives, &mut errors);
+
         // Plugins are installed before object- and interface-level authorization so those rules
         // stay outside the plugin chain. Taking the list out keeps the rest of the build free to
         // move the type maps.
@@ -1017,6 +1262,9 @@ impl<Ctx: 'static> Schema<Ctx> {
         let mut builder = gql::Schema::builder();
         if let Some(description) = self.description.clone() {
             builder = builder.description(description);
+        }
+        for definition in std::mem::take(&mut self.directive_definitions) {
+            builder.add_directive(definition);
         }
 
         let mut registry_types: Vec<(String, gql::Type)> =
@@ -1048,6 +1296,12 @@ impl<Ctx: 'static> Schema<Ctx> {
             if let Some(description) = options.query_description.as_ref() {
                 root = root.description(description.to_string());
             }
+            for directive in pending_type_directives
+                .shift_remove(self.query_name.as_str())
+                .unwrap_or_default()
+            {
+                root = root.directive(directive);
+            }
             for field in self.query {
                 root = root.field(field);
             }
@@ -1058,6 +1312,12 @@ impl<Ctx: 'static> Schema<Ctx> {
             let mut root = gql::ObjectType::new(self.mutation_name.clone());
             if let Some(description) = options.mutation_description.as_ref() {
                 root = root.description(description.to_string());
+            }
+            for directive in pending_type_directives
+                .shift_remove(self.mutation_name.as_str())
+                .unwrap_or_default()
+            {
+                root = root.directive(directive);
             }
             for field in self.mutation {
                 root = root.field(field);
@@ -1070,11 +1330,26 @@ impl<Ctx: 'static> Schema<Ctx> {
             if let Some(description) = options.subscription_description.as_ref() {
                 root = root.description(description.to_string());
             }
+            for directive in pending_type_directives
+                .shift_remove(self.subscription_name.as_str())
+                .unwrap_or_default()
+            {
+                root = root.directive(directive);
+            }
             for field in self.subscription {
                 root = root.field(field);
             }
             builder.add_type(gql::Type::from(root));
             builder = builder.subscription(self.subscription_name.clone());
+        }
+
+        for name in pending_type_directives.keys() {
+            errors.push(GraphQLError::new(format!(
+                "`Schema::type_directive` was called for `{name}`, but no type with that name was \
+                 registered. Register the type with `object`, `object_ref`, `interface`, \
+                 `union`, `scalar` or `enum_type`; a root operation type also needs at least one \
+                 field."
+            )));
         }
 
         for plugin in &plugins {
@@ -1113,6 +1388,131 @@ impl<Ctx: 'static> Schema<Ctx> {
     /// Same as [`Schema::build`].
     pub fn build_clone(&self) -> Result<gql::Schema, SchemaError> {
         self.clone().build()
+    }
+
+    /// Attach pending directives to every named type that exists now.
+    ///
+    /// Root operation objects are created separately during the build, so they consume their
+    /// entries from the same map after this runs.
+    fn apply_named_type_directives(&mut self, pending: &mut IndexMap<Name, Vec<AppliedDirective>>) {
+        for object in self.objects.values_mut() {
+            if let Some(directives) = pending.shift_remove(object.name.as_ref()) {
+                object.directives.extend(directives);
+            }
+        }
+        for interface in self.interfaces.values_mut() {
+            if let Some(directives) = pending.shift_remove(interface.name.as_ref()) {
+                interface.directives.extend(directives);
+            }
+        }
+        for union in self.unions.values_mut() {
+            if let Some(directives) = pending.shift_remove(union.name.as_ref()) {
+                union.directives.extend(directives);
+            }
+        }
+        for ty in self.registry.types_mut().values_mut() {
+            let Some(directives) = pending.shift_remove(ty.name().as_ref()) else {
+                continue;
+            };
+            match ty {
+                gql::Type::Scalar(scalar) => Arc::make_mut(scalar).directives.extend(directives),
+                gql::Type::Object(object) => Arc::make_mut(object).directives.extend(directives),
+                gql::Type::Interface(interface) => {
+                    Arc::make_mut(interface).directives.extend(directives);
+                }
+                gql::Type::Union(union) => Arc::make_mut(union).directives.extend(directives),
+                gql::Type::Enum(enumeration) => {
+                    Arc::make_mut(enumeration).directives.extend(directives);
+                }
+                gql::Type::InputObject(input) => {
+                    Arc::make_mut(input).directives.extend(directives);
+                }
+            }
+        }
+    }
+
+    /// Attach pending directives to field arguments.
+    fn apply_argument_directives(
+        &mut self,
+        pending: Vec<(Name, Name, Name, AppliedDirective)>,
+        errors: &mut Vec<GraphQLError>,
+    ) {
+        for (type_name, field_name, argument_name, directive) in pending {
+            let Some(field) = self.field_mut(&type_name, &field_name) else {
+                errors.push(GraphQLError::new(format!(
+                    "`Schema::argument_directive` targets argument `{argument_name}` of field \
+                     `{type_name}.{field_name}`, but that field does not exist. Declare the field \
+                     before calling `build()`, or check the type and field names."
+                )));
+                continue;
+            };
+            let Some(argument) = field.args.get_mut(argument_name.as_ref()) else {
+                errors.push(GraphQLError::new(format!(
+                    "`Schema::argument_directive` targets `{type_name}.{field_name}({argument_name}:)`, \
+                     but that field has no argument named `{argument_name}`. Arguments come from \
+                     the resolver's args type."
+                )));
+                continue;
+            };
+            argument.directives.push(directive);
+        }
+    }
+
+    /// Attach pending directives to input object fields.
+    fn apply_input_field_directives(
+        &mut self,
+        pending: Vec<(Name, Name, AppliedDirective)>,
+        errors: &mut Vec<GraphQLError>,
+    ) {
+        for (type_name, field_name, directive) in pending {
+            let input = self
+                .registry
+                .types_mut()
+                .get_mut(type_name.as_ref())
+                .and_then(|ty| match ty {
+                    gql::Type::InputObject(input) => Some(Arc::make_mut(input)),
+                    _ => None,
+                });
+            let Some(input) = input else {
+                errors.push(GraphQLError::new(format!(
+                    "`Schema::input_field_directive` targets `{type_name}.{field_name}`, but \
+                     `{type_name}` is not a registered input object. Give the Rust type \
+                     `#[graphql(name = \"{type_name}\")]` and use it as an argument or input field \
+                     so it is registered before `build()`."
+                )));
+                continue;
+            };
+            let Some(field) = input.fields.get_mut(field_name.as_ref()) else {
+                errors.push(GraphQLError::new(format!(
+                    "`Schema::input_field_directive` targets `{type_name}.{field_name}`, but input \
+                     object `{type_name}` has no field named `{field_name}`."
+                )));
+                continue;
+            };
+            field.directives.push(directive);
+        }
+    }
+
+    /// Find a field by its declaring type, including the root operation types.
+    fn field_mut(&mut self, type_name: &str, field_name: &str) -> Option<&mut gql::Field> {
+        if let Some(object) = self.objects.get_mut(type_name) {
+            return object.fields.get_mut(field_name);
+        }
+        if let Some(interface) = self.interfaces.get_mut(type_name) {
+            return interface.fields.get_mut(field_name);
+        }
+        let fields = if type_name == self.query_name {
+            &mut self.query
+        } else if type_name == self.mutation_name {
+            &mut self.mutation
+        } else if type_name == self.subscription_name {
+            &mut self.subscription
+        } else {
+            return None;
+        };
+        fields
+            .iter_mut()
+            .find(|field| field.name.as_ref() == field_name)
     }
 
     /// Merge objects and unions generated by result-union fields into the user-declared maps.
@@ -1419,6 +1819,16 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
     /// Set the object's description, overriding the one from the derive.
     pub fn description(&mut self, description: impl Into<Arc<str>>) -> &mut Self {
         self.object.description = Some(description.into());
+        self
+    }
+
+    /// Apply a directive to this object type.
+    ///
+    /// Each call adds an application in declaration order, which is how a repeatable directive
+    /// is used more than once. The application is checked against its definition when the schema
+    /// is built; see [`Schema::directive`].
+    pub fn directive(&mut self, directive: AppliedDirective) -> &mut Self {
+        self.object.directives.push(directive);
         self
     }
 
@@ -2266,6 +2676,15 @@ impl<'a, Ctx: 'static> InterfaceBuilder<'a, Ctx> {
         self
     }
 
+    /// Apply a directive to this interface type.
+    ///
+    /// Each call adds an application in declaration order. See [`Schema::directive`] for the
+    /// definition side and validation rules.
+    pub fn directive(&mut self, directive: AppliedDirective) -> &mut Self {
+        self.interface.directives.push(directive);
+        self
+    }
+
     /// Whether this interface already declares a field with `name`.
     ///
     /// Read-only, for extensions that add a field only when it is absent.
@@ -2458,6 +2877,15 @@ impl<'a, Ctx: 'static> UnionBuilder<'a, Ctx> {
     /// Set the union's description.
     pub fn description(&mut self, description: impl Into<Arc<str>>) -> &mut Self {
         self.union.description = Some(description.into());
+        self
+    }
+
+    /// Apply a directive to this union type.
+    ///
+    /// Each call adds an application in declaration order. See [`Schema::directive`] for the
+    /// definition side and validation rules.
+    pub fn directive(&mut self, directive: AppliedDirective) -> &mut Self {
+        self.union.directives.push(directive);
         self
     }
 
