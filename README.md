@@ -79,6 +79,10 @@ Serve the schema over HTTP with `suku`; see [`examples/axum`](examples/axum).
   `#[graphql(one_of)]`, and `*_with_info` resolver variants.
 - **Reusable builders.** `Schema` is `Clone`; `build_with(BuildOptions)` and
   `build_clone` build without throwing the declaration away.
+- **Plugins.** `Schema::plugin` runs build-time hooks over every object, interface
+  and root field, with resolver and subscription wrapping. Tracing, mocks and
+  response-extension plugins are built in. See
+  [`docs/schema/plugins.md`](docs/schema/plugins.md).
 
 See [`docs/schema/object.md`](docs/schema/object.md) for the full guide.
 

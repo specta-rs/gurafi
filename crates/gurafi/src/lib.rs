@@ -163,6 +163,33 @@
 //! [`Raw`] and [`RawObject`] for lists, abstract types, reserved `__gql_*` keys and the
 //! performance tradeoff.
 //!
+//! # Plugins
+//!
+//! [`Schema::plugin`] registers a build-time extension that sees every object, interface and
+//! root field. A plugin can change metadata through [`FieldMeta`] and [`Plugin::field`], wrap
+//! resolvers with [`Plugin::wrap_resolve`] and subscription factories with
+//! [`Plugin::wrap_subscribe`], or add types and directives through [`Plugin::configure`].
+//! Plugins are applied once when the schema is built, so fields declared before or after
+//! registration are covered equally.
+//!
+//! ```
+//! use gurafi::{NoArgs, ResponseExtensionPlugin, Schema};
+//!
+//! struct Ctx;
+//!
+//! let mut schema = Schema::<Ctx>::new();
+//! schema.plugin(ResponseExtensionPlugin::new("servedBy", "gurafi").root_only());
+//! schema.query(|q| {
+//!     q.field("ok", |_: NoArgs, _: &Ctx| true);
+//! });
+//! let schema = schema.build().expect("valid schema");
+//! # let _ = schema;
+//! ```
+//!
+//! [`TracingPlugin`] emits start/finish events without depending on a particular logging crate,
+//! and [`MockPlugin`] replaces named fields for tests. See the [`plugin`] module for ordering,
+//! coverage and the full hook documentation.
+//!
 //! # Batching and per-request caches
 //!
 //! [`Loader`] collects loads issued in the same scheduler tick into one call of a user-supplied
@@ -182,6 +209,7 @@ mod expose;
 mod field;
 mod id;
 mod loader;
+pub mod plugin;
 mod raw;
 mod registry;
 mod schema;
@@ -198,6 +226,9 @@ pub use gql::{GraphQLError, Value};
 pub use gurafi_macros::{Args, Enum, Input, Object, Scalar, Union};
 pub use id::ID;
 pub use loader::{Loader, LoaderConfig};
+pub use plugin::{
+    FieldMeta, MockPlugin, Plugin, ResponseExtensionPlugin, TraceEvent, TracePhase, TracingPlugin,
+};
 pub use raw::{Raw, RawObject};
 pub use registry::TypeRegistry;
 pub use schema::{

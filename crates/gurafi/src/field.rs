@@ -893,11 +893,18 @@ pub(crate) fn install_property_resolver(field: &mut Field) {
     if field.resolve.is_some() || field.subscribe.is_some() {
         return;
     }
-    let name = field.name.clone();
-    field.resolve = Some(Arc::new(move |context| {
+    field.resolve = Some(property_resolver(field.name.clone()));
+}
+
+/// The resolver a raw field would use if the executor ran its default property lookup.
+///
+/// Plugins use it as `next` while deciding whether they wrap a raw field. If no plugin wraps,
+/// the caller leaves the field without a resolver and the executor keeps its leaf fast path.
+pub(crate) fn property_resolver(name: Name) -> gql::ResolveFn {
+    Arc::new(move |context| {
         let name = name.clone();
         Box::pin(async move { read_raw_field(&name, context.parent) })
-    }));
+    })
 }
 
 /// Wrap a field's resolvers with an authorization check.

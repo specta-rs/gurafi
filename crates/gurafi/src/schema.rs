@@ -47,6 +47,7 @@ use crate::{
         AuthGuard, FieldCheck, FieldConfig, InterfaceFieldConfig, RawFieldArgs, ValidationSlot,
         apply_auth_guard, read_raw_field,
     },
+    plugin::{Plugin, PluginTargets, apply_plugins},
     registry::TypeRegistry,
     traits::{
         EnumModel, InputObject, IntoValue, ObjectModel, OutputType, ScalarValue, coerce_args,
@@ -346,6 +347,8 @@ pub struct Schema<Ctx: 'static = ()> {
     interface_auth_error: IndexMap<String, Arc<str>>,
     interface_field_auth: IndexMap<String, IndexMap<Name, Arc<AuthGuard<Ctx>>>>,
     pending_inherited: Vec<PendingInherited>,
+    /// Build-time extensions, applied to every field once when the schema is built.
+    plugins: Vec<Arc<dyn Plugin<Ctx>>>,
     marker: PhantomData<fn() -> Ctx>,
 }
 
@@ -374,6 +377,7 @@ impl<Ctx: 'static> Clone for Schema<Ctx> {
             interface_auth_error: self.interface_auth_error.clone(),
             interface_field_auth: self.interface_field_auth.clone(),
             pending_inherited: self.pending_inherited.clone(),
+            plugins: self.plugins.clone(),
             marker: PhantomData,
         }
     }
@@ -394,6 +398,7 @@ impl<Ctx: 'static> std::fmt::Debug for Schema<Ctx> {
             .field("query_fields", &self.query.len())
             .field("mutation_fields", &self.mutation.len())
             .field("subscription_fields", &self.subscription.len())
+            .field("plugins", &self.plugins.len())
             .finish_non_exhaustive()
     }
 }
@@ -428,6 +433,7 @@ impl<Ctx: 'static> Schema<Ctx> {
             interface_auth_error: IndexMap::new(),
             interface_field_auth: IndexMap::new(),
             pending_inherited: Vec::new(),
+            plugins: Vec::new(),
             marker: PhantomData,
         }
     }
@@ -435,6 +441,44 @@ impl<Ctx: 'static> Schema<Ctx> {
     /// Set the schema's description.
     pub fn description(&mut self, description: impl Into<Arc<str>>) -> &mut Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// Register a build-time plugin.
+    ///
+    /// Plugins are stored and applied once when the schema is built (through [`Schema::build`],
+    /// [`Schema::build_with`] or [`Schema::build_clone`]), after every type and field has been
+    /// declared. Registering a plugin before or after declaring fields is therefore equivalent,
+    /// and fields added later are always covered.
+    ///
+    /// See the [`crate::plugin`] module documentation for ordering and coverage, and
+    /// [`crate::TracingPlugin`], [`crate::ResponseExtensionPlugin`] and
+    /// [`crate::MockPlugin`] for the built-ins.
+    ///
+    /// ```
+    /// use gurafi::{FieldMeta, NoArgs, Object, Plugin, Schema};
+    ///
+    /// struct AddDescription;
+    ///
+    /// impl Plugin<Ctx> for AddDescription {
+    ///     fn field(&self, meta: &FieldMeta<'_>, field: &mut gql::Field) {
+    ///         if meta.is_root {
+    ///             field.description = Some("A root field".into());
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// # struct Ctx;
+    /// # #[derive(Object)] struct Giraffe { name: String }
+    /// let mut schema = Schema::<Ctx>::new();
+    /// schema.plugin(AddDescription);
+    /// schema.query(|q| {
+    ///     q.field("ok", |_: NoArgs, _: &Ctx| true);
+    /// });
+    /// # let _ = schema.build().expect("valid schema");
+    /// ```
+    pub fn plugin<P: Plugin<Ctx>>(&mut self, plugin: P) -> &mut Self {
+        self.plugins.push(Arc::new(plugin));
         self
     }
 
@@ -919,6 +963,24 @@ impl<Ctx: 'static> Schema<Ctx> {
         self.check_raw_field_mixing(&mut errors);
         self.expand_transitive_interfaces();
         self.resolve_inherited(&mut errors);
+
+        // Plugins are installed before object- and interface-level authorization so those rules
+        // stay outside the plugin chain. Taking the list out keeps the rest of the build free to
+        // move the type maps.
+        let plugins = std::mem::take(&mut self.plugins);
+        apply_plugins(
+            &plugins,
+            PluginTargets {
+                objects: &mut self.objects,
+                interfaces: &mut self.interfaces,
+                query: &mut self.query,
+                mutation: &mut self.mutation,
+                subscription: &mut self.subscription,
+                query_name: &self.query_name,
+                mutation_name: &self.mutation_name,
+                subscription_name: &self.subscription_name,
+            },
+        );
         self.apply_guards();
 
         let mut builder = gql::Schema::builder();
@@ -982,6 +1044,10 @@ impl<Ctx: 'static> Schema<Ctx> {
             }
             builder.add_type(gql::Type::from(root));
             builder = builder.subscription(self.subscription_name.clone());
+        }
+
+        for plugin in &plugins {
+            plugin.configure(&mut builder);
         }
 
         match builder.build() {
@@ -1287,6 +1353,18 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
     pub fn description(&mut self, description: impl Into<Arc<str>>) -> &mut Self {
         self.object.description = Some(description.into());
         self
+    }
+
+    /// Whether this object already declares a field with `name`.
+    ///
+    /// This is a read-only inspection for extensions that add a field only when the object has
+    /// not declared it yet (for example a Relay `id` field). It never changes the definition.
+    #[must_use]
+    pub fn has_field(&self, name: &str) -> bool {
+        self.object
+            .fields
+            .keys()
+            .any(|field| field.as_ref() == name)
     }
 
     /// Declare that this object implements an interface.
@@ -1951,6 +2029,17 @@ impl<'a, Ctx: 'static> InterfaceBuilder<'a, Ctx> {
     pub fn description(&mut self, description: impl Into<Arc<str>>) -> &mut Self {
         self.interface.description = Some(description.into());
         self
+    }
+
+    /// Whether this interface already declares a field with `name`.
+    ///
+    /// Read-only, for extensions that add a field only when it is absent.
+    #[must_use]
+    pub fn has_field(&self, name: &str) -> bool {
+        self.interface
+            .fields
+            .keys()
+            .any(|field| field.as_ref() == name)
     }
 
     /// Declare that this interface implements another interface.
