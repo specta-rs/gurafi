@@ -84,6 +84,7 @@ A complete runnable example lives in [`examples/zoo.rs`](examples/zoo.rs).
   `#[derive(Scalar)]` and `#[derive(Union)]` register a Rust type as a GraphQL type. A field's
   output type is inferred from its Rust return type, and its arguments are inferred from its
   Rust arguments type. There is no second list of argument declarations to keep in sync.
+  `#[derive(ErrorUnion)]` gives a fallible field a generated GraphQL result union.
 - **Resolvers have one shape.** Object fields receive `(&Model, Args, &Ctx)`. Root fields receive
   `(Args, &Ctx)`. Each has a sync, async, infallible and fallible variant.
 - **Runtime coercion errors are per-field GraphQL errors.** Bad client input never panics and
@@ -117,6 +118,80 @@ GraphQL. Non-empty lists are not enforced.
 
 `Result<T, E>` is deliberately **not** an `OutputType`: a fallible field is declared with
 `field_result` / `field_result_async`, which tells the schema builder that failure is possible.
+
+## Typed error result unions
+
+Some failures are part of an API rather than exceptional. Derive `ErrorUnion` on an enum of
+payload objects and declare the field with `field_result_union`; the schema gets a generated
+union of a success payload and each error payload, the same shape as Pothos's Errors plugin.
+
+```rust
+use gurafi::{ErrorUnion, Input, NoArgs, Object, Schema};
+
+#[derive(Object)]
+struct User {
+    name: String,
+}
+
+#[derive(Object)]
+struct ConflictError {
+    message: String,
+    code: String,
+}
+
+#[derive(ErrorUnion)]
+enum CreateUserError {
+    Conflict(ConflictError),
+}
+
+#[derive(Input)]
+struct CreateUserArgs {
+    name: String,
+}
+
+let mut schema = Schema::<()>::new();
+schema.object::<User>(|o| {
+    o.field("name", |u: &User, _: NoArgs, _: &()| u.name.clone());
+});
+schema.object::<ConflictError>(|o| {
+    o.field("message", |e: &ConflictError, _: NoArgs, _: &()| e.message.clone());
+    o.field("code", |e: &ConflictError, _: NoArgs, _: &()| e.code.clone());
+});
+schema.query(|q| {
+    q.field("ok", |_: NoArgs, _: &()| true);
+});
+schema.mutation(|m| {
+    m.field_result_union::<User, CreateUserError, CreateUserArgs, _>(
+        "createUser",
+        |args: CreateUserArgs, _: &()| {
+            if args.name.is_empty() {
+                Err(CreateUserError::Conflict(ConflictError {
+                    message: "Name is required.".into(),
+                    code: "NAME_REQUIRED".into(),
+                }))
+            } else {
+                Ok(User { name: args.name })
+            }
+        },
+    );
+});
+```
+
+That produces:
+
+```graphql
+type MutationCreateUserSuccess { data: User! }
+union MutationCreateUserResult = MutationCreateUserSuccess | ConflictError
+type Mutation { createUser(name: String!): MutationCreateUserResult! }
+```
+
+`Ok(T)` becomes the success payload and `Err(E)` becomes the matching error payload; neither is a
+GraphQL `errors` entry. The success `data` field uses `T`'s type (`Option<T>` stays nullable,
+lists keep their wrappers, and an abstract `T` keeps its abstract type). Error payload objects are
+registered like any other object with `schema.object::<M>(...)`; forgetting one is a build error
+that names the missing type. Sync, async, root, object and subscription fields are supported.
+See [`docs/schema/errors.md`](../../docs/schema/errors.md) for names, limitations and how this
+relates to error masking.
 
 ## Objects
 

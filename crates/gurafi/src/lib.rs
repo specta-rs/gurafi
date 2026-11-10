@@ -9,6 +9,8 @@
 //!
 //! - `#[derive(Object)]`, `#[derive(Input)]`, `#[derive(Enum)]`, `#[derive(Scalar)]` and
 //!   `#[derive(Union)]` register a Rust type as a GraphQL type.
+//! - `#[derive(ErrorUnion)]` and `field_result_union` expose a `Result<T, E>` as a generated
+//!   GraphQL union of a success payload and typed error payloads.
 //! - A field's GraphQL output type is inferred from its Rust return type via [`OutputType`].
 //! - A field's GraphQL arguments are inferred from its Rust arguments type via [`InputObject`].
 //!   There is no second list of argument declarations to keep in sync. An `Input` type is
@@ -205,6 +207,7 @@
 
 mod cache;
 mod error;
+mod error_union;
 mod expose;
 mod field;
 mod id;
@@ -220,10 +223,11 @@ pub use gql;
 
 pub use cache::RequestCache;
 pub use error::SchemaError;
+pub use error_union::ErrorUnionModel;
 pub use expose::{__expose_name, Expose};
 pub use field::{FieldConfig, InterfaceFieldConfig};
 pub use gql::{GraphQLError, Value};
-pub use gurafi_macros::{Args, Enum, Input, Object, Scalar, Union};
+pub use gurafi_macros::{Args, Enum, ErrorUnion, Input, Object, Scalar, Union};
 pub use id::ID;
 pub use loader::{Loader, LoaderConfig};
 pub use plugin::{

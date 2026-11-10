@@ -11,7 +11,7 @@ documentation.
 | ----- | ----------- |
 | [`gql`](crates/gql) | A GraphQL reference implementation for Rust. Implements the October 2021 specification: parser, type system, validation, execution, introspection, subscriptions, complexity analysis and schema compatibility checking. It is transport- and framework-agnostic. |
 | [`gurafi`](crates/gurafi) | An intuitive, type-safe, code-first GraphQL schema builder built on `gql`. Rust types drive the GraphQL type system; `gurafi` only adds developer experience. |
-| [`gurafi-macros`](crates/gurafi-macros) | Procedural macros for `gurafi` (`Object`, `Input`, `Args`, `Enum`, `Scalar`, `Union`). |
+| [`gurafi-macros`](crates/gurafi-macros) | Procedural macros for `gurafi` (`Object`, `Input`, `Args`, `Enum`, `Scalar`, `Union`, `ErrorUnion`). |
 | [`suku`](crates/suku) | A production GraphQL-over-HTTP server for a `gql::Schema`, with batching, SSE subscriptions, error masking and pluggable authentication. |
 | [`shiri`](crates/shiri) | Serde-compatible serialization experiments. Not part of the GraphQL stack. |
 
@@ -75,6 +75,10 @@ Serve the schema over HTTP with `suku`; see [`examples/axum`](examples/axum).
   non-null value from an `Option` resolver.
 - **Authorization at every level.** Object and interface rules are inherited by
   their fields, with sync and async predicates.
+- **Typed error result unions.** `#[derive(ErrorUnion)]` and
+  `field_result_union` turn `Result<T, E>` into a generated GraphQL union of a
+  success payload and each typed error payload, without encoding failures as
+  GraphQL errors. See [`docs/schema/errors.md`](docs/schema/errors.md).
 - **Validation, one-of inputs and resolver info.** `#[graphql(validate)]`,
   `#[graphql(one_of)]`, and `*_with_info` resolver variants.
 - **Reusable builders.** `Schema` is `Clone`; `build_with(BuildOptions)` and

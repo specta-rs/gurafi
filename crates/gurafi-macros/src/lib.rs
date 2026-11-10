@@ -10,6 +10,7 @@
 //! - [`macro@Enum`] registers a Rust enum as a GraphQL enum.
 //! - [`macro@Scalar`] registers a newtype as a custom scalar delegating to its inner type.
 //! - [`macro@Union`] registers a Rust enum as a GraphQL union of object types.
+//! - [`macro@ErrorUnion`] declares the typed errors a `field_result_union` exposes.
 //!
 //! Every macro emits all of the trait implementations `gurafi` needs, so a derive is the
 //! whole registration: there is no second list of fields to keep in sync. Unsupported shapes
@@ -21,6 +22,7 @@
 
 mod attr;
 mod enums;
+mod error_union;
 mod input;
 mod object;
 mod scalar;
@@ -199,6 +201,43 @@ pub fn derive_scalar(input: TokenStream) -> TokenStream {
 pub fn derive_union(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     union::expand(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Derive the typed errors of a result-union field.
+///
+/// The enum is not itself a GraphQL type. It describes how a `field_result_union` field turns
+/// each Rust error variant into a GraphQL object payload, and the generated result union uses
+/// those payloads as members. Every variant must hold exactly one object model:
+///
+/// ```ignore
+/// use gurafi::{ErrorUnion, Object};
+///
+/// #[derive(Object)]
+/// struct NotFoundError {
+///     message: String,
+/// }
+///
+/// #[derive(Object)]
+/// struct ConflictError {
+///     field: String,
+/// }
+///
+/// #[derive(ErrorUnion)]
+/// enum CreateUserError {
+///     NotFound(NotFoundError),
+///     Conflict(ConflictError),
+/// }
+/// ```
+///
+/// The payload objects must still be registered with `schema.object::<M>(...)`. Missing
+/// registration is a schema build error that names the missing payload. Generic enums, unit
+/// variants, struct variants and tuple variants with zero or several fields are compile errors.
+#[proc_macro_derive(ErrorUnion)]
+pub fn derive_error_union(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    error_union::expand(input)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }

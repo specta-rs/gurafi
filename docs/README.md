@@ -7,6 +7,7 @@ Rust crates for building GraphQL servers.
 - [Architecture](architecture.md) — how `gql`, `gurafi` and `suku` fit together
 - [Defining a schema](schema/object.md) — objects, inputs, enums, interfaces, unions, auth, validation, type overrides
 - [Plugins](schema/plugins.md) — build-time field hooks, resolver wrapping, tracing, mocks and response extensions
+- [Typed error result unions](schema/errors.md) — exposing `Result<T, E>` as a GraphQL union of success and error payloads
 - [Serving over HTTP](server/suku.md) — requests, batches, subscriptions, limits, auth
 - [Schema evolution](schema/evolution.md) — compatibility diffing and SDL snapshots
 

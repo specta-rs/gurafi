@@ -87,6 +87,10 @@ o.field_with_info("path", |g: &Giraffe, _: NoArgs, _: &Ctx, info| {
 Root fields omit the model argument and receive `(Args, &Ctx)`; their
 `*_with_info` variants work the same way.
 
+When a failure is part of the API instead of an exceptional GraphQL error, derive
+`ErrorUnion` and use `field_result_union` to expose a generated success/error union. See
+[Typed error result unions](errors.md).
+
 When a resolver needs to write response `extensions`, use
 `field_with_execution` / `field_result_with_execution` on objects and roots.
 They append `&gql::ResolverContext<'_>`, which exposes the execution context,
