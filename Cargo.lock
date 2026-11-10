@@ -108,6 +108,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-tracing"
+version = "0.0.0"
+dependencies = [
+ "futures",
+ "gql",
+ "gurafi",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -216,6 +227,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "tracing",
+ "tracing-core",
 ]
 
 [[package]]
@@ -226,6 +238,7 @@ dependencies = [
  "gql",
  "gurafi-macros",
  "indexmap",
+ "tracing",
 ]
 
 [[package]]
@@ -243,6 +256,7 @@ version = "0.0.1"
 dependencies = [
  "futures",
  "gurafi",
+ "tracing",
 ]
 
 [[package]]
@@ -606,6 +620,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "tracing-core",
 ]
 
 [[package]]

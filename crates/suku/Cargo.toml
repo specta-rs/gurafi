@@ -11,13 +11,14 @@ repository.workspace = true
 [features]
 default = ["axum"]
 axum = ["dep:axum", "dep:tower-http", "dep:tokio"]
+tracing = ["dep:tracing", "gql/tracing"]
 
 [dependencies]
 gql.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tracing.workspace = true
+tracing = { workspace = true, optional = true }
 
 http.workspace = true
 bytes = "1.6"
@@ -28,6 +29,7 @@ tower-http = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
+tracing-core = "0.1.36"
 serde_json.workspace = true
 tokio.workspace = true
 tower = { version = "0.5", features = ["util"] }

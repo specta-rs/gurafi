@@ -201,6 +201,13 @@
 //! where loaders and other request-wide state belong: put both in the context passed to
 //! [`gql::ExecutionOptions::with_context`] and every resolver in that request shares them, while
 //! the next request starts empty.
+//!
+//! # Observability
+//!
+//! The optional `tracing` feature instruments schema building, plugin application, authorization,
+//! validation, resolvers, error-union dispatch, [`Loader`] batching and [`RequestCache`] lookups.
+//! It is off by default. Loader spans record the key *type* and cache hit/miss, never key values;
+//! per-resolver and cache events are TRACE. See the repository's `docs/observability.md`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -216,6 +223,7 @@ pub mod plugin;
 mod raw;
 mod registry;
 mod schema;
+mod telemetry;
 mod traits;
 mod value;
 

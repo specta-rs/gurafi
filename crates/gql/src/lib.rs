@@ -29,6 +29,16 @@
 //! ));
 //! assert_eq!(response.data.unwrap().as_object().unwrap().get("hello").unwrap().as_str(), Some("world"));
 //! ```
+//!
+//! # Observability
+//!
+//! The optional `tracing` feature instruments parsing, validation, variable coercion, operation
+//! execution, per-field completion, subscriptions and schema construction. It is off by default,
+//! so a normal build does not compile `tracing` and contains none of the instrumentation. With
+//! the feature enabled, spans record counts, byte lengths and short identifier prefixes; variable
+//! values, arguments and document text are never recorded. Operation summaries are INFO, field
+//! spans are DEBUG and collection spans are TRACE. See the repository's
+//! `docs/observability.md` for the span tree.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
@@ -45,6 +55,7 @@ pub mod prepared;
 mod schema;
 mod sdl;
 mod sdl_schema;
+mod telemetry;
 mod types;
 pub mod validation;
 mod value;

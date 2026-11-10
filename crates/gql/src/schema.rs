@@ -335,6 +335,15 @@ impl Schema {
     /// # Errors
     ///
     /// Returns parse and schema validation errors.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            level = "info",
+            name = "gql.schema.from_sdl",
+            fields(sdl_bytes = source.len())
+        )
+    )]
     pub fn from_sdl(source: &str) -> Result<Self, SchemaError> {
         crate::sdl_schema::schema_from_sdl(source)
     }
@@ -543,6 +552,19 @@ impl SchemaBuilder {
     /// Returns every validation problem found. The GraphQL specification requires a schema to
     /// reject duplicate types, dangling references, invalid interface implementations and
     /// invalid input cycles; all of those are reported here rather than deferred to execution.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            level = "info",
+            name = "gql.schema.build",
+            fields(
+                types = self.types.len(),
+                directives = self.directives.len(),
+                errors = tracing::field::Empty,
+            )
+        )
+    )]
     pub fn build(mut self) -> Result<Schema, SchemaError> {
         // Introspection types are always present. Users cannot register them, so no duplicate
         // check is needed. They are immutable, hold no resolvers and reference nothing a user
@@ -1622,6 +1644,15 @@ fn validate_field_directives(schema: &Schema, field: &Field, errors: &mut Schema
     }
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        skip_all,
+        level = "debug",
+        name = "gql.schema.validate",
+        fields(types = schema.types().len(), directives = schema.directives().len())
+    )
+)]
 fn validate_schema(schema: &Schema, errors: &mut SchemaError) {
     for ty in schema.inner.types.values() {
         match ty {

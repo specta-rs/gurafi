@@ -73,25 +73,118 @@ impl fmt::Display for FieldLabel<'_> {
     }
 }
 
-/// Execute a parsed and validated operation.
-pub(crate) async fn execute(
+/// Parse a request document, with a `gql.parse` span when tracing is enabled.
+///
+/// This is a non-async helper so the span's locals are not part of the `execute` future. The
+/// top-level future is polled on the caller's stack, and a document at the parser's depth limit
+/// already runs close to a 2 MiB stack.
+#[cfg_attr(feature = "tracing", inline(never))]
+#[cfg_attr(not(feature = "tracing"), inline)]
+fn parse_document(query: &str) -> Result<ast::Document<'_>, GraphQLError> {
+    #[cfg(feature = "tracing")]
+    let span = tracing::debug_span!(target: "gql", "gql.parse", document_bytes = query.len());
+    let result = parse_query(query);
+    #[cfg(feature = "tracing")]
+    drop(span);
+    result
+}
+
+/// Validate a document, with a `gql.validate` span when tracing is enabled.
+#[cfg_attr(feature = "tracing", inline(never))]
+#[cfg_attr(not(feature = "tracing"), inline)]
+fn validate_document(
     schema: &Schema,
-    request: Request<'_>,
+    document: &ast::Document<'_>,
     options: &ExecutionOptions,
-) -> Response {
-    let document = match parse_query(request.query) {
-        Ok(document) => document,
-        Err(error) => return Response::error(error),
-    };
-    let validation_errors = validation::validate(
+) -> Vec<GraphQLError> {
+    #[cfg(feature = "tracing")]
+    let span = tracing::debug_span!(target: "gql", "gql.validate");
+    let errors = validation::validate(
         schema,
-        &document,
+        document,
         &ValidationOptions {
             introspection: options.introspection,
             max_depth: options.max_depth,
             max_errors: options.max_errors,
         },
     );
+    #[cfg(feature = "tracing")]
+    drop(span);
+    errors
+}
+
+/// Coerce request variables, with a `gql.coerce_variables` span when tracing is enabled.
+#[cfg_attr(feature = "tracing", inline(never))]
+#[cfg_attr(not(feature = "tracing"), inline)]
+fn coerce_variables(
+    schema: &Schema,
+    operation: &ast::OperationDefinition<'_>,
+    inputs: Option<&Object>,
+) -> Result<coerce::CoercedVariables, Vec<GraphQLError>> {
+    #[cfg(feature = "tracing")]
+    let span = tracing::debug_span!(
+        target: "gql",
+        "gql.coerce_variables",
+        definitions = operation.variables.len(),
+    );
+    let result = coerce::coerce_variable_values(schema, operation, inputs);
+    #[cfg(feature = "tracing")]
+    drop(span);
+    result
+}
+
+/// Apply the configured complexity limits, with a `gql.complexity` span when tracing is enabled.
+#[cfg_attr(feature = "tracing", inline(never))]
+#[cfg_attr(not(feature = "tracing"), inline)]
+fn analyze_complexity(
+    schema: &Schema,
+    document: &ast::Document<'_>,
+    operation: &ast::OperationDefinition<'_>,
+    variables: &Object,
+    options: &ExecutionOptions,
+) -> Result<(), GraphQLError> {
+    #[cfg(feature = "tracing")]
+    let span = tracing::debug_span!(
+        target: "gql",
+        "gql.complexity",
+        list_factor = options.list_complexity,
+        max_complexity = options.max_complexity,
+    );
+    let result = complexity::analyze_operation(
+        schema,
+        document,
+        operation,
+        variables,
+        &ComplexityOptions {
+            list_factor: options.list_complexity,
+            field_cost: 1,
+            max_complexity: options.max_complexity,
+            max_depth: options.max_depth,
+            max_breadth: options.max_breadth,
+        },
+    )
+    .map(|_| ());
+    #[cfg(feature = "tracing")]
+    drop(span);
+    result
+}
+
+/// Execute a parsed and validated operation.
+pub(crate) async fn execute(
+    schema: &Schema,
+    request: Request<'_>,
+    options: &ExecutionOptions,
+) -> Response {
+    // Spans around the synchronous stages are created but deliberately not entered: these
+    // functions recurse over the document, and holding an entered-span guard around that
+    // recursion would grow the stack of a document at the parser's depth limit. A span still
+    // records its own creation-to-drop duration.
+    let document = parse_document(request.query);
+    let document = match document {
+        Ok(document) => document,
+        Err(error) => return Response::error(error),
+    };
+    let validation_errors = validate_document(schema, &document, options);
     if !validation_errors.is_empty() {
         return Response {
             data: None,
@@ -105,7 +198,25 @@ pub(crate) async fn execute(
         Err(error) => return Response::error(error),
     };
 
+    #[cfg(feature = "tracing")]
+    {
+        let span = tracing::Span::current();
+        if !span.is_disabled() {
+            span.record("kind", operation_kind_name(operation.kind));
+        }
+    }
+
     execute_operation(schema, &document, operation, request.variables, options).await
+}
+
+/// A stable, low-cardinality name for an operation kind.
+#[cfg(feature = "tracing")]
+fn operation_kind_name(kind: OperationKind) -> &'static str {
+    match kind {
+        OperationKind::Query => "query",
+        OperationKind::Mutation => "mutation",
+        OperationKind::Subscription => "subscription",
+    }
 }
 
 /// Execute an operation that has already been parsed, validated and selected.
@@ -122,7 +233,7 @@ pub(crate) async fn execute_operation<'doc>(
     request_variables: Option<&Object>,
     options: &ExecutionOptions,
 ) -> Response {
-    let variables = match coerce::coerce_variable_values(schema, operation, request_variables) {
+    let variables = match coerce_variables(schema, operation, request_variables) {
         Ok(variables) => variables,
         Err(errors) => {
             return Response {
@@ -133,19 +244,8 @@ pub(crate) async fn execute_operation<'doc>(
         }
     };
 
-    if let Err(error) = complexity::analyze_operation(
-        schema,
-        document,
-        operation,
-        &variables.values,
-        &ComplexityOptions {
-            list_factor: options.list_complexity,
-            field_cost: 1,
-            max_complexity: options.max_complexity,
-            max_depth: options.max_depth,
-            max_breadth: options.max_breadth,
-        },
-    ) {
+    if let Err(error) = analyze_complexity(schema, document, operation, &variables.values, options)
+    {
         return Response::error(error);
     }
 
@@ -452,6 +552,15 @@ pub(crate) async fn run_operation<'doc>(
 /// single-root-field check all happened during setup and are not repeated, and the root field was
 /// authorized during setup, so event execution only resolves values with that event's own
 /// deadline. Re-parsing per event is a known cost for high-frequency subscriptions.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        skip_all,
+        level = "debug",
+        name = "gql.subscription_event",
+        fields(operation = operation_name.unwrap_or("<anonymous>"), errors = tracing::field::Empty)
+    )
+)]
 pub(crate) async fn execute_subscription_event(
     context: &ExecutionContext,
     query: &str,
@@ -1005,6 +1114,19 @@ impl<'doc> Executor<'doc> {
     where
         'doc: 's,
     {
+        #[cfg(feature = "tracing")]
+        if tracing::enabled!(target: "gql::field", tracing::Level::DEBUG) {
+            return self.execute_field_dynamic_traced(
+                object_type,
+                parent,
+                response_key,
+                nodes,
+                hint,
+                path,
+                errors,
+                depth,
+            );
+        }
         async move {
             let Some(first) = nodes.first().copied() else {
                 return (
@@ -1039,6 +1161,77 @@ impl<'doc> Executor<'doc> {
                     depth,
                 )
                 .await;
+            (pop_field_key(path), outcome)
+        }
+        .boxed()
+    }
+
+    /// The traced form of [`Self::execute_field_dynamic_async`].
+    ///
+    /// Kept as a separate function so the untraced future keeps its original size. The executor
+    /// recurses once per selection-set level, and a document at the parser's depth limit runs out
+    /// of stack if that state grows even slightly.
+    #[cfg(feature = "tracing")]
+    #[allow(clippy::too_many_arguments)]
+    fn execute_field_dynamic_traced<'s>(
+        &'s self,
+        object_type: &'doc ObjectType,
+        parent: &'s Value,
+        response_key: &'doc str,
+        nodes: &'s [&'doc ast::Field<'doc>],
+        hint: Option<&'doc crate::types::Field>,
+        path: &'s mut Path,
+        errors: &'s mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> BoxFuture<'s, (Arc<str>, Result<Value, GraphQLError>)>
+    where
+        'doc: 's,
+    {
+        async move {
+            let Some(first) = nodes.first().copied() else {
+                return (
+                    Arc::from(response_key),
+                    Err(GraphQLError::new(format!(
+                        "No field node was provided for response key \"{response_key}\"."
+                    ))),
+                );
+            };
+            let field = match hint {
+                Some(field) => Some(field),
+                None => object_type.get_field(first.name),
+            };
+            let key: Arc<str> = match (field, first.alias) {
+                (Some(field), None) => field.name.clone(),
+                _ => Arc::from(response_key),
+            };
+            path.push(PathSegment::Field(key));
+
+            let span = super::super::telemetry::field_span!(
+                object_type.name.as_ref(),
+                first.name,
+                path.as_slice(),
+                super::super::telemetry::field_type_label(field),
+                nodes
+                    .iter()
+                    .filter(|node| node.selection_set.is_some())
+                    .count(),
+                field.is_some_and(|field| field.resolve.is_some()),
+                field.is_some_and(|field| field.resolve.is_none() && field.args.is_empty())
+            );
+            let outcome = super::super::telemetry::instrument_span_if_enabled!(
+                span.clone(),
+                self.execute_field_inner_dynamic_async(
+                    object_type,
+                    field,
+                    parent,
+                    first,
+                    nodes,
+                    path,
+                    errors,
+                    depth,
+                )
+            );
+            super::super::telemetry::record_field_outcome!(span, outcome);
             (pop_field_key(path), outcome)
         }
         .boxed()
@@ -1295,6 +1488,19 @@ impl<'doc> Executor<'doc> {
     where
         'doc: 's,
     {
+        #[cfg(feature = "tracing")]
+        if tracing::enabled!(target: "gql::field", tracing::Level::DEBUG) {
+            return self.execute_field_no_args_traced(
+                object_type,
+                parent,
+                response_key,
+                nodes,
+                hint,
+                path,
+                errors,
+                depth,
+            );
+        }
         async move {
             let Some(first) = nodes.first().copied() else {
                 return (
@@ -1329,6 +1535,74 @@ impl<'doc> Executor<'doc> {
                     depth,
                 )
                 .await;
+            (pop_field_key(path), outcome)
+        }
+        .boxed()
+    }
+
+    /// The traced form of [`Self::execute_field_no_args_async`]; see
+    /// [`Self::execute_field_dynamic_traced`] for why it is a separate function.
+    #[cfg(feature = "tracing")]
+    #[allow(clippy::too_many_arguments)]
+    fn execute_field_no_args_traced<'s>(
+        &'s self,
+        object_type: &'doc ObjectType,
+        parent: &'s Value,
+        response_key: &'doc str,
+        nodes: &'s [&'doc ast::Field<'doc>],
+        hint: Option<&'doc crate::types::Field>,
+        path: &'s mut Path,
+        errors: &'s mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> BoxFuture<'s, (Arc<str>, Result<Value, GraphQLError>)>
+    where
+        'doc: 's,
+    {
+        async move {
+            let Some(first) = nodes.first().copied() else {
+                return (
+                    Arc::from(response_key),
+                    Err(GraphQLError::new(format!(
+                        "No field node was provided for response key \"{response_key}\"."
+                    ))),
+                );
+            };
+            let field = match hint {
+                Some(field) => Some(field),
+                None => object_type.get_field(first.name),
+            };
+            let key: Arc<str> = match (field, first.alias) {
+                (Some(field), None) => field.name.clone(),
+                _ => Arc::from(response_key),
+            };
+            path.push(PathSegment::Field(key));
+
+            let span = super::super::telemetry::field_span!(
+                object_type.name.as_ref(),
+                first.name,
+                path.as_slice(),
+                super::super::telemetry::field_type_label(field),
+                nodes
+                    .iter()
+                    .filter(|node| node.selection_set.is_some())
+                    .count(),
+                field.is_some_and(|field| field.resolve.is_some()),
+                field.is_some_and(|field| field.resolve.is_none() && field.args.is_empty())
+            );
+            let outcome = super::super::telemetry::instrument_span_if_enabled!(
+                span.clone(),
+                self.execute_field_inner_no_args_async(
+                    object_type,
+                    field,
+                    parent,
+                    first,
+                    nodes,
+                    path,
+                    errors,
+                    depth,
+                )
+            );
+            super::super::telemetry::record_field_outcome!(span, outcome);
             (pop_field_key(path), outcome)
         }
         .boxed()
@@ -1736,6 +2010,10 @@ impl<'doc> Executor<'doc> {
         first: &ast::Field<'_>,
         hint: Option<&'f crate::types::Field>,
     ) -> Option<&'f crate::types::Field> {
+        // Leaf shortcuts complete fields without going through the instrumented per-field
+        // wrapper. When a subscriber wants field spans, decline the shortcut so the field is
+        // traced like every other one. With no subscriber this is a single branch and the
+        // shortcuts behave exactly as before.
         if !first.arguments.is_empty() || meta_return_type(first.name).is_some() {
             return None;
         }
@@ -1864,9 +2142,22 @@ impl<'doc> Executor<'doc> {
         let key = group.key_arc(first, group.field);
         path.push(PathSegment::Field(key));
 
-        let outcome = self
-            .execute_field_inner_planned(object_type, group, parent, path, errors, depth)
-            .await;
+        let _span = crate::telemetry::field_span!(
+            object_type.name.as_ref(),
+            first.name,
+            path.as_slice(),
+            crate::telemetry::field_type_label(group.field),
+            group.nodes.selection_sets().len(),
+            group.field.is_some_and(|field| field.resolve.is_some()),
+            group
+                .field
+                .is_some_and(|field| field.resolve.is_none() && field.args.is_empty())
+        );
+        let outcome = crate::telemetry::instrument_span_if_enabled!(
+            _span.clone(),
+            self.execute_field_inner_planned(object_type, group, parent, path, errors, depth)
+        );
+        crate::telemetry::record_field_outcome!(_span, outcome);
         (pop_field_key(path), outcome)
     }
 
@@ -2737,6 +3028,13 @@ impl<'doc> Executor<'doc> {
         errors: &mut Vec<GraphQLError>,
         depth: usize,
     ) -> Option<Result<Arc<Object>, GraphQLError>> {
+        // The synchronous subtree path has no field spans. When a subscriber wants them, hand
+        // the work to the asynchronous path, which emits the same `gql.field` spans as every
+        // other field. With no subscriber the fast path is byte-for-byte the original one.
+        #[cfg(feature = "tracing")]
+        if tracing::enabled!(target: "gql::field", tracing::Level::DEBUG) {
+            return None;
+        }
         if depth >= SYNC_DEPTH_LIMIT || self.type_has_resolvers(selections.source, object_type) {
             return None;
         }
@@ -2792,6 +3090,12 @@ impl<'doc> Executor<'doc> {
         errors: &mut Vec<GraphQLError>,
         depth: usize,
     ) -> Option<Result<Value, GraphQLError>> {
+        // The synchronous completion path does not emit `gql.field` spans. When a subscriber
+        // wants them, take the asynchronous path for this value so every field is traced.
+        #[cfg(feature = "tracing")]
+        if tracing::enabled!(target: "gql::field", tracing::Level::DEBUG) {
+            return None;
+        }
         let mut records = Vec::new();
         let outcome = self.complete_field_value_sync(
             value,

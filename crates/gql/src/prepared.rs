@@ -259,6 +259,20 @@ impl PreparedQuery {
     ///
     /// Executing a prepared subscription returns the same error normal execution does: use
     /// [`PreparedQuery::subscribe`] instead.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            level = "info",
+            name = "gql.execute_prepared",
+            fields(
+                prepared_id = self.inner.id.chars().take(8).collect::<String>(),
+                kind = ?self.inner.kind,
+                operation = self.inner.operation_name.as_deref().unwrap_or("<anonymous>"),
+                variable_count = variables.map_or(0, Object::len),
+            )
+        )
+    )]
     pub async fn execute(
         &self,
         variables: Option<&Object>,
@@ -286,6 +300,18 @@ impl PreparedQuery {
     /// Returns a fully formed error response when the prepared operation is not a subscription or
     /// the source stream could not be created.
     #[allow(clippy::result_large_err)]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            level = "info",
+            name = "gql.subscribe_prepared",
+            fields(
+                prepared_id = self.inner.id.chars().take(8).collect::<String>(),
+                variable_count = variables.map_or(0, Object::len),
+            )
+        )
+    )]
     pub async fn subscribe(
         &self,
         variables: Option<&Object>,

@@ -39,6 +39,14 @@
 //! # let _ = app;
 //! # }
 //! ```
+//!
+//! # Observability
+//!
+//! The optional `tracing` feature (which also enables `gql/tracing`) emits a `suku.request` span
+//! with method, path, body size, operation, request id, batch size and status, plus children for
+//! parsing, execution, serialization and subscriptions. Transport and extractor failures are WARN
+//! events with a status and code. Request bodies, headers, tokens and variable values are never
+//! recorded. See the repository's `docs/observability.md`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]

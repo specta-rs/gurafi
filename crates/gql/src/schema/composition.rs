@@ -126,10 +126,31 @@ impl Schema {
     ///
     /// Returns merge conflicts, including conflicting runtime implementations, and the ordinary
     /// validation errors a rebuild can produce.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            level = "info",
+            name = "gql.schema.merge",
+            fields(
+                types = self.types().len(),
+                incoming_types = other.types().len(),
+                changed = tracing::field::Empty,
+            )
+        )
+    )]
     pub fn merge(&self, other: &Schema) -> Result<Schema, SchemaError> {
         let mut builder = builder_from(self);
         builder.merge(other);
-        builder.build()
+        let result = builder.build();
+        #[cfg(feature = "tracing")]
+        if let Ok(schema) = &result {
+            let span = tracing::Span::current();
+            if !span.is_disabled() {
+                span.record("changed", super::diff(self, schema).changes().count());
+            }
+        }
+        result
     }
 
     /// Remove types by name.
@@ -137,6 +158,15 @@ impl Schema {
     /// # Errors
     ///
     /// Returns validation errors when a removed type is still referenced.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            level = "info",
+            name = "gql.schema.without_types",
+            fields(types = self.types().len(), removed = names.len())
+        )
+    )]
     pub fn without_types(&self, names: &[&str]) -> Result<Schema, SchemaError> {
         let removed: FxHashSet<&str> = names.iter().copied().collect();
         self.retain_types(|ty| !removed.contains(ty.name().as_ref()))
@@ -149,6 +179,15 @@ impl Schema {
     /// # Errors
     ///
     /// Returns validation errors when a removed type is still referenced.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            level = "info",
+            name = "gql.schema.retain_types",
+            fields(types = self.types().len())
+        )
+    )]
     pub fn retain_types(
         &self,
         mut retain: impl FnMut(&Type) -> bool,
@@ -190,6 +229,15 @@ impl Schema {
     ///     .unwrap();
     /// assert!(trimmed.query_type().get_field("drop").is_none());
     /// ```
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            level = "info",
+            name = "gql.schema.transform",
+            fields(types = self.types().len())
+        )
+    )]
     pub fn transform(
         &self,
         mut transform: impl FnMut(&Type, &Field) -> FieldTransform,
@@ -256,6 +304,15 @@ impl Schema {
     /// assert!(extended.query_type().get_field("extra").is_some());
     /// assert!(extended.query_type().get_field("hello").unwrap().resolve.is_some());
     /// ```
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            level = "info",
+            name = "gql.schema.extend_sdl",
+            fields(sdl_bytes = sdl.len(), types = self.types().len(), changed = tracing::field::Empty)
+        )
+    )]
     pub fn extend_sdl(&self, sdl: &str) -> Result<Schema, SchemaError> {
         self.extend_sdl_many([sdl])
     }
@@ -314,6 +371,13 @@ impl Schema {
         }
         let mut extended = Schema::from_sdl(&source)?;
         overlay_resolvers(self, &mut extended);
+        #[cfg(feature = "tracing")]
+        {
+            let span = tracing::Span::current();
+            if !span.is_disabled() {
+                span.record("changed", super::diff(self, &extended).changes().count());
+            }
+        }
         Ok(extended)
     }
 }
@@ -324,6 +388,15 @@ impl SchemaBuilder {
     /// The same compatibility rules as [`Schema::merge`] apply. Conflicts are recorded in the
     /// builder and reported by [`SchemaBuilder::build`], so a partially built schema can be
     /// composed before validation.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            level = "info",
+            name = "gql.schema.builder.merge",
+            fields(types = self.types.len(), incoming_types = other.types().len())
+        )
+    )]
     pub fn merge(&mut self, other: &Schema) -> &mut Self {
         merge_description(
             &mut self.description,

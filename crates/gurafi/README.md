@@ -636,6 +636,21 @@ for server integration.
 - This crate is code-first and does not read SDL; `gql` owns parsing, validation, execution and
   SDL printing.
 
+## Observability
+
+The optional `tracing` feature instruments schema building, plugins, authorization, validation,
+resolvers, the `Loader` and `RequestCache`:
+
+```toml
+[dependencies]
+gurafi = { version = "0.0.1", features = ["tracing"] }
+```
+
+`gurafi.schema.build`, `gurafi.loader.load` and `gurafi.loader.batch` are the summary points;
+per-resolver, auth, validator and cache events are TRACE. Loader spans record the key *type* and
+cache hit/miss, never key values. See [`docs/observability.md`](../../docs/observability.md) for
+the span tree and performance guidance.
+
 ## Workspace
 
 - `crates/gql` — the GraphQL specification implementation (`gql` knows nothing about `gurafi`).

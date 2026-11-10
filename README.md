@@ -58,6 +58,34 @@ let schema = schema.build().expect("valid schema");
 
 Serve the schema over HTTP with `suku`; see [`examples/axum`](examples/axum).
 
+## Observability
+
+`gql`, `gurafi`, `suku` and `gurafi-relay` each have an optional `tracing` feature. It is off by
+default, so a normal build does not compile `tracing`; enable just the layers you want to inspect:
+
+```toml
+[dependencies]
+gurafi = { version = "0.0.1", features = ["tracing"] }
+suku = { version = "0.0.1", features = ["tracing"] }
+```
+
+Wire any `tracing` subscriber in the application. With `tracing-subscriber`:
+
+```rust
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+
+tracing_subscriber::registry()
+    .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+    .with(fmt::layer())
+    .init();
+```
+
+Operation summaries are INFO, field spans and loader batches are DEBUG, and the hottest
+per-object/per-item work is TRACE. Run the example with
+`RUST_LOG=gql=debug,gurafi=debug cargo run -p example-tracing --features tracing`, and see
+[`docs/observability.md`](docs/observability.md) for the full span tree, safe fields and
+production/development guidance.
+
 ## What `gurafi` adds
 
 - **Args, not leaked inputs.** `#[derive(Input)]` (or `#[derive(Args)]`) is

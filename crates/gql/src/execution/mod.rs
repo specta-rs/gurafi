@@ -355,9 +355,16 @@ impl<'a> Request<'a> {
 #[cfg_attr(
     feature = "tracing",
     tracing::instrument(
-        skip(schema, request, options),
-        level = "debug",
-        name = "graphql.execute"
+        skip_all,
+        level = "info",
+        name = "gql.execute",
+        fields(
+            operation = request.operation_name.unwrap_or("<anonymous>"),
+            document_bytes = request.query.len(),
+            variable_count = request.variables.map_or(0, Object::len),
+            kind = tracing::field::Empty,
+            errors = tracing::field::Empty,
+        )
     )
 )]
 pub async fn execute(
@@ -381,9 +388,16 @@ pub async fn execute(
 #[cfg_attr(
     feature = "tracing",
     tracing::instrument(
-        skip(schema, request, options),
-        level = "debug",
-        name = "graphql.subscribe"
+        skip_all,
+        level = "info",
+        name = "gql.subscribe",
+        fields(
+            operation = request.operation_name.unwrap_or("<anonymous>"),
+            document_bytes = request.query.len(),
+            variable_count = request.variables.map_or(0, Object::len),
+            kind = "subscription",
+            errors = tracing::field::Empty,
+        )
     )
 )]
 pub async fn subscribe(

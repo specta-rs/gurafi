@@ -401,6 +401,18 @@ impl<Ctx: 'static + Sync> Relay<Ctx> {
     }
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        skip_all,
+        level = "debug",
+        name = "relay.mutation",
+        fields(
+            result_type = std::any::type_name::<T>(),
+            has_client_mutation_id = client_mutation_id.is_some(),
+        )
+    )
+)]
 fn payload_value<T: gurafi::IntoValue>(
     result: T,
     client_mutation_id: Option<String>,

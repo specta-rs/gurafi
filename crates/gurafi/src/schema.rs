@@ -951,6 +951,22 @@ impl<Ctx: 'static> Schema<Ctx> {
     ///
     /// `build_with` consumes the builder. Use [`Schema::build_clone`] when the builder is still
     /// needed, or call `schema.clone().build_with(options)`.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            level = "info",
+            name = "gurafi.schema.build",
+            fields(
+                objects = self.objects.len(),
+                interfaces = self.interfaces.len(),
+                unions = self.unions.len(),
+                plugins = self.plugins.len(),
+                query_fields = self.query.len(),
+                errors = tracing::field::Empty,
+            )
+        )
+    )]
     pub fn build_with(mut self, options: BuildOptions) -> Result<gql::Schema, SchemaError> {
         let mut errors = std::mem::take(&mut self.errors);
         self.merge_generated_types(&mut errors);
@@ -3440,12 +3456,22 @@ where
             )?;
             let ctx = context.context.require_data::<Ctx>()?;
             hook.run(&args, ctx)?;
-            match (resolver)(model, args, ctx, context.info) {
+            let result = match (resolver)(model, args, ctx, context.info) {
                 Ok(value) => value
                     .into_value()
                     .map(|data| gql::Value::external(ResultSuccess::new(data))),
                 Err(error) => error.into_value(),
+            };
+            #[cfg(feature = "tracing")]
+            if tracing::enabled!(target: "gurafi::error_union", tracing::Level::TRACE) {
+                tracing::trace!(
+                    target: "gurafi::error_union",
+                    field = name,
+                    outcome = if result.is_ok() { "success" } else { "error" },
+                    "gurafi.error_union.dispatch"
+                );
             }
+            result
         })
     });
     (field, validation)
@@ -3494,12 +3520,22 @@ where
             )?;
             let ctx = context.context.require_data::<Ctx>()?;
             hook.run(&args, ctx)?;
-            match (resolver)(model, args, ctx, context.info).await {
+            let result = match (resolver)(model, args, ctx, context.info).await {
                 Ok(value) => value
                     .into_value()
                     .map(|data| gql::Value::external(ResultSuccess::new(data))),
                 Err(error) => error.into_value(),
+            };
+            #[cfg(feature = "tracing")]
+            if tracing::enabled!(target: "gurafi::error_union", tracing::Level::TRACE) {
+                tracing::trace!(
+                    target: "gurafi::error_union",
+                    field = name,
+                    outcome = if result.is_ok() { "success" } else { "error" },
+                    "gurafi.error_union.dispatch"
+                );
             }
+            result
         })
     });
     (field, validation)

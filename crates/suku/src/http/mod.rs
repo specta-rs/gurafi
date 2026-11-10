@@ -333,6 +333,22 @@ impl From<HttpResponse> for HttpResult {
 /// is only invoked for requests that actually execute GraphQL (never for GraphiQL or for
 /// method/content-type rejections), so it can safely consult `Authorization`, cookies and
 /// middleware request extensions.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        skip_all,
+        level = "info",
+        name = "suku.request",
+        fields(
+            method = %parts.method,
+            path = parts.uri.path(),
+            body_bytes = body.len(),
+            request_id = tracing::field::Empty,
+            batch_size = tracing::field::Empty,
+            status = tracing::field::Empty,
+        )
+    )
+)]
 pub async fn handle<F, Fut>(
     server: &Server,
     config: &HttpConfig,
@@ -345,11 +361,23 @@ where
     Fut: Future<Output = Result<Context, HttpError>> + Send,
 {
     let accept = accept::parse(&parts.headers);
-    match parts.method {
+    let result = match parts.method {
         Method::GET => handle_get(server, config, parts, &accept, extract_context).await,
         Method::POST => handle_post(server, config, parts, body, &accept, extract_context).await,
         _ => HttpResult::Response(method_not_allowed(server)),
+    };
+    #[cfg(feature = "tracing")]
+    {
+        let span = tracing::Span::current();
+        if !span.is_disabled() {
+            let status = match &result {
+                HttpResult::Response(response) => response.status,
+                HttpResult::Stream(_) => StatusCode::OK,
+            };
+            span.record("status", status.as_u16());
+        }
     }
+    result
 }
 
 async fn handle_get<F, Fut>(
@@ -516,6 +544,28 @@ where
     process_payload(server, accept, payload, context).await
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        skip_all,
+        level = "debug",
+        name = "suku.process",
+        fields(
+            batch_size = match &payload {
+                RequestPayload::Single(_) => 1usize,
+                RequestPayload::Batch(requests) => requests.len(),
+            },
+            operation = match &payload {
+                RequestPayload::Single(request) => request.operation_name.as_deref().unwrap_or("<anonymous>"),
+                RequestPayload::Batch(_) => "<batch>",
+            },
+            request_id = match &payload {
+                RequestPayload::Single(request) => request.prepared_id().unwrap_or(""),
+                RequestPayload::Batch(_) => "",
+            },
+        )
+    )
+)]
 async fn process_payload(
     server: &Server,
     accept: &Accept,
@@ -614,6 +664,15 @@ fn sse_response(subscription: gql::SubscriptionResponse) -> HttpResult {
     let events = subscription
         .stream
         .map(|response| -> Result<Bytes, Infallible> {
+            #[cfg(feature = "tracing")]
+            if tracing::enabled!(target: "suku::subscription", tracing::Level::TRACE) {
+                tracing::trace!(
+                    target: "suku::subscription",
+                    errors = response.errors.len(),
+                    has_data = response.data.is_some(),
+                    "suku.subscription.event"
+                );
+            }
             let json = response.to_json_string();
             Ok(Bytes::from(format!("event: next\ndata: {json}\n\n")))
         })
@@ -643,6 +702,15 @@ fn execution_status(response: &Response, media: JsonMedia) -> StatusCode {
     }
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        skip_all,
+        level = "debug",
+        name = "suku.serialize",
+        fields(status = status.as_u16(), errors = response.errors.len(), body_bytes = tracing::field::Empty)
+    )
+)]
 fn json_response(status: StatusCode, accept: &Accept, response: &Response) -> HttpResponse {
     let mut http = HttpResponse::new(status);
     http.headers.insert(
@@ -654,9 +722,25 @@ fn json_response(status: StatusCode, accept: &Accept, response: &Response) -> Ht
     http.headers
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     http.body = response.to_json_bytes();
+    #[cfg(feature = "tracing")]
+    {
+        let span = tracing::Span::current();
+        if !span.is_disabled() {
+            span.record("body_bytes", http.body.len());
+        }
+    }
     http
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        skip_all,
+        level = "debug",
+        name = "suku.serialize_batch",
+        fields(responses = responses.len(), body_bytes = tracing::field::Empty)
+    )
+)]
 fn json_batch_response(accept: &Accept, responses: &[Response]) -> HttpResponse {
     // Serialize each response independently so one malformed value cannot turn the whole batch
     // into an opaque error.
@@ -691,6 +775,13 @@ fn request_error(
     message: impl Into<String>,
     request: Option<&GraphQLRequest>,
 ) -> HttpResult {
+    #[cfg(feature = "tracing")]
+    tracing::warn!(
+        target: "suku::http",
+        status = status.as_u16(),
+        code = "REQUEST",
+        "suku.request.error"
+    );
     let mut response = crate::response::error_response(message);
     let meta = request.map_or_else(ResponseMeta::none, ResponseMeta::from_request);
     server.format_response(&mut response, meta, ErrorKind::Request);
@@ -698,6 +789,13 @@ fn request_error(
 }
 
 fn context_error_response(server: &Server, accept: &Accept, mut error: HttpError) -> HttpResult {
+    #[cfg(feature = "tracing")]
+    tracing::warn!(
+        target: "suku::http",
+        status = error.status.as_u16(),
+        code = "CONTEXT",
+        "suku.request.error"
+    );
     server.format_response(
         &mut error.response,
         ResponseMeta::none(),
@@ -709,6 +807,13 @@ fn context_error_response(server: &Server, accept: &Accept, mut error: HttpError
 }
 
 fn method_not_allowed(server: &Server) -> HttpResponse {
+    #[cfg(feature = "tracing")]
+    tracing::warn!(
+        target: "suku::http",
+        status = StatusCode::METHOD_NOT_ALLOWED.as_u16(),
+        code = "METHOD",
+        "suku.request.error"
+    );
     let mut response = crate::response::error_response("Only GET and POST are supported.");
     server.format_response(&mut response, ResponseMeta::none(), ErrorKind::Request);
     let mut http = HttpResponse::with_body(
@@ -722,6 +827,13 @@ fn method_not_allowed(server: &Server) -> HttpResponse {
 }
 
 fn not_acceptable(server: &Server) -> HttpResult {
+    #[cfg(feature = "tracing")]
+    tracing::warn!(
+        target: "suku::http",
+        status = StatusCode::NOT_ACCEPTABLE.as_u16(),
+        code = "ACCEPT",
+        "suku.request.error"
+    );
     let mut response = crate::response::error_response(
         "No acceptable response type; use `application/json` or `application/graphql-response+json`.",
     );

@@ -26,6 +26,7 @@ serde = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
+tracing-core = "0.1.36"
 serde_json.workspace = true
 
 [[bench]]

@@ -114,6 +114,19 @@ pub(crate) async fn subscribe(
 /// that re-parses the query for every event (the response stream is `'static`); prepared requests
 /// hand back one that reuses the prepared document.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        skip_all,
+        level = "info",
+        name = "gql.subscription_setup",
+        fields(
+            operation = operation.name.unwrap_or("<anonymous>"),
+            prepared = prepared.is_some(),
+            variable_definitions = operation.variables.len(),
+        )
+    )
+)]
 pub(crate) async fn subscribe_document<F>(
     schema: &Schema,
     document: &ast::Document<'_>,
