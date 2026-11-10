@@ -4,13 +4,15 @@
 //! introspection snapshots and code generation. Server code normally builds schemas with the
 //! builder (or with `gurafi`) and attaches resolvers.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
 
 use crate::{
     Value,
     ast::{self, Definition, TypeDefinitionKind, TypeExtensionKind, TypeSystemDefinition},
     error::GraphQLError,
-    schema::{Schema, SchemaBuilder, SchemaError},
+    schema::{DirectiveOwner, NamedOwner, NamedPath, Schema, SchemaBuilder, SchemaError},
     types::{
         AppliedDirective, DirectiveDefinition, EnumType, EnumValue, Field, InputObjectType,
         InputValue, InterfaceType, Name, ObjectType, ScalarType, Type, TypeRef, UnionType,
@@ -98,7 +100,7 @@ fn check_sdl_directives(document: &ast::Document<'_>) -> Vec<GraphQLError> {
             .collect(),
         repeatable: false,
     };
-    let mut specs: HashMap<&str, Spec> = HashMap::new();
+    let mut specs: FxHashMap<&str, Spec> = FxHashMap::default();
     specs.insert(
         "skip",
         builtin(
@@ -142,7 +144,7 @@ fn check_sdl_directives(document: &ast::Document<'_>) -> Vec<GraphQLError> {
 
     // The edges of the directive-reference graph, used to reject a directive that applies
     // itself (directly or transitively) to one of its own arguments.
-    let mut references: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut references: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
 
     for definition in &document.definitions {
         if let Definition::TypeSystem(TypeSystemDefinition::Directive(directive)) = definition {
@@ -178,7 +180,7 @@ fn check_sdl_directives(document: &ast::Document<'_>) -> Vec<GraphQLError> {
     fn check(
         directives: &[ast::Directive<'_>],
         expected: crate::ast::DirectiveLocation,
-        specs: &HashMap<&str, Spec>,
+        specs: &FxHashMap<&str, Spec>,
         errors: &mut Vec<GraphQLError>,
     ) {
         let mut seen: Vec<&str> = Vec::new();
@@ -253,7 +255,7 @@ fn check_sdl_directives(document: &ast::Document<'_>) -> Vec<GraphQLError> {
 
     fn check_field(
         field: &ast::FieldDefinition<'_>,
-        specs: &HashMap<&str, Spec>,
+        specs: &FxHashMap<&str, Spec>,
         errors: &mut Vec<GraphQLError>,
     ) {
         check(&field.directives, Location::FieldDefinition, specs, errors);
@@ -416,7 +418,7 @@ fn check_sdl_directives(document: &ast::Document<'_>) -> Vec<GraphQLError> {
     fn reaches(
         current: &str,
         target: &str,
-        references: &HashMap<&str, Vec<&str>>,
+        references: &FxHashMap<&str, Vec<&str>>,
         visited: &mut Vec<String>,
     ) -> bool {
         if visited.iter().any(|name| name == current) {
@@ -456,7 +458,7 @@ struct Definitions {
     /// Schema-level applications, in source order, validated before the schema is built.
     applied_directives: Vec<AppliedDirective>,
     errors: Vec<GraphQLError>,
-    seen: HashMap<Name, usize>,
+    seen: FxHashMap<Name, usize>,
     schema_definition_seen: bool,
     roots_seen: Vec<ast::OperationKind>,
 }
@@ -962,7 +964,9 @@ impl Definitions {
 
 fn type_ref(ty: &ast::Type<'_>) -> TypeRef {
     match ty {
-        ast::Type::Named(name) => TypeRef::named(*name),
+        // Built-in type names are interned, so a reference to `String` or `Int` shares one
+        // allocation instead of making a new `Arc<str>` for every field and argument.
+        ast::Type::Named(name) => TypeRef::named_str(name),
         ast::Type::List(inner) => type_ref(inner).list(),
         ast::Type::NonNull(inner) => type_ref(inner).non_null(),
     }
@@ -1096,11 +1100,23 @@ fn const_value(value: &ast::Value<'_>) -> Result<Value, GraphQLError> {
 /// as they do for field arguments. Built-in directives are included, which means a wrong-typed
 /// `@deprecated(reason: ...)` or `@specifiedBy(url: ...)` is rejected instead of silently
 /// becoming `""`.
+/// `argument "name" of <owner>`, formatted only when an error is recorded.
+struct LowerArgument<'a> {
+    name: &'a str,
+    owner: &'a dyn core::fmt::Display,
+}
+
+impl core::fmt::Display for LowerArgument<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "argument \"{}\" of {}", self.name, self.owner)
+    }
+}
+
 /// Validate every directive applied at one location against the built schema.
 fn check_directive_values(
     schema: &Schema,
     directives: &[ast::Directive<'_>],
-    owner: &str,
+    owner: &dyn core::fmt::Display,
     errors: &mut Vec<GraphQLError>,
 ) {
     for directive in directives {
@@ -1142,26 +1158,33 @@ fn validate_directive_values(schema: &Schema, document: &ast::Document<'_>) -> V
                 check_directive_values(
                     schema,
                     &schema_definition.directives,
-                    "the schema",
+                    &"the schema",
                     &mut errors,
                 );
             }
             TypeSystemDefinition::SchemaExtension(extension) => {
-                check_directive_values(schema, &extension.directives, "the schema", &mut errors);
+                check_directive_values(schema, &extension.directives, &"the schema", &mut errors);
             }
             TypeSystemDefinition::Directive(directive) => {
-                let owner = format!("directive \"@{}\"", directive.name);
-                check_directive_values(schema, &directive.directives, &owner, &mut errors);
+                check_directive_values(
+                    schema,
+                    &directive.directives,
+                    &DirectiveOwner(directive.name),
+                    &mut errors,
+                );
                 for argument in &directive.arguments {
-                    let owner = format!(
-                        "argument \"{}\" of directive \"@{}\"",
-                        argument.name, directive.name
-                    );
+                    let owner = LowerArgument {
+                        name: argument.name,
+                        owner: &DirectiveOwner(directive.name),
+                    };
                     check_directive_values(schema, &argument.directives, &owner, &mut errors);
                 }
             }
             TypeSystemDefinition::Type(definition) => {
-                let owner = format!("type \"{}\"", definition.name);
+                let owner = NamedOwner {
+                    kind: "type",
+                    name: definition.name,
+                };
                 check_directive_values(schema, &definition.directives, &owner, &mut errors);
                 match &definition.kind {
                     TypeDefinitionKind::Scalar | TypeDefinitionKind::Union(_) => {}
@@ -1173,22 +1196,31 @@ fn validate_directive_values(schema: &Schema, document: &ast::Document<'_>) -> V
                     }
                     TypeDefinitionKind::Enum(enumeration) => {
                         for value in &enumeration.values {
-                            let owner =
-                                format!("enum value \"{}.{}\"", definition.name, value.name);
+                            let owner = NamedPath {
+                                kind: "enum value",
+                                type_name: definition.name,
+                                name: value.name,
+                            };
                             check_directive_values(schema, &value.directives, &owner, &mut errors);
                         }
                     }
                     TypeDefinitionKind::InputObject(input) => {
                         for field in &input.fields {
-                            let owner =
-                                format!("input field \"{}.{}\"", definition.name, field.name);
+                            let owner = NamedPath {
+                                kind: "input field",
+                                type_name: definition.name,
+                                name: field.name,
+                            };
                             check_directive_values(schema, &field.directives, &owner, &mut errors);
                         }
                     }
                 }
             }
             TypeSystemDefinition::TypeExtension(extension) => {
-                let owner = format!("type \"{}\"", extension.name);
+                let owner = NamedOwner {
+                    kind: "type",
+                    name: extension.name,
+                };
                 check_directive_values(schema, &extension.directives, &owner, &mut errors);
                 match &extension.kind {
                     TypeExtensionKind::Scalar | TypeExtensionKind::Union(_) => {}
@@ -1200,14 +1232,21 @@ fn validate_directive_values(schema: &Schema, document: &ast::Document<'_>) -> V
                     }
                     TypeExtensionKind::Enum(enumeration) => {
                         for value in &enumeration.values {
-                            let owner = format!("enum value \"{}.{}\"", extension.name, value.name);
+                            let owner = NamedPath {
+                                kind: "enum value",
+                                type_name: extension.name,
+                                name: value.name,
+                            };
                             check_directive_values(schema, &value.directives, &owner, &mut errors);
                         }
                     }
                     TypeExtensionKind::InputObject(input) => {
                         for field in &input.fields {
-                            let owner =
-                                format!("input field \"{}.{}\"", extension.name, field.name);
+                            let owner = NamedPath {
+                                kind: "input field",
+                                type_name: extension.name,
+                                name: field.name,
+                            };
                             check_directive_values(schema, &field.directives, &owner, &mut errors);
                         }
                     }
@@ -1225,13 +1264,21 @@ fn check_fields(
     errors: &mut Vec<GraphQLError>,
 ) {
     for field in fields {
-        let owner = format!("field \"{type_name}.{}\"", field.name);
+        let owner = NamedPath {
+            kind: "field",
+            type_name,
+            name: field.name,
+        };
         check_directive_values(schema, &field.directives, &owner, errors);
         for argument in &field.arguments {
-            let owner = format!(
-                "argument \"{}\" of field \"{}.{}\"",
-                argument.name, type_name, field.name
-            );
+            let owner = LowerArgument {
+                name: argument.name,
+                owner: &NamedPath {
+                    kind: "field",
+                    type_name,
+                    name: field.name,
+                },
+            };
             check_directive_values(schema, &argument.directives, &owner, errors);
         }
     }
@@ -1247,7 +1294,7 @@ fn check_model_directives(schema: &Schema, errors: &mut Vec<GraphQLError>) {
     fn check(
         schema: &Schema,
         directives: &[AppliedDirective],
-        owner: &str,
+        owner: &dyn core::fmt::Display,
         errors: &mut Vec<GraphQLError>,
     ) {
         let mut seen: Vec<&str> = Vec::new();
@@ -1274,7 +1321,10 @@ fn check_model_directives(schema: &Schema, errors: &mut Vec<GraphQLError>) {
                 check(
                     schema,
                     &scalar.directives,
-                    &format!("scalar \"{}\"", scalar.name),
+                    &NamedOwner {
+                        kind: "scalar",
+                        name: &scalar.name,
+                    },
                     errors,
                 );
             }
@@ -1282,15 +1332,29 @@ fn check_model_directives(schema: &Schema, errors: &mut Vec<GraphQLError>) {
                 check(
                     schema,
                     &object.directives,
-                    &format!("object \"{}\"", object.name),
+                    &NamedOwner {
+                        kind: "object",
+                        name: &object.name,
+                    },
                     errors,
                 );
                 for field in object.fields.values() {
-                    let owner = format!("field \"{}.{}\"", object.name, field.name);
+                    let owner = NamedPath {
+                        kind: "field",
+                        type_name: &object.name,
+                        name: &field.name,
+                    };
                     check(schema, &field.directives, &owner, errors);
                     for argument in field.args.values() {
-                        let owner = format!("argument \"{}\" of {owner}", argument.name);
-                        check(schema, &argument.directives, &owner, errors);
+                        check(
+                            schema,
+                            &argument.directives,
+                            &LowerArgument {
+                                name: &argument.name,
+                                owner: &owner,
+                            },
+                            errors,
+                        );
                     }
                 }
             }
@@ -1298,15 +1362,29 @@ fn check_model_directives(schema: &Schema, errors: &mut Vec<GraphQLError>) {
                 check(
                     schema,
                     &interface.directives,
-                    &format!("interface \"{}\"", interface.name),
+                    &NamedOwner {
+                        kind: "interface",
+                        name: &interface.name,
+                    },
                     errors,
                 );
                 for field in interface.fields.values() {
-                    let owner = format!("field \"{}.{}\"", interface.name, field.name);
+                    let owner = NamedPath {
+                        kind: "field",
+                        type_name: &interface.name,
+                        name: &field.name,
+                    };
                     check(schema, &field.directives, &owner, errors);
                     for argument in field.args.values() {
-                        let owner = format!("argument \"{}\" of {owner}", argument.name);
-                        check(schema, &argument.directives, &owner, errors);
+                        check(
+                            schema,
+                            &argument.directives,
+                            &LowerArgument {
+                                name: &argument.name,
+                                owner: &owner,
+                            },
+                            errors,
+                        );
                     }
                 }
             }
@@ -1314,7 +1392,10 @@ fn check_model_directives(schema: &Schema, errors: &mut Vec<GraphQLError>) {
                 check(
                     schema,
                     &union.directives,
-                    &format!("union \"{}\"", union.name),
+                    &NamedOwner {
+                        kind: "union",
+                        name: &union.name,
+                    },
                     errors,
                 );
             }
@@ -1322,11 +1403,18 @@ fn check_model_directives(schema: &Schema, errors: &mut Vec<GraphQLError>) {
                 check(
                     schema,
                     &enumeration.directives,
-                    &format!("enum \"{}\"", enumeration.name),
+                    &NamedOwner {
+                        kind: "enum",
+                        name: &enumeration.name,
+                    },
                     errors,
                 );
                 for value in enumeration.values.values() {
-                    let owner = format!("enum value \"{}.{}\"", enumeration.name, value.name);
+                    let owner = NamedPath {
+                        kind: "enum value",
+                        type_name: &enumeration.name,
+                        name: &value.name,
+                    };
                     check(schema, &value.directives, &owner, errors);
                 }
             }
@@ -1334,11 +1422,18 @@ fn check_model_directives(schema: &Schema, errors: &mut Vec<GraphQLError>) {
                 check(
                     schema,
                     &input.directives,
-                    &format!("input object \"{}\"", input.name),
+                    &NamedOwner {
+                        kind: "input object",
+                        name: &input.name,
+                    },
                     errors,
                 );
                 for field in input.fields.values() {
-                    let owner = format!("input field \"{}.{}\"", input.name, field.name);
+                    let owner = NamedPath {
+                        kind: "input field",
+                        type_name: &input.name,
+                        name: &field.name,
+                    };
                     check(schema, &field.directives, &owner, errors);
                 }
             }
@@ -1349,15 +1444,19 @@ fn check_model_directives(schema: &Schema, errors: &mut Vec<GraphQLError>) {
         check(
             schema,
             &directive.directives,
-            &format!("directive \"@{}\"", directive.name),
+            &DirectiveOwner(&directive.name),
             errors,
         );
         for argument in directive.args.values() {
-            let owner = format!(
-                "argument \"{}\" of directive \"@{}\"",
-                argument.name, directive.name
+            check(
+                schema,
+                &argument.directives,
+                &LowerArgument {
+                    name: &argument.name,
+                    owner: &DirectiveOwner(&directive.name),
+                },
+                errors,
             );
-            check(schema, &argument.directives, &owner, errors);
         }
     }
 }
@@ -1376,7 +1475,7 @@ pub(crate) fn validate_applied_directives(
     schema: &Schema,
     directives: &[AppliedDirective],
     location: ast::DirectiveLocation,
-    owner: &str,
+    owner: &dyn core::fmt::Display,
     errors: &mut SchemaError,
 ) {
     let mut seen: Vec<&str> = Vec::new();

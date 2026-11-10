@@ -25,7 +25,7 @@ use crate::{
     ast::{self, OperationKind},
     complexity::{self, ComplexityOptions, StaticComplexity},
     error::{GraphQLError, Location, Path, PathSegment, Response},
-    fragments::Fragments,
+    fragments::{FragmentIndex, Fragments},
     introspection,
     parser::parse_query,
     schema::Schema,
@@ -177,6 +177,7 @@ pub(crate) async fn execute_operation<'doc>(
         operation,
         operation.name.map(Arc::from),
         None,
+        None,
         root_type,
         variables.values,
         options,
@@ -197,6 +198,7 @@ pub(crate) async fn execute_prepared_operation<'doc>(
     operation: &'doc ast::OperationDefinition<'doc>,
     operation_name: Option<Arc<str>>,
     plan: &'doc PreparedPlan<'doc>,
+    fragment_index: &'doc FragmentIndex<'doc>,
     root_type: &'doc ObjectType,
     static_complexity: Option<&StaticComplexity>,
     compiled_variables: Option<&coerce::CompiledVariables>,
@@ -251,6 +253,7 @@ pub(crate) async fn execute_prepared_operation<'doc>(
         operation,
         operation_name,
         Some(plan),
+        Some(fragment_index),
         root_type,
         variables.values,
         options,
@@ -287,6 +290,7 @@ async fn finish_operation<'doc>(
     operation: &'doc ast::OperationDefinition<'doc>,
     operation_name: Option<Arc<str>>,
     plan: Option<&'doc PreparedPlan<'doc>>,
+    fragment_index: Option<&'doc FragmentIndex<'doc>>,
     root_type: &'doc ObjectType,
     variables: Object,
     options: &ExecutionOptions,
@@ -304,7 +308,10 @@ async fn finish_operation<'doc>(
     };
     let deadline = options.timeout.map(|timeout| Instant::now() + timeout);
 
-    let fragments = Fragments::new(document);
+    let fragments = match fragment_index {
+        Some(index) => Fragments::prepared(document, index),
+        None => Fragments::new(document),
+    };
     run_operation(
         &context,
         fragments,
@@ -559,6 +566,23 @@ impl<'doc> Executor<'doc> {
             return Ok(result);
         }
         if self.parallel && collected.len() > 1 {
+            // A single field that needs the asynchronous path has nothing to run concurrently with,
+            // so it is awaited in place instead of through a batch. That saves the future vector,
+            // its ordered output vector and a cloned path per object, which is the common shape
+            // for a record with one resolver-backed field among scalar properties.
+            if self.only_one_async_field(object_type, &collected) {
+                return self
+                    .execute_fields_sequentially_planned(
+                        object_type,
+                        parent,
+                        &collected,
+                        path,
+                        errors,
+                        result,
+                        depth,
+                    )
+                    .await;
+            }
             // The batch lives on the heap so the boxed future below stays small enough to
             // recurse safely.
             let mut futures = Vec::with_capacity(collected.len());
@@ -1035,7 +1059,7 @@ impl<'doc> Executor<'doc> {
         let location = first.location;
         // A single leaf node collects no selection sets, which is the majority of fields and
         // does not need to build (or even walk) the list.
-        let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 2]> = match nodes {
+        let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 4]> = match nodes {
             [only] if only.selection_set.is_none() => SmallVec::new(),
             _ => nodes
                 .iter()
@@ -1325,7 +1349,7 @@ impl<'doc> Executor<'doc> {
         let location = first.location;
         // A single leaf node collects no selection sets, which is the majority of fields and
         // does not need to build (or even walk) the list.
-        let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 2]> = match nodes {
+        let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 4]> = match nodes {
             [only] if only.selection_set.is_none() => SmallVec::new(),
             _ => nodes
                 .iter()
@@ -1563,6 +1587,95 @@ impl<'doc> Executor<'doc> {
         }
     }
 
+    /// Whether exactly one group of `collected` needs the asynchronous completion path.
+    ///
+    /// The predicate is the same one the inline leaf path uses, so this only scans the groups and
+    /// never completes (or even touches) a field.
+    fn only_one_async_field(
+        &self,
+        object_type: &'doc ObjectType,
+        collected: &CollectedFields<'doc>,
+    ) -> bool {
+        let mut async_fields = 0usize;
+        for index in 0..collected.len() {
+            let Some(group) = collected.view(index, &self.context.variables, object_type) else {
+                continue;
+            };
+            if !self.can_execute_leaf_inline_planned(object_type, &group) {
+                async_fields += 1;
+                if async_fields > 1 {
+                    return false;
+                }
+            }
+        }
+        async_fields == 1
+    }
+
+    /// Complete every group in document order, awaiting the single asynchronous field in place.
+    ///
+    /// This mirrors the batched loop's ordering and error handling: every field is completed,
+    /// errors are appended in document order, and the first non-null failure bubbles only after
+    /// the remaining fields were completed.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_fields_sequentially_planned<'s>(
+        &'s self,
+        object_type: &'doc ObjectType,
+        parent: &'s Value,
+        collected: &CollectedFields<'doc>,
+        path: &'s mut Path,
+        errors: &'s mut Vec<GraphQLError>,
+        mut result: Object,
+        depth: usize,
+    ) -> Result<Object, GraphQLError>
+    where
+        'doc: 's,
+    {
+        // The batch checks the deadline once before polling, so a single-field completion does the
+        // same; each completion still checks it for itself.
+        if self.expired() {
+            return Err(
+                GraphQLError::new("The operation timed out before it could finish.")
+                    .with_path(path.to_vec()),
+            );
+        }
+        let mut bubble = None;
+        for index in 0..collected.len() {
+            let Some(group) = collected.view(index, &self.context.variables, object_type) else {
+                continue;
+            };
+            let (response_key, outcome) =
+                match self.try_execute_leaf_planned(object_type, parent, &group, path, errors) {
+                    Some(done) => done,
+                    // The single asynchronous field is awaited in place, so no box is needed.
+                    None => {
+                        self.execute_field_unboxed_planned(
+                            object_type,
+                            parent,
+                            &group,
+                            path,
+                            errors,
+                            depth,
+                        )
+                        .await
+                    }
+                };
+            match outcome {
+                Ok(value) => result.push_unchecked(response_key, value),
+                // A non-null field failed; keep collecting the other fields' errors, but the
+                // object itself becomes null.
+                Err(error) => {
+                    if bubble.is_none() {
+                        bubble = Some(error);
+                    }
+                }
+            }
+        }
+        match bubble {
+            Some(error) => Err(error),
+            None => Ok(result),
+        }
+    }
+
     /// Complete a selection set made only of object properties.
     ///
     /// This runs before the asynchronous batch is built so such sets never allocate or poll a
@@ -1715,28 +1828,46 @@ impl<'doc> Executor<'doc> {
     where
         'doc: 's,
     {
-        async move {
-            let Some(first) = group.nodes.first() else {
-                return (
-                    Arc::from(group.response_key),
-                    Err(GraphQLError::new(format!(
-                        "No field node was provided for response key \"{}\".",
-                        group.response_key
-                    ))),
-                );
-            };
+        self.execute_field_unboxed_planned(object_type, parent, group, path, errors, depth)
+            .boxed()
+    }
 
-            // An unaliased field's response key is exactly the schema field's interned name, so the
-            // response object and the error path can share that `Arc` instead of allocating one.
-            let key = group.key_arc(first, group.field);
-            path.push(PathSegment::Field(key));
+    /// [`Self::execute_field_planned`] without the box, for the caller that awaits it in place.
+    ///
+    /// A sequential completion holds one field future at a time, so the box would only add an
+    /// allocation: the recursive state is already owned by the boxed
+    /// [`Self::execute_fields`] future enclosing it.
+    async fn execute_field_unboxed_planned<'s>(
+        &'s self,
+        object_type: &'doc ObjectType,
+        parent: &'s Value,
+        group: &'s GroupView<'_, 'doc>,
+        path: &'s mut Path,
+        errors: &'s mut Vec<GraphQLError>,
+        depth: usize,
+    ) -> (Arc<str>, Result<Value, GraphQLError>)
+    where
+        'doc: 's,
+    {
+        let Some(first) = group.nodes.first() else {
+            return (
+                Arc::from(group.response_key),
+                Err(GraphQLError::new(format!(
+                    "No field node was provided for response key \"{}\".",
+                    group.response_key
+                ))),
+            );
+        };
 
-            let outcome = self
-                .execute_field_inner_planned(object_type, group, parent, path, errors, depth)
-                .await;
-            (pop_field_key(path), outcome)
-        }
-        .boxed()
+        // An unaliased field's response key is exactly the schema field's interned name, so the
+        // response object and the error path can share that `Arc` instead of allocating one.
+        let key = group.key_arc(first, group.field);
+        path.push(PathSegment::Field(key));
+
+        let outcome = self
+            .execute_field_inner_planned(object_type, group, parent, path, errors, depth)
+            .await;
+        (pop_field_key(path), outcome)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1757,8 +1888,8 @@ impl<'doc> Executor<'doc> {
         };
         let location = first.location;
         // The completion path takes the merged selection sets. They are built here in document
-        // order; the buffer stays inline for the usual one or two nodes.
-        let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 2]> = match group.nodes.first()
+        // order; the buffer stays inline for the usual handful of merged nodes.
+        let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 4]> = match group.nodes.first()
         {
             Some(only) if only.selection_set.is_none() => SmallVec::new(),
             _ => group.nodes.selection_sets(),
@@ -1767,9 +1898,6 @@ impl<'doc> Executor<'doc> {
             &selection_sets,
             group.child.filter(|_| self.plans.is_some()),
         );
-        // The plan owns its nodes as `Arc`s; collect references once so `ResolveInfo` can expose
-        // the same slice shape as the dynamic path.
-        let field_nodes = group.nodes.field_node_refs();
 
         if self.expired() {
             return Err(
@@ -1786,16 +1914,18 @@ impl<'doc> Executor<'doc> {
                 parent: object_type.name.as_ref(),
                 name: first.name,
             };
-            let empty_args = Object::new();
-            let info = self.resolve_info(
-                first.name,
-                object_type.name.as_ref(),
-                &ty,
-                path.as_slice(),
-                ast::FieldNodes::borrowed(&field_nodes),
-            );
             let denial = match self.context.authorizer.as_ref() {
                 Some(authorizer) => {
+                    // The merged nodes are only materialized when a caller can observe them.
+                    let field_nodes = group.nodes.field_node_refs();
+                    let empty_args = Object::new();
+                    let info = self.resolve_info(
+                        first.name,
+                        object_type.name.as_ref(),
+                        &ty,
+                        path.as_slice(),
+                        ast::FieldNodes::borrowed(&field_nodes),
+                    );
                     let authorization = AuthorizationContext {
                         context: self.context,
                         field_name: first.name,
@@ -1892,7 +2022,19 @@ impl<'doc> Executor<'doc> {
         // A resolver produces an owned value, but a field without one just reads the parent
         // object's property. Borrowing that property instead of cloning it is what keeps
         // composite fields free of a full copy of the parent's list or object.
-        let resolved = {
+        //
+        // Selection information is only materialized when a caller can observe it: the merged
+        // node slice allocates for groups with several nodes, and most fields have neither a
+        // resolver nor an authorizer to read it.
+        let authorizer = self
+            .context
+            .authorizer
+            .as_ref()
+            .filter(|_| !(self.skip_root_authorization && path.len() == 1));
+        let resolved = if authorizer.is_none() && field.resolve.is_none() {
+            default_property(label, field.name.as_ref(), parent).map(property_value)
+        } else {
+            let field_nodes = group.nodes.field_node_refs();
             let info = self.resolve_info(
                 field.name.as_ref(),
                 object_type.name.as_ref(),
@@ -1900,8 +2042,8 @@ impl<'doc> Executor<'doc> {
                 path.as_slice(),
                 ast::FieldNodes::borrowed(&field_nodes),
             );
-            let denial = match self.context.authorizer.as_ref() {
-                Some(authorizer) if !(self.skip_root_authorization && path.len() == 1) => {
+            let denial = match authorizer {
+                Some(authorizer) => {
                     let authorization = AuthorizationContext {
                         context: self.context,
                         field_name: field.name.as_ref(),
@@ -1913,7 +2055,7 @@ impl<'doc> Executor<'doc> {
                     };
                     authorizer.authorize_async(&authorization).await.err()
                 }
-                _ => None,
+                None => None,
             };
             if let Some(error) = denial {
                 Err(error)
@@ -2849,7 +2991,7 @@ impl<'doc> Executor<'doc> {
         depth: usize,
     ) -> Option<Result<Value, GraphQLError>> {
         let location = first.location;
-        let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 2]> = match nodes {
+        let selection_sets: SmallVec<[&'doc ast::SelectionSet<'doc>; 4]> = match nodes {
             [only] if only.selection_set.is_none() => SmallVec::new(),
             _ => nodes
                 .iter()

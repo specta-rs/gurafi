@@ -483,39 +483,42 @@ where
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn cached(&self, key: &K) -> Option<Arc<Result<V, E>>> {
-        match self.lock().entries.get(key) {
-            Some(Entry::Ready(result)) => Some(Arc::clone(result)),
-            _ => None,
-        }
-    }
-
     /// Queue a key unless it is already cached or in flight.
-    fn enqueue(&self, key: K) {
+    ///
+    /// Returns the cached result when the key is already resolved. Doing the cache check and the
+    /// queue insertion under one lock keeps the common load path at two lock acquisitions (queue,
+    /// then flush/lookup) instead of four.
+    fn enqueue(&self, key: &K) -> Option<Arc<Result<V, E>>> {
         let mut state = self.lock();
-        if state.entries.contains_key(&key) {
-            return;
+        match state.entries.get(key) {
+            Some(Entry::Ready(result)) => return Some(Arc::clone(result)),
+            // Queued or part of an in-flight batch: the existing entry already covers this load.
+            Some(_) => return None,
+            None => {}
         }
         if state.queue.len() >= self.config.max_queue {
             self.flush_locked(&mut state);
-            if state.entries.contains_key(&key) {
-                return;
+            if state.entries.contains_key(key) {
+                return None;
             }
         }
         if state.queued.insert(key.clone()) {
-            state.queue.push_back(key);
+            state.queue.push_back(key.clone());
         }
+        None
+    }
+
+    /// Flush the queue and report what is known about `key`, under one lock.
+    fn flush_and_lookup(&self, key: &K) -> Lookup<V, E> {
+        let mut state = self.lock();
+        self.flush_locked(&mut state);
+        Self::lookup_locked(&state, key)
     }
 
     /// Turn every queued key into a batch.
     ///
     /// Splitting respects `max_batch_size`. Each batch is started as a shared future; whichever
     /// waiter is polled drives it, which is what makes the loader spawn-free.
-    fn flush(&self) {
-        let mut state = self.lock();
-        self.flush_locked(&mut state);
-    }
-
     fn flush_locked(&self, state: &mut State<K, V, E>) {
         while !state.queue.is_empty() {
             let take = state.queue.len().min(self.config.max_batch_size);
@@ -553,7 +556,7 @@ where
                     .collect(),
             );
             if let Some(inner) = weak.upgrade() {
-                inner.complete(batch, &keys, &results);
+                inner.complete(batch, keys, &results);
             }
             results
         }
@@ -562,13 +565,13 @@ where
     }
 
     /// Record the outcome of a batch, waking every waiter through the shared future.
-    fn complete(&self, batch: u64, keys: &[K], results: &BatchOutput<V, E>) {
+    fn complete(&self, batch: u64, keys: Vec<K>, results: &BatchOutput<V, E>) {
         let mut state = self.lock();
         state.batches.remove(&batch);
 
-        for (index, key) in keys.iter().enumerate() {
+        for (index, key) in keys.into_iter().enumerate() {
             let owns_key = matches!(
-                state.entries.get(key),
+                state.entries.get(&key),
                 Some(Entry::Pending { batch: owner, .. }) if *owner == batch
             );
             if !owns_key {
@@ -578,23 +581,20 @@ where
 
             match results.get(index) {
                 Some(result) => {
-                    state
-                        .entries
-                        .insert(key.clone(), Entry::Ready(Arc::clone(result)));
+                    state.entries.insert(key, Entry::Ready(Arc::clone(result)));
                 }
                 None => {
                     // The batch function omitted this key. Retry it in the next batch.
-                    state.entries.remove(key);
+                    state.entries.remove(&key);
                     if state.queued.insert(key.clone()) {
-                        state.queue.push_back(key.clone());
+                        state.queue.push_back(key);
                     }
                 }
             }
         }
     }
 
-    fn lookup(&self, key: &K) -> Lookup<V, E> {
-        let state = self.lock();
+    fn lookup_locked(state: &State<K, V, E>, key: &K) -> Lookup<V, E> {
         match state.entries.get(key) {
             Some(Entry::Ready(result)) => Lookup::Ready(Arc::clone(result)),
             Some(Entry::Pending { batch, index }) => match state.batches.get(batch) {
@@ -609,11 +609,10 @@ where
     }
 
     async fn load(self: Arc<Self>, key: K) -> Result<V, E> {
-        if let Some(result) = self.cached(&key) {
+        // One lock covers both "already resolved?" and "queue it for the next batch".
+        if let Some(result) = self.enqueue(&key) {
             return (*result).clone();
         }
-
-        self.enqueue(key.clone());
 
         // One yield is the batch window: every load polled before this task is polled again is
         // queued and will be flushed into the same batch.
@@ -621,9 +620,7 @@ where
 
         let mut attempts: u8 = 0;
         loop {
-            self.flush();
-
-            match self.lookup(&key) {
+            match self.flush_and_lookup(&key) {
                 Lookup::Ready(result) => return (*result).clone(),
                 Lookup::Pending { shared, index } => {
                     let results = shared.await;
@@ -655,7 +652,7 @@ where
                              this indicates a bug in the loader"
                         );
                     }
-                    self.enqueue(key.clone());
+                    self.enqueue(&key);
                 }
             }
         }

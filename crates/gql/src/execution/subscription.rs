@@ -191,7 +191,10 @@ where
         extensions: std::sync::Mutex::new(None),
     };
 
-    let fragments = crate::fragments::Fragments::new(document);
+    let fragments = match prepared.as_ref() {
+        Some(prepared) => prepared.fragments.clone(),
+        None => crate::fragments::Fragments::new(document),
+    };
     let plan = prepared.as_ref().map(|prepared| prepared.plan);
     let selection_sets = [&operation.selection_set];
     let selections = collect::Selections::new(&selection_sets, plan.and_then(|plan| plan.root()));

@@ -5,7 +5,7 @@
 //! `Query.nodes`; every later registration adds its type to the same dispatcher.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex, PoisonError, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -45,7 +45,8 @@ type NodeIdGetter<M> = Arc<dyn Fn(&M) -> String + Send + Sync>;
 const MAX_NODE_FANOUT: usize = 16;
 
 struct NodeTypeEntry<Ctx> {
-    typename: String,
+    /// Shared so cloning an entry to rebuild the registry does not copy the name.
+    typename: Arc<str>,
     load_one: LoadOneValue<Ctx>,
     load_many: LoadManyValue<Ctx>,
 }
@@ -53,7 +54,7 @@ struct NodeTypeEntry<Ctx> {
 impl<Ctx> Clone for NodeTypeEntry<Ctx> {
     fn clone(&self) -> Self {
         Self {
-            typename: self.typename.clone(),
+            typename: Arc::clone(&self.typename),
             load_one: Arc::clone(&self.load_one),
             load_many: Arc::clone(&self.load_many),
         }
@@ -265,7 +266,7 @@ impl<M: ObjectModel, Ctx: 'static + Sync> NodeBuilder<M, Ctx> {
 
         Ok((
             NodeTypeEntry {
-                typename: M::NAME.to_owned(),
+                typename: Arc::from(M::NAME),
                 load_one,
                 load_many,
             },
@@ -278,25 +279,34 @@ impl<M: ObjectModel, Ctx: 'static + Sync> NodeBuilder<M, Ctx> {
 ///
 /// Loader failures are cached too: retrying a failing backend once per selection would multiply
 /// the damage during an outage.
+///
+/// The map is nested by type name so a lookup never has to build a combined `"Type:id"` key: the
+/// outer name is an [`Arc<str>]` shared with the registry, and the inner key borrows the decoded
+/// local ID. Only an actual load allocates a key for its cached result.
+type CachedNode = Result<Option<Value>, GraphQLError>;
+
 #[derive(Default)]
 struct NodeResultCache {
-    entries: Mutex<HashMap<String, Result<Option<Value>, GraphQLError>>>,
+    entries: Mutex<HashMap<Arc<str>, HashMap<String, CachedNode>>>,
 }
 
 impl NodeResultCache {
-    fn get(&self, key: &str) -> Option<Result<Option<Value>, GraphQLError>> {
+    fn get(&self, typename: &str, local: &str) -> Option<CachedNode> {
         self.entries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(key)
+            .get(typename)
+            .and_then(|by_local| by_local.get(local))
             .cloned()
     }
 
-    fn insert(&self, key: String, value: Result<Option<Value>, GraphQLError>) {
+    fn insert(&self, typename: &Arc<str>, local_id: impl Into<String>, value: CachedNode) {
         self.entries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(key, value);
+            .entry(Arc::clone(typename))
+            .or_default()
+            .insert(local_id.into(), value);
     }
 }
 
@@ -324,7 +334,11 @@ impl NodeResultCache {
 pub struct Relay<Ctx: 'static> {
     node_interface: Option<InterfaceRef>,
     node_root: bool,
-    node_types: Arc<RwLock<Vec<NodeTypeEntry<Ctx>>>>,
+    /// The registered node types, behind a shared immutable snapshot.
+    ///
+    /// Requests clone the inner [`Arc`] instead of the entries, so dispatch never copies the
+    /// registry; registration rebuilds the vector while no request can observe the old one.
+    node_types: Arc<RwLock<Arc<Vec<NodeTypeEntry<Ctx>>>>>,
     cache_accessor: Option<CacheAccessor<Ctx>>,
     allow_local_ids: Arc<AtomicBool>,
     pub(crate) page_info: bool,
@@ -345,7 +359,7 @@ impl<Ctx: 'static + Sync> Relay<Ctx> {
         Self {
             node_interface: None,
             node_root: false,
-            node_types: Arc::new(RwLock::new(Vec::new())),
+            node_types: Arc::new(RwLock::new(Arc::new(Vec::new()))),
             cache_accessor: None,
             allow_local_ids: Arc::new(AtomicBool::new(false)),
             page_info: false,
@@ -401,13 +415,13 @@ impl<Ctx: 'static + Sync> Relay<Ctx> {
         schema: &mut Schema<Ctx>,
         build: impl FnOnce(&mut NodeBuilder<M, Ctx>),
     ) -> Result<(), RelayError> {
-        let typename = M::NAME.to_owned();
+        let typename: Arc<str> = Arc::from(M::NAME);
         if self
             .node_types
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .any(|entry| entry.typename == typename)
+            .any(|entry| *entry.typename == *typename)
         {
             return Err(RelayError::new(format!(
                 "node type `{typename}` is already registered with this Relay"
@@ -435,10 +449,11 @@ impl<Ctx: 'static + Sync> Relay<Ctx> {
             }
         });
 
-        self.node_types
+        let mut types = self
+            .node_types
             .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(entry);
+            .unwrap_or_else(PoisonError::into_inner);
+        Arc::make_mut(&mut types).push(entry);
         Ok(())
     }
 
@@ -516,12 +531,13 @@ impl<Ctx: 'static + Sync> Relay<Ctx> {
     }
 }
 
-fn snapshot<Ctx>(types: &Arc<RwLock<Vec<NodeTypeEntry<Ctx>>>>) -> Vec<NodeTypeEntry<Ctx>> {
-    types.read().unwrap_or_else(PoisonError::into_inner).clone()
-}
-
-fn cache_key(typename: &str, local: &str) -> String {
-    format!("{typename}:{local}")
+/// A shared snapshot of the node registry.
+///
+/// This is one atomic increment: the entries themselves are never copied on the request path.
+fn snapshot<Ctx>(
+    types: &Arc<RwLock<Arc<Vec<NodeTypeEntry<Ctx>>>>>,
+) -> Arc<Vec<NodeTypeEntry<Ctx>>> {
+    Arc::clone(&types.read().unwrap_or_else(PoisonError::into_inner))
 }
 
 async fn resolve_one<Ctx: 'static>(
@@ -535,21 +551,24 @@ async fn resolve_one<Ctx: 'static>(
         Ok(decoded) => {
             let Some(entry) = entries
                 .iter()
-                .find(|entry| entry.typename == decoded.typename)
+                .find(|entry| *entry.typename == *decoded.typename)
             else {
                 return Err(GraphQLError::new(format!(
                     "Global ID names unknown node type `{}`.",
                     decoded.typename
                 )));
             };
-            let key = cache_key(&entry.typename, &decoded.local_id);
-            if let Some(cached) = cache.and_then(|cache| cache.get(&key)) {
+            if let Some(cached) =
+                cache.and_then(|cache| cache.get(&entry.typename, &decoded.local_id))
+            {
                 return cached;
             }
-            let value = (entry.load_one)(decoded.local_id, ctx).await;
-            if let Some(cache) = cache {
-                cache.insert(key, value.clone());
-            }
+            let Some(cache) = cache else {
+                // No request cache: hand the local ID straight to the loader, nothing to keep.
+                return (entry.load_one)(decoded.local_id, ctx).await;
+            };
+            let value = (entry.load_one)(decoded.local_id.clone(), ctx).await;
+            cache.insert(&entry.typename, decoded.local_id, value.clone());
             value
         }
         Err(error) => {
@@ -557,8 +576,7 @@ async fn resolve_one<Ctx: 'static>(
                 return Err(error);
             }
             for entry in entries {
-                let key = cache_key(&entry.typename, &raw);
-                if let Some(cached) = cache.and_then(|cache| cache.get(&key)) {
+                if let Some(cached) = cache.and_then(|cache| cache.get(&entry.typename, &raw)) {
                     match cached {
                         Ok(Some(value)) => return Ok(Some(value)),
                         Ok(None) => continue,
@@ -567,7 +585,7 @@ async fn resolve_one<Ctx: 'static>(
                 }
                 let value = (entry.load_one)(raw.clone(), ctx).await;
                 if let Some(cache) = cache {
-                    cache.insert(key, value.clone());
+                    cache.insert(&entry.typename, raw.as_str(), value.clone());
                 }
                 match value {
                     Ok(Some(value)) => return Ok(Some(value)),
@@ -580,6 +598,12 @@ async fn resolve_one<Ctx: 'static>(
     }
 }
 
+/// The IDs one node type was asked for, in request order.
+struct NodeRequest<'a, Ctx> {
+    entry: &'a NodeTypeEntry<Ctx>,
+    requested: Vec<(usize, String)>,
+}
+
 async fn resolve_many<Ctx: 'static>(
     entries: &[NodeTypeEntry<Ctx>],
     cache: Option<&Arc<NodeResultCache>>,
@@ -587,9 +611,13 @@ async fn resolve_many<Ctx: 'static>(
     ids: &[ID],
     allow_local: bool,
 ) -> Result<Vec<Option<Value>>, GraphQLError> {
-    let mut results: Vec<Option<Value>> = vec![None; ids.len()];
+    let mut results: Vec<Option<Value>> = Vec::with_capacity(ids.len());
+    results.resize_with(ids.len(), || None);
     let mut resolved = vec![false; ids.len()];
-    let mut global: Vec<(&str, Vec<(usize, String)>)> = Vec::new();
+    // Group global IDs by type. `global_index` makes the grouping constant time per ID instead of
+    // a linear scan of the groups; both orders stay first-seen.
+    let mut global: Vec<NodeRequest<'_, Ctx>> = Vec::new();
+    let mut global_index: HashMap<&str, usize> = HashMap::with_capacity(entries.len());
     let mut local: Vec<(usize, String)> = Vec::new();
 
     for (index, id) in ids.iter().enumerate() {
@@ -597,15 +625,16 @@ async fn resolve_many<Ctx: 'static>(
             Ok(decoded) => {
                 let Some(entry) = entries
                     .iter()
-                    .find(|entry| entry.typename == decoded.typename)
+                    .find(|entry| *entry.typename == *decoded.typename)
                 else {
                     // A list of nullable nodes can report one unusable item without nulling the
                     // whole field. There is no per-item GraphQL error channel from a resolver, so
                     // the slot stays `null`; singular `node` still reports the unknown type.
                     continue;
                 };
-                let key = cache_key(&entry.typename, &decoded.local_id);
-                if let Some(cached) = cache.and_then(|cache| cache.get(&key)) {
+                if let Some(cached) =
+                    cache.and_then(|cache| cache.get(&entry.typename, &decoded.local_id))
+                {
                     match cached {
                         Ok(value) => {
                             results[index] = value;
@@ -613,13 +642,14 @@ async fn resolve_many<Ctx: 'static>(
                         }
                         Err(error) => return Err(error),
                     }
-                } else if let Some((_, requested)) = global
-                    .iter_mut()
-                    .find(|(typename, _)| *typename == entry.typename)
-                {
-                    requested.push((index, decoded.local_id));
+                } else if let Some(group) = global_index.get(entry.typename.as_ref()) {
+                    global[*group].requested.push((index, decoded.local_id));
                 } else {
-                    global.push((entry.typename.as_str(), vec![(index, decoded.local_id)]));
+                    global_index.insert(entry.typename.as_ref(), global.len());
+                    global.push(NodeRequest {
+                        entry,
+                        requested: vec![(index, decoded.local_id)],
+                    });
                 }
             }
             Err(_) => {
@@ -632,47 +662,52 @@ async fn resolve_many<Ctx: 'static>(
         }
     }
 
-    for (typename, requested) in global {
-        let Some(entry) = entries.iter().find(|entry| entry.typename == typename) else {
-            continue;
-        };
-        let mut unique: Vec<String> = Vec::new();
+    for NodeRequest { entry, requested } in global {
+        // Deduplicate the loader keys in first-seen order without cloning: `unique` borrows the
+        // requested IDs and the loader's owned vector is built once, below.
+        let mut unique: Vec<&str> = Vec::with_capacity(requested.len());
+        let mut seen: HashSet<&str> = HashSet::with_capacity(requested.len());
         for (_, local_id) in &requested {
-            if !unique.contains(local_id) {
-                unique.push(local_id.clone());
+            if seen.insert(local_id.as_str()) {
+                unique.push(local_id.as_str());
             }
         }
-        let values = (entry.load_many)(unique.clone(), ctx).await?;
-        let by_id: HashMap<&str, &Option<Value>> = unique
-            .iter()
-            .map(String::as_str)
-            .zip(values.iter())
-            .collect();
-        for (index, local_id) in requested {
-            let value = by_id
+        let keys: Vec<String> = unique.iter().map(|id| (*id).to_owned()).collect();
+        let values = (entry.load_many)(keys, ctx).await?;
+        let mut positions: HashMap<&str, usize> = HashMap::with_capacity(unique.len());
+        for (position, id) in unique.iter().enumerate() {
+            positions.insert(*id, position);
+        }
+        for (index, local_id) in &requested {
+            let value = positions
                 .get(local_id.as_str())
-                .and_then(|value| (*value).clone());
+                .and_then(|position| values.get(*position))
+                .cloned()
+                .flatten();
             if let Some(cache) = cache {
-                cache.insert(cache_key(typename, &local_id), Ok(value.clone()));
+                cache.insert(&entry.typename, local_id.as_str(), Ok(value.clone()));
             }
-            results[index] = value;
-            resolved[index] = true;
+            results[*index] = value;
+            resolved[*index] = true;
         }
     }
 
     // Local IDs are not tied to a type, so try each registered loader. The first loader with a
     // value wins; this is deliberately a compatibility path rather than the primary dispatch.
     if !local.is_empty() {
-        let unique: Vec<String> =
-            local
-                .iter()
-                .map(|(_, id)| id.clone())
-                .fold(Vec::new(), |mut unique, id| {
-                    if !unique.contains(&id) {
-                        unique.push(id);
-                    }
-                    unique
-                });
+        let mut unique: Vec<&str> = Vec::with_capacity(local.len());
+        let mut seen: HashSet<&str> = HashSet::with_capacity(local.len());
+        for (_, id) in &local {
+            if seen.insert(id.as_str()) {
+                unique.push(id.as_str());
+            }
+        }
+        // The positions are the same for every loader, so build them once instead of searching
+        // `unique` per entry and ID.
+        let mut positions: HashMap<&str, usize> = HashMap::with_capacity(unique.len());
+        for (position, id) in unique.iter().enumerate() {
+            positions.insert(*id, position);
+        }
         for entry in entries {
             if local.iter().all(|(index, _)| resolved[*index]) {
                 break;
@@ -681,8 +716,7 @@ async fn resolve_many<Ctx: 'static>(
                 if resolved[*index] {
                     continue;
                 }
-                let key = cache_key(&entry.typename, local_id);
-                if let Some(cached) = cache.and_then(|cache| cache.get(&key)) {
+                if let Some(cached) = cache.and_then(|cache| cache.get(&entry.typename, local_id)) {
                     match cached {
                         Ok(Some(value)) => {
                             results[*index] = Some(value);
@@ -698,19 +732,20 @@ async fn resolve_many<Ctx: 'static>(
                 break;
             }
 
-            let values = (entry.load_many)(unique.clone(), ctx).await?;
+            let keys: Vec<String> = unique.iter().map(|id| (*id).to_owned()).collect();
+            let values = (entry.load_many)(keys, ctx).await?;
             for (index, local_id) in &local {
                 if resolved[*index] {
                     continue;
                 }
-                let value = unique
-                    .iter()
-                    .position(|id| id == local_id)
-                    .and_then(|position| values.get(position))
-                    .and_then(Clone::clone);
+                let value = positions
+                    .get(local_id.as_str())
+                    .and_then(|position| values.get(*position))
+                    .cloned()
+                    .flatten();
                 if value.is_some() {
                     if let Some(cache) = cache {
-                        cache.insert(cache_key(&entry.typename, local_id), Ok(value.clone()));
+                        cache.insert(&entry.typename, local_id.as_str(), Ok(value.clone()));
                     }
                     results[*index] = value;
                     resolved[*index] = true;

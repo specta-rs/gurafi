@@ -9,26 +9,52 @@ const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 
 /// Encode bytes with the standard alphabet, including padding.
 pub(crate) fn encode(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let first = chunk[0];
-        let second = chunk.get(1).copied().unwrap_or(0);
-        let third = chunk.get(2).copied().unwrap_or(0);
+    encode_parts(&[bytes])
+}
 
-        output.push(ALPHABET[(first >> 2) as usize] as char);
-        output.push(ALPHABET[(((first & 0b0000_0011) << 4) | (second >> 4)) as usize] as char);
-        if chunk.len() > 1 {
-            output.push(ALPHABET[(((second & 0b0000_1111) << 2) | (third >> 6)) as usize] as char);
-        } else {
+/// Encode the concatenation of several byte slices into one `String`.
+///
+/// Encoding a value that is assembled from parts (a type name, a separator and a local ID) into a
+/// single buffer avoids building the intermediate joined string first.
+pub(crate) fn encode_parts(parts: &[&[u8]]) -> String {
+    let len: usize = parts.iter().map(|part| part.len()).sum();
+    let mut output = String::with_capacity(len.div_ceil(3) * 4);
+    let mut buffer = [0u8; 3];
+    let mut filled = 0;
+    for part in parts {
+        for &byte in *part {
+            buffer[filled] = byte;
+            filled += 1;
+            if filled == 3 {
+                push_group(&mut output, buffer[0], buffer[1], buffer[2]);
+                filled = 0;
+            }
+        }
+    }
+    match filled {
+        0 => {}
+        1 => {
+            let first = buffer[0];
+            output.push(ALPHABET[(first >> 2) as usize] as char);
+            output.push(ALPHABET[((first & 0b0000_0011) << 4) as usize] as char);
+            output.push('=');
             output.push('=');
         }
-        if chunk.len() > 2 {
-            output.push(ALPHABET[(third & 0b0011_1111) as usize] as char);
-        } else {
+        _ => {
+            push_group(&mut output, buffer[0], buffer[1], 0);
+            // The fourth character of a one-byte-short group is padding.
+            output.pop();
             output.push('=');
         }
     }
     output
+}
+
+fn push_group(output: &mut String, first: u8, second: u8, third: u8) {
+    output.push(ALPHABET[(first >> 2) as usize] as char);
+    output.push(ALPHABET[(((first & 0b0000_0011) << 4) | (second >> 4)) as usize] as char);
+    output.push(ALPHABET[(((second & 0b0000_1111) << 2) | (third >> 6)) as usize] as char);
+    output.push(ALPHABET[(third & 0b0011_1111) as usize] as char);
 }
 
 /// Decode canonical, padded standard Base64.
@@ -110,7 +136,7 @@ fn value_of(byte: u8) -> Result<u8, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, encode};
+    use super::{decode, encode, encode_parts};
 
     #[test]
     fn standard_vectors_and_round_trips() {
@@ -127,6 +153,18 @@ mod tests {
         ] {
             assert_eq!(encode(plain.as_bytes()), encoded);
             assert_eq!(decode(encoded).unwrap(), plain.as_bytes());
+        }
+    }
+
+    #[test]
+    fn parts_encode_like_their_concatenation() {
+        for (parts, plain) in [
+            (vec![&b"User"[..], b":", b"42"], "User:42"),
+            (vec![&b"User"[..], b":", b""], "User:"),
+            (vec![&b""[..], b"", b""], ""),
+            (vec![&b"ab"[..], b"cdef", b"g"], "abcdefg"),
+        ] {
+            assert_eq!(encode_parts(&parts), encode(plain.as_bytes()));
         }
     }
 

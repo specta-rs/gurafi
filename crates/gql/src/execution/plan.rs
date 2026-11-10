@@ -91,10 +91,11 @@ pub(crate) struct FieldPlan<'a> {
     type_name: Name,
     /// Response keys in first-seen order.
     groups: Vec<FieldGroup<'a>>,
-    /// Whether any field of the type defines a resolver.
+    /// Whether any field this plan selects defines a resolver.
     ///
-    /// The synchronous completion path refuses a type that defines one, whatever the selection
-    /// asks for. Planning it once keeps that check off the per-object path.
+    /// The plan records this for the fields it selects, which is what the synchronous completion
+    /// path needs: it only ever completes selected fields, and refuses any field that defines a
+    /// resolver. A source without a plan for the type keeps the conservative type-wide check.
     pub(crate) has_resolvers: bool,
     /// Whether the response object is exactly a projection of the parent object.
     ///
@@ -197,7 +198,7 @@ pub(crate) struct Variant<'a> {
 impl<'a> Variant<'a> {
     /// The nodes' sub-selections, merged in document order.
     #[inline]
-    pub(crate) fn selection_sets(&'a self) -> SmallVec<[&'a ast::SelectionSet<'a>; 2]> {
+    pub(crate) fn selection_sets(&'a self) -> SmallVec<[&'a ast::SelectionSet<'a>; 4]> {
         self.nodes
             .iter()
             .filter_map(|node| node.selection_set.as_ref())
@@ -244,7 +245,10 @@ impl<'s, 'a> GroupNodes<'s, 'a> {
     }
 
     /// The merged nodes as references, used to build resolver-visible field information.
-    pub(crate) fn field_node_refs(&self) -> SmallVec<[&'a ast::Field<'a>; 2]> {
+    ///
+    /// Groups usually merge a single node, so the buffer stays inline; the inline capacity covers
+    /// the handful of duplicates that fragments and repeated selections typically produce.
+    pub(crate) fn field_node_refs(&self) -> SmallVec<[&'a ast::Field<'a>; 4]> {
         match self {
             Self::Borrowed(nodes) => nodes.iter().copied().collect(),
             Self::Planned(nodes) => nodes.iter().map(|node| &**node).collect(),
@@ -252,8 +256,12 @@ impl<'s, 'a> GroupNodes<'s, 'a> {
     }
 
     /// The nodes' sub-selections, merged in document order.
+    ///
+    /// A group's nodes usually contribute one or two sets; the inline buffer covers the
+    /// duplicates fragments and repeated selections produce, so the common group does not
+    /// allocate once per object.
     #[inline]
-    pub(crate) fn selection_sets(&self) -> SmallVec<[&'a ast::SelectionSet<'a>; 2]> {
+    pub(crate) fn selection_sets(&self) -> SmallVec<[&'a ast::SelectionSet<'a>; 4]> {
         match self {
             Self::Borrowed(nodes) => nodes
                 .iter()
@@ -787,10 +795,16 @@ impl<'a> Builder<'a, '_, '_> {
             }
         }
 
-        let has_resolvers = object_type
-            .fields
-            .values()
-            .any(|field| field.resolve.is_some());
+        // Only the fields this plan selects can ever be completed through it, so the resolver check
+        // covers those fields rather than the whole type. A type-wide scan would refuse the
+        // synchronous completion path for every selection of a type that happens to define a
+        // resolver the document never asks for.
+        let has_resolvers = groups.iter().any(|group| {
+            group
+                .field_index
+                .and_then(|index| object_type.fields.get_index(index as usize))
+                .is_some_and(|(_, field)| field.resolve.is_some())
+        });
         // A plan can stand in for its parent object only when the response is the identity
         // projection: every group is one unconditional, unaliased built-in scalar property.
         let identity_projection = groups.iter().all(|group| {
@@ -1211,7 +1225,13 @@ mod tests {
             .field(Field::new(
                 "friends",
                 TypeRef::named("User").non_null().list().non_null(),
-            ));
+            ))
+            // A resolver the plans below never select: the type defines one, the selections do
+            // not ask for it, so their plans must still complete synchronously.
+            .field(
+                Field::new("score", TypeRef::int().non_null())
+                    .resolve(|_| Box::pin(async { Ok(Value::Int(1)) })),
+            );
         let query = ObjectType::new("Query")
             .field(
                 Field::new("user", TypeRef::named("User"))
@@ -1295,6 +1315,35 @@ mod tests {
         assert_eq!(user_plan.groups[2].nodes.len(), 1);
         assert!(user_plan.groups[0].property.is_some());
         assert!(user_plan.groups[3].property.is_none());
+    }
+
+    #[test]
+    fn resolver_check_covers_only_selected_fields() {
+        let schema = schema();
+        // `User` defines a resolver (`score`), but neither selection asks for it.
+        let document = parse_query("query { user { id name } }").expect("parses");
+        let plan = build_plan(&schema, &document);
+        let root = plan.field_plan(0, schema.query_type()).expect("root");
+        // The root selects `user`, which defines a resolver.
+        assert!(root.has_resolvers);
+        let child = root.groups[0]
+            .variant(&Object::new())
+            .expect("variant")
+            .child
+            .expect("child source");
+        let user = schema.object_type("User").expect("user type");
+        assert!(!plan.field_plan(child, user).expect("user plan").has_resolvers);
+
+        // Selecting the resolver-backed field flips it, so the synchronous path is refused.
+        let document = parse_query("query { user { id score } }").expect("parses");
+        let plan = build_plan(&schema, &document);
+        let root = plan.field_plan(0, schema.query_type()).expect("root");
+        let child = root.groups[0]
+            .variant(&Object::new())
+            .expect("variant")
+            .child
+            .expect("child source");
+        assert!(plan.field_plan(child, user).expect("user plan").has_resolvers);
     }
 
     #[test]

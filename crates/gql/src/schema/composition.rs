@@ -230,6 +230,10 @@ impl Schema {
     /// schema's roots. Resolvers of every field that still exists keep working, which makes this
     /// the build-time counterpart of loading a base document plus an extension document.
     ///
+    /// The extension is applied by printing and re-parsing the schema, so one call costs
+    /// `O(schema size)`. Applying several documents one at a time is therefore `O(k · n)`;
+    /// [`Schema::extend_sdl_many`] applies them together in `O(n + total SDL)`.
+    ///
     /// # Errors
     ///
     /// Returns parse errors, extension errors such as extending an unknown type, and schema
@@ -253,11 +257,61 @@ impl Schema {
     /// assert!(extended.query_type().get_field("hello").unwrap().resolve.is_some());
     /// ```
     pub fn extend_sdl(&self, sdl: &str) -> Result<Schema, SchemaError> {
+        self.extend_sdl_many([sdl])
+    }
+
+    /// Extend the schema with several GraphQL SDL documents in one build.
+    ///
+    /// This is the batch form of [`Schema::extend_sdl`]: the documents are concatenated and
+    /// applied in order, so the schema is printed, parsed and validated once rather than once per
+    /// document. The result is the same as calling [`Schema::extend_sdl`] for each document in
+    /// turn, except that the documents are validated together (a later document may fix a shape
+    /// an earlier one left temporarily invalid).
+    ///
+    /// Resolvers of every field that still exists keep working.
+    ///
+    /// # Errors
+    ///
+    /// Returns parse errors, extension errors such as extending an unknown type, and schema
+    /// validation errors.
+    ///
+    /// ```
+    /// use gql::{Field, ObjectType, Schema, TypeRef, Value};
+    ///
+    /// let mut builder = Schema::builder();
+    /// builder.add_type(
+    ///     ObjectType::new("Query")
+    ///         .field(Field::new("hello", TypeRef::string()).resolve(|_| {
+    ///             Box::pin(async { Ok(Value::from("world")) })
+    ///         }))
+    ///         .into(),
+    /// );
+    /// let schema = builder.query("Query").build().unwrap();
+    ///
+    /// let extended = schema
+    ///     .extend_sdl_many([
+    ///         "type Extra { value: String }",
+    ///         "extend type Query { extra: Extra }",
+    ///     ])
+    ///     .unwrap();
+    /// assert!(extended.get_type("Extra").is_some());
+    /// assert!(extended.query_type().get_field("extra").is_some());
+    /// assert!(extended.query_type().get_field("hello").unwrap().resolve.is_some());
+    /// ```
+    pub fn extend_sdl_many<'a>(
+        &self,
+        documents: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Schema, SchemaError> {
         let mut source = self.sdl();
         if !source.ends_with('\n') {
             source.push('\n');
         }
-        source.push_str(sdl);
+        for sdl in documents {
+            source.push_str(sdl);
+            if !source.ends_with('\n') {
+                source.push('\n');
+            }
+        }
         let mut extended = Schema::from_sdl(&source)?;
         overlay_resolvers(self, &mut extended);
         Ok(extended)
@@ -429,32 +483,36 @@ fn merge_root(
 }
 
 fn merge_types(name: &str, left: &Type, right: &Type) -> Result<Type, String> {
+    // The same definition allocation on both sides means there is nothing to merge. This is the
+    // common case when a schema is merged with a schema derived from it, and it must not pay for
+    // a deep clone or an equivalence comparison.
+    if type_ptr_eq(left, right) {
+        return Ok(left.clone());
+    }
     match (left, right) {
         (Type::Scalar(left), Type::Scalar(right)) => {
             if !scalar_equivalent(left, right) {
                 return Err(type_conflict(name));
             }
-            Ok(Type::Scalar(Arc::new(merge_scalar(name, left, right)?)))
+            Ok(Type::Scalar(merge_scalar(name, left, right)?))
         }
         (Type::Object(left), Type::Object(right)) => {
             if !object_equivalent(left, right) {
                 return Err(type_conflict(name));
             }
-            Ok(Type::Object(Arc::new(merge_object(name, left, right)?)))
+            Ok(Type::Object(merge_object(name, left, right)?))
         }
         (Type::Interface(left), Type::Interface(right)) => {
             if !interface_equivalent(left, right) {
                 return Err(type_conflict(name));
             }
-            Ok(Type::Interface(Arc::new(merge_interface(
-                name, left, right,
-            )?)))
+            Ok(Type::Interface(merge_interface(name, left, right)?))
         }
         (Type::Union(left), Type::Union(right)) => {
             if !union_equivalent(left, right) {
                 return Err(type_conflict(name));
             }
-            Ok(Type::Union(Arc::new(merge_union(name, left, right)?)))
+            Ok(Type::Union(merge_union(name, left, right)?))
         }
         (Type::Enum(left), Type::Enum(right)) => {
             if !enum_equivalent(left, right) {
@@ -473,6 +531,19 @@ fn merge_types(name: &str, left: &Type, right: &Type) -> Result<Type, String> {
             left.kind(),
             right.kind()
         )),
+    }
+}
+
+/// Whether both sides point at the same definition allocation.
+fn type_ptr_eq(left: &Type, right: &Type) -> bool {
+    match (left, right) {
+        (Type::Scalar(left), Type::Scalar(right)) => Arc::ptr_eq(left, right),
+        (Type::Object(left), Type::Object(right)) => Arc::ptr_eq(left, right),
+        (Type::Interface(left), Type::Interface(right)) => Arc::ptr_eq(left, right),
+        (Type::Union(left), Type::Union(right)) => Arc::ptr_eq(left, right),
+        (Type::Enum(left), Type::Enum(right)) => Arc::ptr_eq(left, right),
+        (Type::InputObject(left), Type::InputObject(right)) => Arc::ptr_eq(left, right),
+        _ => false,
     }
 }
 
@@ -632,71 +703,209 @@ fn same_slice<T: Eq>(left: &[T], right: &[T]) -> bool {
     left.len() == right.len() && left.iter().all(|value| right.contains(value))
 }
 
-fn merge_scalar(name: &str, left: &ScalarType, right: &ScalarType) -> Result<ScalarType, String> {
-    let mut merged = left.clone();
+fn merge_scalar(
+    name: &str,
+    left: &Arc<ScalarType>,
+    right: &ScalarType,
+) -> Result<Arc<ScalarType>, String> {
+    // Copying a function pointer is only necessary when the right side supplies one that the
+    // left side lacks. If it supplies none (or the same allocation), the left definition is
+    // already the merged result, so the shared `Arc` can be reused instead of deep-cloned.
+    //
+    // Two built-in coercion functions are interchangeable even when they are distinct
+    // allocations: they are the engine's own code, and the specification defines their behaviour.
+    let both_builtin = left.builtin && right.builtin;
+    let mut needs_copy = builtin_slot_needed(&left.serialize, &right.serialize, both_builtin)
+        .map_err(|()| runtime_conflict(name, "serialize"))?;
+    needs_copy |= builtin_slot_needed(&left.parse_value, &right.parse_value, both_builtin)
+        .map_err(|()| runtime_conflict(name, "parse_value"))?;
+    needs_copy |= builtin_slot_needed(&left.parse_literal, &right.parse_literal, both_builtin)
+        .map_err(|()| runtime_conflict(name, "parse_literal"))?;
+    if !needs_copy {
+        return Ok(left.clone());
+    }
+    let mut merged = (**left).clone();
     if merged.serialize.is_none() {
         merged.serialize = right.serialize.clone();
         merged.builtin = right.builtin;
-    } else if right.serialize.is_some() && !(left.builtin && right.builtin) {
-        return Err(runtime_conflict(name, "serialize"));
     }
     if merged.parse_value.is_none() {
         merged.parse_value = right.parse_value.clone();
-    } else if right.parse_value.is_some() && !(left.builtin && right.builtin) {
-        return Err(runtime_conflict(name, "parse_value"));
     }
     if merged.parse_literal.is_none() {
         merged.parse_literal = right.parse_literal.clone();
-    } else if right.parse_literal.is_some() && !(left.builtin && right.builtin) {
-        return Err(runtime_conflict(name, "parse_literal"));
     }
-    Ok(merged)
+    Ok(Arc::new(merged))
 }
 
-fn merge_object(name: &str, left: &ObjectType, right: &ObjectType) -> Result<ObjectType, String> {
-    let mut merged = left.clone();
+/// Whether `source` fills a runtime slot `target` leaves empty, and fail on a real conflict.
+///
+/// `needs_copy` records that a merge is required; a conflict is reported exactly as the merge
+/// loop reports it, so the fast path cannot change which error wins.
+fn fill_slot<T: ?Sized>(
+    owner: &str,
+    slot: &str,
+    target: &Option<Arc<T>>,
+    source: &Option<Arc<T>>,
+    needs_copy: &mut bool,
+) -> Result<(), String> {
+    match scalar_slot_needed(target, source) {
+        Ok(fills) => *needs_copy |= fills,
+        Err(()) => return Err(runtime_conflict(owner, slot)),
+    }
+    Ok(())
+}
+
+/// Whether a merge has to copy anything, without allocating or deep-cloning.
+///
+/// `Ok(true)` means `source` sets a slot `target` leaves unset. `Err(())` means both sides set
+/// the slot to different implementations; the caller decides which slot name to report.
+fn scalar_slot_needed<T: ?Sized>(
+    target: &Option<Arc<T>>,
+    source: &Option<Arc<T>>,
+) -> Result<bool, ()> {
+    match (target, source) {
+        (_, None) => Ok(false),
+        (None, Some(_)) => Ok(true),
+        (Some(left), Some(right)) if Arc::ptr_eq(left, right) => Ok(false),
+        (Some(_), Some(_)) => Err(()),
+    }
+}
+
+/// [`scalar_slot_needed`] for a scalar's coercion functions.
+///
+/// The specification defines the built-in functions, so two built-in coercers are compatible
+/// even when each scalar instance allocated its own copy.
+fn builtin_slot_needed<T: ?Sized>(
+    target: &Option<Arc<T>>,
+    source: &Option<Arc<T>>,
+    both_builtin: bool,
+) -> Result<bool, ()> {
+    match (target, source) {
+        (_, None) => Ok(false),
+        (None, Some(_)) => Ok(true),
+        (Some(left), Some(right)) if Arc::ptr_eq(left, right) || both_builtin => Ok(false),
+        (Some(_), Some(_)) => Err(()),
+    }
+}
+
+/// Whether merging a field needs to copy runtime behaviour, and whether it is possible.
+///
+/// The three slots are checked in the same order [`merge_field_runtime`] copies them, so a
+/// conflict reports the same slot it would have reported on the slow path.
+fn merge_field_slots(
+    owner: &str,
+    name: &str,
+    target: &Field,
+    source: &Field,
+) -> Result<bool, String> {
+    let resolve = scalar_slot_needed(&target.resolve, &source.resolve);
+    let subscribe = scalar_slot_needed(&target.subscribe, &source.subscribe);
+    let complexity = scalar_slot_needed(&target.complexity, &source.complexity);
+    if resolve.is_err() || subscribe.is_err() || complexity.is_err() {
+        let slot = if resolve.is_err() {
+            "resolve"
+        } else if subscribe.is_err() {
+            "subscribe"
+        } else {
+            "complexity"
+        };
+        return Err(runtime_conflict(&format!("{owner}.{name}"), slot));
+    }
+    Ok(resolve == Ok(true) || subscribe == Ok(true) || complexity == Ok(true))
+}
+
+fn merge_object(
+    name: &str,
+    left: &Arc<ObjectType>,
+    right: &ObjectType,
+) -> Result<Arc<ObjectType>, String> {
+    let mut needs_copy = false;
+    fill_slot(
+        name,
+        "is_type_of",
+        &left.is_type_of,
+        &right.is_type_of,
+        &mut needs_copy,
+    )?;
+    for (field_name, field) in &left.fields {
+        if let Some(other) = right.fields.get(field_name) {
+            if merge_field_slots(name, field_name, field, other)? {
+                needs_copy = true;
+            }
+        }
+    }
+    if !needs_copy {
+        return Ok(left.clone());
+    }
+    let mut merged = (**left).clone();
     if merged.is_type_of.is_none() {
         merged.is_type_of = right.is_type_of.clone();
-    } else if right.is_type_of.is_some() && !same_slot(&merged.is_type_of, &right.is_type_of) {
-        return Err(runtime_conflict(name, "is_type_of"));
     }
     for (field_name, field) in &mut merged.fields {
         if let Some(other) = right.fields.get(field_name) {
             merge_field_runtime(name, field_name, field, other)?;
         }
     }
-    Ok(merged)
+    Ok(Arc::new(merged))
 }
 
 fn merge_interface(
     name: &str,
-    left: &InterfaceType,
+    left: &Arc<InterfaceType>,
     right: &InterfaceType,
-) -> Result<InterfaceType, String> {
-    let mut merged = left.clone();
+) -> Result<Arc<InterfaceType>, String> {
+    let mut needs_copy = false;
+    fill_slot(
+        name,
+        "resolve_type",
+        &left.resolve_type,
+        &right.resolve_type,
+        &mut needs_copy,
+    )?;
+    for (field_name, field) in &left.fields {
+        if let Some(other) = right.fields.get(field_name) {
+            if merge_field_slots(name, field_name, field, other)? {
+                needs_copy = true;
+            }
+        }
+    }
+    if !needs_copy {
+        return Ok(left.clone());
+    }
+    let mut merged = (**left).clone();
     if merged.resolve_type.is_none() {
         merged.resolve_type = right.resolve_type.clone();
-    } else if right.resolve_type.is_some() && !same_slot(&merged.resolve_type, &right.resolve_type)
-    {
-        return Err(runtime_conflict(name, "resolve_type"));
     }
     for (field_name, field) in &mut merged.fields {
         if let Some(other) = right.fields.get(field_name) {
             merge_field_runtime(name, field_name, field, other)?;
         }
     }
-    Ok(merged)
+    Ok(Arc::new(merged))
 }
 
-fn merge_union(name: &str, left: &UnionType, right: &UnionType) -> Result<UnionType, String> {
-    let mut merged = left.clone();
+fn merge_union(
+    name: &str,
+    left: &Arc<UnionType>,
+    right: &UnionType,
+) -> Result<Arc<UnionType>, String> {
+    let mut needs_copy = false;
+    fill_slot(
+        name,
+        "resolve_type",
+        &left.resolve_type,
+        &right.resolve_type,
+        &mut needs_copy,
+    )?;
+    if !needs_copy {
+        return Ok(left.clone());
+    }
+    let mut merged = (**left).clone();
     if merged.resolve_type.is_none() {
         merged.resolve_type = right.resolve_type.clone();
-    } else if right.resolve_type.is_some() && !same_slot(&merged.resolve_type, &right.resolve_type)
-    {
-        return Err(runtime_conflict(name, "resolve_type"));
     }
-    Ok(merged)
+    Ok(Arc::new(merged))
 }
 
 /// Whether two optional function slots refer to the same implementation.

@@ -4,7 +4,7 @@ use core::fmt;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
-use rustc_hash::{FxBuildHasher, FxHashSet};
+use rustc_hash::FxBuildHasher;
 
 mod composition;
 
@@ -370,14 +370,8 @@ impl SchemaBuilder {
     #[must_use]
     pub fn new() -> Self {
         let mut directives = TypeMap::default();
-        for directive in [
-            DirectiveDefinition::skip(),
-            DirectiveDefinition::include(),
-            DirectiveDefinition::deprecated(),
-            DirectiveDefinition::specified_by(),
-            DirectiveDefinition::one_of(),
-        ] {
-            directives.insert(directive.name.clone(), directive);
+        for directive in builtin_directives() {
+            directives.insert(directive.name.clone(), directive.clone());
         }
 
         Self {
@@ -551,11 +545,11 @@ impl SchemaBuilder {
     /// invalid input cycles; all of those are reported here rather than deferred to execution.
     pub fn build(mut self) -> Result<Schema, SchemaError> {
         // Introspection types are always present. Users cannot register them, so no duplicate
-        // check is needed.
+        // check is needed. They are immutable, hold no resolvers and reference nothing a user
+        // defines, so every schema shares one cached copy instead of rebuilding them.
         if self.types.get("__Schema").is_none() {
-            for ty in crate::introspection::types() {
-                let name = ty.name().clone();
-                self.types.insert(name, ty);
+            for ty in introspection_types() {
+                self.types.insert(ty.name().clone(), ty.clone());
             }
         }
 
@@ -629,6 +623,23 @@ impl SchemaBuilder {
 /// The specification's default `@deprecated` reason.
 const DEFAULT_DEPRECATION_REASON: &str = "No longer supported";
 
+/// The built-in directive definitions, constructed once and cloned per builder.
+///
+/// A builder owns its directive map and a schema is immutable, so cloning these plain
+/// definitions is total and cheap; rebuilding them from scratch on every build was not.
+fn builtin_directives() -> &'static [DirectiveDefinition] {
+    static DIRECTIVES: std::sync::OnceLock<Vec<DirectiveDefinition>> = std::sync::OnceLock::new();
+    DIRECTIVES.get_or_init(|| {
+        vec![
+            DirectiveDefinition::skip(),
+            DirectiveDefinition::include(),
+            DirectiveDefinition::deprecated(),
+            DirectiveDefinition::specified_by(),
+            DirectiveDefinition::one_of(),
+        ]
+    })
+}
+
 /// Copy dedicated built-in directive applications into their authoritative model fields.
 ///
 /// `@deprecated`, `@specifiedBy` and `@oneOf` have first-class fields on the type model, and the
@@ -692,18 +703,27 @@ fn apply_dedicated_directives(
     for ty in types.values_mut() {
         match ty {
             Type::Scalar(scalar) => {
+                if !has_named(&scalar.directives, "specifiedBy") {
+                    continue;
+                }
                 let scalar = Arc::make_mut(scalar);
                 if let Some(url) = string_argument(&scalar.directives, "specifiedBy", "url") {
                     scalar.specified_by_url = Some(url);
                 }
             }
             Type::Object(object) => {
+                if !object_has_deprecation(object) {
+                    continue;
+                }
                 let object = Arc::make_mut(object);
                 for field in object.fields.values_mut() {
                     apply_field(field);
                 }
             }
             Type::Interface(interface) => {
+                if !interface_has_deprecation(interface) {
+                    continue;
+                }
                 let interface = Arc::make_mut(interface);
                 for field in interface.fields.values_mut() {
                     apply_field(field);
@@ -711,18 +731,20 @@ fn apply_dedicated_directives(
             }
             Type::Union(_) => {}
             Type::Enum(enumeration) => {
+                if !enum_has_deprecation(enumeration) {
+                    continue;
+                }
                 let enumeration = Arc::make_mut(enumeration);
                 for value in enumeration.values.values_mut() {
                     apply_deprecation(&value.directives, &mut value.deprecation_reason);
                 }
             }
             Type::InputObject(input) => {
+                if !input_has_dedicated(input) {
+                    continue;
+                }
                 let input = Arc::make_mut(input);
-                if input
-                    .directives
-                    .iter()
-                    .any(|directive| directive.name.as_ref() == "oneOf")
-                {
+                if has_named(&input.directives, "oneOf") {
                     input.one_of = true;
                 }
                 for field in input.fields.values_mut() {
@@ -733,11 +755,67 @@ fn apply_dedicated_directives(
     }
 
     for directive in definitions.values_mut() {
+        if !directive_has_deprecation(directive) {
+            continue;
+        }
         apply_deprecation(&directive.directives, &mut directive.deprecation_reason);
         for argument in directive.args.values_mut() {
             apply_input_value(argument);
         }
     }
+}
+
+/// Whether a directive with the given name is applied.
+fn has_named(directives: &[AppliedDirective], name: &str) -> bool {
+    directives
+        .iter()
+        .any(|directive| directive.name.as_ref() == name)
+}
+
+fn field_has_deprecation(field: &Field) -> bool {
+    has_named(&field.directives, "deprecated")
+}
+
+fn has_argument_deprecation(args: &IndexMap<Name, InputValue>) -> bool {
+    args.values()
+        .any(|argument| has_named(&argument.directives, "deprecated"))
+}
+
+fn object_has_deprecation(object: &ObjectType) -> bool {
+    has_named(&object.directives, "deprecated")
+        || object
+            .fields
+            .values()
+            .any(|field| field_has_deprecation(field) || has_argument_deprecation(&field.args))
+}
+
+fn interface_has_deprecation(interface: &InterfaceType) -> bool {
+    has_named(&interface.directives, "deprecated")
+        || interface
+            .fields
+            .values()
+            .any(|field| field_has_deprecation(field) || has_argument_deprecation(&field.args))
+}
+
+fn enum_has_deprecation(enumeration: &EnumType) -> bool {
+    has_named(&enumeration.directives, "deprecated")
+        || enumeration
+            .values
+            .values()
+            .any(|value| has_named(&value.directives, "deprecated"))
+}
+
+fn input_has_dedicated(input: &InputObjectType) -> bool {
+    has_named(&input.directives, "oneOf")
+        || has_named(&input.directives, "deprecated")
+        || input
+            .fields
+            .values()
+            .any(|field| has_named(&field.directives, "deprecated"))
+}
+
+fn directive_has_deprecation(directive: &DirectiveDefinition) -> bool {
+    has_named(&directive.directives, "deprecated") || has_argument_deprecation(&directive.args)
 }
 
 /// Remove `@deprecated`, `@specifiedBy` and `@oneOf` applications now that their authoritative
@@ -884,6 +962,13 @@ fn strip_dedicated_directives(schema: &mut Schema) {
 /// when validation succeeded, which also means every coercion here succeeds; anything else is
 /// still reported rather than silently kept.
 fn coerce_applied_directive_arguments(schema: &mut Schema, errors: &mut SchemaError) {
+    // Most schemas have no directive applications at all. Coercion needs a snapshot of the
+    // schema to resolve named input types, which forces a deep copy of every definition through
+    // `Arc::make_mut`; skip all of that when there is nothing to coerce.
+    if !has_applied_directives(schema) {
+        return;
+    }
+
     fn coerce(
         lookup: &Schema,
         directives: &mut [AppliedDirective],
@@ -923,6 +1008,9 @@ fn coerce_applied_directive_arguments(schema: &mut Schema, errors: &mut SchemaEr
     fn field(lookup: &Schema, field: &mut Field, owner: &str, errors: &mut SchemaError) {
         coerce(lookup, &mut field.directives, owner, errors);
         for argument in field.args.values_mut() {
+            if argument.directives.is_empty() {
+                continue;
+            }
             let owner = format!("argument \"{}\" of {owner}", argument.name);
             input_value(lookup, argument, &owner, errors);
         }
@@ -933,6 +1021,9 @@ fn coerce_applied_directive_arguments(schema: &mut Schema, errors: &mut SchemaEr
 
     coerce(&lookup, &mut inner.applied_directives, "the schema", errors);
     for ty in inner.types.values_mut() {
+        if !type_has_applied_directives(ty) {
+            continue;
+        }
         match ty {
             Type::Scalar(scalar) => {
                 let scalar = Arc::make_mut(scalar);
@@ -995,12 +1086,87 @@ fn coerce_applied_directive_arguments(schema: &mut Schema, errors: &mut SchemaEr
         }
     }
     for directive in inner.directives.values_mut() {
+        if directive.directives.is_empty()
+            && directive.args.values().all(|a| a.directives.is_empty())
+        {
+            continue;
+        }
         let owner = format!("directive \"@{}\"", directive.name);
         coerce(&lookup, &mut directive.directives, &owner, errors);
         for argument in directive.args.values_mut() {
             let owner = format!("argument \"{}\" of {owner}", argument.name);
             input_value(&lookup, argument, &owner, errors);
         }
+    }
+}
+
+/// Whether any element of the schema has an applied directive.
+///
+/// The directive passes are not free: coercion snapshots the whole schema and then deep-clones
+/// every definition it rewrites. Nearly every schema has none, so this scan lets the build skip
+/// those passes entirely.
+fn has_applied_directives(schema: &Schema) -> bool {
+    !schema.inner.applied_directives.is_empty()
+        || schema.inner.types.values().any(type_has_applied_directives)
+        || schema.inner.directives.values().any(|directive| {
+            !directive.directives.is_empty()
+                || directive.args.values().any(|a| !a.directives.is_empty())
+        })
+}
+
+fn type_has_applied_directives(ty: &Type) -> bool {
+    match ty {
+        Type::Scalar(scalar) => !scalar.directives.is_empty(),
+        Type::Object(object) => {
+            !object.directives.is_empty()
+                || object.fields.values().any(field_has_applied_directives)
+        }
+        Type::Interface(interface) => {
+            !interface.directives.is_empty()
+                || interface.fields.values().any(field_has_applied_directives)
+        }
+        Type::Union(union) => !union.directives.is_empty(),
+        Type::Enum(enumeration) => {
+            !enumeration.directives.is_empty()
+                || enumeration
+                    .values
+                    .values()
+                    .any(|value| !value.directives.is_empty())
+        }
+        Type::InputObject(input) => {
+            !input.directives.is_empty()
+                || input
+                    .fields
+                    .values()
+                    .any(|field| !field.directives.is_empty())
+        }
+    }
+}
+
+fn field_has_applied_directives(field: &Field) -> bool {
+    !field.directives.is_empty()
+        || field
+            .args
+            .values()
+            .any(|argument| !argument.directives.is_empty())
+}
+
+/// The built-in scalars, in the canonical order they are added to a schema.
+const BUILT_IN_SCALARS: [&str; 5] = ["String", "Int", "Float", "Boolean", "ID"];
+
+/// The index of a built-in scalar name in [`BUILT_IN_SCALARS`].
+fn builtin_scalar_index(name: &str) -> Option<usize> {
+    BUILT_IN_SCALARS.iter().position(|builtin| *builtin == name)
+}
+
+/// Build the built-in scalar at `index` in [`BUILT_IN_SCALARS`].
+fn builtin_scalar(index: usize) -> ScalarType {
+    match index {
+        0 => ScalarType::string(),
+        1 => ScalarType::int(),
+        2 => ScalarType::float(),
+        3 => ScalarType::boolean(),
+        _ => ScalarType::id(),
     }
 }
 
@@ -1015,13 +1181,28 @@ fn add_referenced_builtin_scalars(
     types: &mut TypeMap<Type>,
     directives: &TypeMap<DirectiveDefinition>,
 ) {
-    let mut referenced: FxHashSet<Name> = FxHashSet::default();
-
-    fn add_type_ref(ty: &TypeRef, referenced: &mut FxHashSet<Name>) {
-        referenced.insert(ty.named_type().clone());
+    // Fast path for the common fully-populated schema.
+    if BUILT_IN_SCALARS
+        .iter()
+        .all(|name| types.contains_key(*name))
+    {
+        return;
     }
 
-    fn add_fields<'a>(fields: impl Iterator<Item = &'a Field>, referenced: &mut FxHashSet<Name>) {
+    // Only the five built-in scalar names matter here, so a fixed mask avoids building a set of
+    // every name the schema references.
+    let mut referenced = [false; BUILT_IN_SCALARS.len()];
+
+    fn add_type_ref(ty: &TypeRef, referenced: &mut [bool; BUILT_IN_SCALARS.len()]) {
+        if let Some(index) = builtin_scalar_index(ty.named_type()) {
+            referenced[index] = true;
+        }
+    }
+
+    fn add_fields<'a>(
+        fields: impl Iterator<Item = &'a Field>,
+        referenced: &mut [bool; BUILT_IN_SCALARS.len()],
+    ) {
         for field in fields {
             add_type_ref(&field.ty, referenced);
             for argument in field.args.values() {
@@ -1049,16 +1230,12 @@ fn add_referenced_builtin_scalars(
         }
     }
 
-    let missing: Vec<ScalarType> = [
-        ScalarType::string(),
-        ScalarType::int(),
-        ScalarType::float(),
-        ScalarType::boolean(),
-        ScalarType::id(),
-    ]
-    .into_iter()
-    .filter(|scalar| referenced.contains(&scalar.name) && !types.contains_key(&scalar.name))
-    .collect();
+    let missing: Vec<ScalarType> = BUILT_IN_SCALARS
+        .iter()
+        .enumerate()
+        .filter(|(index, name)| referenced[*index] && !types.contains_key(**name))
+        .map(|(index, _)| builtin_scalar(index))
+        .collect();
 
     if missing.is_empty() {
         return;
@@ -1077,6 +1254,17 @@ fn add_referenced_builtin_scalars(
     *types = ordered;
 }
 
+/// The introspection types, constructed once and shared by every schema.
+///
+/// A schema is immutable and these definitions have no resolvers and reference no user type, so
+/// sharing one copy is safe. Their fields deliberately keep `type_index` unset: filling it in
+/// would mutate a shared definition, forcing a deep clone on every build. Execution falls back to
+/// a name lookup for those fields, and introspection queries are not the hot path.
+fn introspection_types() -> &'static [Type] {
+    static TYPES: std::sync::OnceLock<Vec<Type>> = std::sync::OnceLock::new();
+    TYPES.get_or_init(crate::introspection::types)
+}
+
 /// Record where each field's output type lives in the schema's type map.
 ///
 /// The map is complete (introspection types included) by the time this runs, and its order never
@@ -1089,6 +1277,15 @@ fn resolve_field_type_indices(types: &mut TypeMap<Type>) {
         .map(|(index, name)| (name.clone(), index as u32))
         .collect();
 
+    fn resolved(
+        fields: &IndexMap<Name, crate::types::Field>,
+        indices: &rustc_hash::FxHashMap<Name, u32>,
+    ) -> bool {
+        fields
+            .values()
+            .all(|field| field.type_index == indices.get(field.ty.named_type()).copied())
+    }
+
     fn assign(
         fields: &mut IndexMap<Name, crate::types::Field>,
         indices: &rustc_hash::FxHashMap<Name, u32>,
@@ -1098,12 +1295,73 @@ fn resolve_field_type_indices(types: &mut TypeMap<Type>) {
         }
     }
 
-    for ty in types.values_mut() {
+    for (name, ty) in types.iter_mut() {
+        if name.starts_with("__") {
+            // Introspection definitions are shared with every other schema and keep their
+            // `type_index` unset; execution resolves them by name.
+            continue;
+        }
         match ty {
-            Type::Object(object) => assign(&mut Arc::make_mut(object).fields, &indices),
-            Type::Interface(interface) => assign(&mut Arc::make_mut(interface).fields, &indices),
+            // A definition shared with the schema this one was composed from already holds the
+            // right positions when the type map kept its order, which is the normal case for
+            // merge/retain/transform. `Arc::make_mut` would deep-clone it for nothing.
+            Type::Object(object) if !resolved(&object.fields, &indices) => {
+                assign(&mut Arc::make_mut(object).fields, &indices);
+            }
+            Type::Interface(interface) if !resolved(&interface.fields, &indices) => {
+                assign(&mut Arc::make_mut(interface).fields, &indices);
+            }
             _ => {}
         }
+    }
+}
+
+/// A named schema element, formatted only when an error is recorded.
+///
+/// Validation formats an owner for every field and argument it visits. Building that string up
+/// front made a successful build allocate once per element, so owners are now formed on demand.
+pub(crate) struct NamedOwner<'a> {
+    pub(crate) kind: &'static str,
+    pub(crate) name: &'a str,
+}
+
+impl fmt::Display for NamedOwner<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} \"{}\"", self.kind, self.name)
+    }
+}
+
+/// A `Kind "type.member"` path, formatted only when an error is recorded.
+pub(crate) struct NamedPath<'a> {
+    pub(crate) kind: &'static str,
+    pub(crate) type_name: &'a str,
+    pub(crate) name: &'a str,
+}
+
+impl fmt::Display for NamedPath<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} \"{}.{}\"", self.kind, self.type_name, self.name)
+    }
+}
+
+/// A directive definition's owner (`directive "@name"`).
+pub(crate) struct DirectiveOwner<'a>(pub(crate) &'a str);
+
+impl fmt::Display for DirectiveOwner<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "directive \"@{}\"", self.0)
+    }
+}
+
+/// An argument of a field or directive definition.
+pub(crate) struct ArgumentPath<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) owner: &'a dyn fmt::Display,
+}
+
+impl fmt::Display for ArgumentPath<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Argument \"{}\" of {}", self.name, self.owner)
     }
 }
 
@@ -1111,7 +1369,7 @@ fn resolve_field_type_indices(types: &mut TypeMap<Type>) {
 fn validate_output_type(
     schema: &Schema,
     reference: &TypeRef,
-    owner: &str,
+    owner: &dyn fmt::Display,
     errors: &mut SchemaError,
 ) {
     match reference {
@@ -1138,7 +1396,7 @@ fn validate_output_type(
 fn validate_input_type(
     schema: &Schema,
     reference: &TypeRef,
-    owner: &str,
+    owner: &dyn fmt::Display,
     errors: &mut SchemaError,
 ) {
     match reference {
@@ -1164,14 +1422,17 @@ fn validate_input_type(
 fn validate_arguments(
     schema: &Schema,
     args: &IndexMap<Name, InputValue>,
-    owner: &str,
+    owner: &dyn fmt::Display,
     errors: &mut SchemaError,
 ) {
     for argument in args.values() {
         validate_input_type(
             schema,
             &argument.ty,
-            &format!("Argument \"{}\" of {owner}", argument.name),
+            &ArgumentPath {
+                name: &argument.name,
+                owner,
+            },
             errors,
         );
         if let Some(default) = &argument.default_value {
@@ -1211,7 +1472,7 @@ fn validate_applied_directives(schema: &Schema, errors: &mut SchemaError) {
         schema,
         schema.applied_directives(),
         DirectiveLocation::Schema,
-        "the schema",
+        &"the schema",
         errors,
     );
     for (_name, ty) in schema.types() {
@@ -1220,7 +1481,10 @@ fn validate_applied_directives(schema: &Schema, errors: &mut SchemaError) {
                 schema,
                 &scalar.directives,
                 DirectiveLocation::Scalar,
-                &format!("scalar \"{}\"", scalar.name),
+                &NamedOwner {
+                    kind: "scalar",
+                    name: scalar.name.as_ref(),
+                },
                 errors,
             ),
             Type::Object(object) => {
@@ -1228,7 +1492,10 @@ fn validate_applied_directives(schema: &Schema, errors: &mut SchemaError) {
                     schema,
                     &object.directives,
                     DirectiveLocation::Object,
-                    &format!("object \"{}\"", object.name),
+                    &NamedOwner {
+                        kind: "object",
+                        name: object.name.as_ref(),
+                    },
                     errors,
                 );
                 for field in object.fields.values() {
@@ -1240,7 +1507,10 @@ fn validate_applied_directives(schema: &Schema, errors: &mut SchemaError) {
                     schema,
                     &interface.directives,
                     DirectiveLocation::Interface,
-                    &format!("interface \"{}\"", interface.name),
+                    &NamedOwner {
+                        kind: "interface",
+                        name: interface.name.as_ref(),
+                    },
                     errors,
                 );
                 for field in interface.fields.values() {
@@ -1251,7 +1521,10 @@ fn validate_applied_directives(schema: &Schema, errors: &mut SchemaError) {
                 schema,
                 &union.directives,
                 DirectiveLocation::Union,
-                &format!("union \"{}\"", union.name),
+                &NamedOwner {
+                    kind: "union",
+                    name: union.name.as_ref(),
+                },
                 errors,
             ),
             Type::Enum(enumeration) => {
@@ -1267,7 +1540,11 @@ fn validate_applied_directives(schema: &Schema, errors: &mut SchemaError) {
                         schema,
                         &value.directives,
                         DirectiveLocation::EnumValue,
-                        &format!("enum value \"{}.{}\"", enumeration.name, value.name),
+                        &NamedPath {
+                            kind: "enum value",
+                            type_name: enumeration.name.as_ref(),
+                            name: value.name.as_ref(),
+                        },
                         errors,
                     );
                 }
@@ -1285,7 +1562,11 @@ fn validate_applied_directives(schema: &Schema, errors: &mut SchemaError) {
                         schema,
                         &field.directives,
                         DirectiveLocation::InputFieldDefinition,
-                        &format!("input field \"{}.{}\"", input.name, field.name),
+                        &NamedPath {
+                            kind: "input field",
+                            type_name: input.name.as_ref(),
+                            name: field.name.as_ref(),
+                        },
                         errors,
                     );
                 }
@@ -1297,7 +1578,7 @@ fn validate_applied_directives(schema: &Schema, errors: &mut SchemaError) {
             schema,
             &directive.1.directives,
             DirectiveLocation::DirectiveDefinition,
-            &format!("directive \"@{}\"", directive.1.name),
+            &DirectiveOwner(&directive.1.name),
             errors,
         );
         for argument in directive.1.args.values() {
@@ -1305,7 +1586,10 @@ fn validate_applied_directives(schema: &Schema, errors: &mut SchemaError) {
                 schema,
                 &argument.directives,
                 DirectiveLocation::ArgumentDefinition,
-                &format!("argument \"{}\"", argument.name),
+                &NamedOwner {
+                    kind: "argument",
+                    name: argument.name.as_ref(),
+                },
                 errors,
             );
         }
@@ -1318,7 +1602,10 @@ fn validate_field_directives(schema: &Schema, field: &Field, errors: &mut Schema
         schema,
         &field.directives,
         DirectiveLocation::FieldDefinition,
-        &format!("field \"{}\"", field.name),
+        &NamedOwner {
+            kind: "field",
+            name: field.name.as_ref(),
+        },
         errors,
     );
     for argument in field.args.values() {
@@ -1326,7 +1613,10 @@ fn validate_field_directives(schema: &Schema, field: &Field, errors: &mut Schema
             schema,
             &argument.directives,
             DirectiveLocation::ArgumentDefinition,
-            &format!("argument \"{}\"", argument.name),
+            &NamedOwner {
+                kind: "argument",
+                name: argument.name.as_ref(),
+            },
             errors,
         );
     }
@@ -1623,7 +1913,11 @@ fn validate_schema(schema: &Schema, errors: &mut SchemaError) {
                     validate_input_type(
                         schema,
                         &field.ty,
-                        &format!("Field \"{}.{}\"", input.name, field.name),
+                        &NamedPath {
+                            kind: "Field",
+                            type_name: &input.name,
+                            name: &field.name,
+                        },
                         errors,
                     );
                     if let Some(default) = &field.default_value {
@@ -1688,7 +1982,7 @@ fn validate_schema(schema: &Schema, errors: &mut SchemaError) {
         validate_arguments(
             schema,
             &directive.args,
-            &format!("directive \"@{}\"", directive.name),
+            &DirectiveOwner(&directive.name),
             errors,
         );
     }
@@ -1736,16 +2030,25 @@ fn validate_field(schema: &Schema, field: &Field, owner: &str, errors: &mut Sche
             field.name
         ));
     }
+    let field_name = field.name.as_ref();
     validate_output_type(
         schema,
         &field.ty,
-        &format!("Field \"{owner}.{}\"", field.name),
+        &NamedPath {
+            kind: "Field",
+            type_name: owner,
+            name: field_name,
+        },
         errors,
     );
     validate_arguments(
         schema,
         &field.args,
-        &format!("field \"{owner}.{}\"", field.name),
+        &NamedPath {
+            kind: "field",
+            type_name: owner,
+            name: field_name,
+        },
         errors,
     );
     if field.name.starts_with("__") {

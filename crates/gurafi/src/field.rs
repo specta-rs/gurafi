@@ -20,54 +20,54 @@ use crate::{
 pub(crate) enum FieldCheck {
     /// `.as_abstract(...)` declared an interface or union output.
     Abstract {
-        owner: String,
+        owner: Name,
         field: Name,
         original: TypeRef,
         abstract_name: Name,
     },
     /// `.as_type::<T>()` replaced the field's GraphQL type.
     TypeOverride {
-        owner: String,
+        owner: Name,
         field: Name,
         original: TypeRef,
         replacement: TypeRef,
     },
     /// `.non_null()` was applied to a resolver that can return `None`.
     NonNullOnOption {
-        owner: String,
+        owner: Name,
         field: Name,
         rust_type: &'static str,
     },
     /// `.nullable_items()` was applied to a field that is not a list.
     NullableItemsOnNonList {
-        owner: String,
+        owner: Name,
         field: Name,
         ty: TypeRef,
     },
     /// `.non_null_items()` was applied to a field that is not a list.
     NonNullItemsOnNonList {
-        owner: String,
+        owner: Name,
         field: Name,
         ty: TypeRef,
     },
     /// A `.resolve_inherited(...)` field's Rust type must be a covariant match for the
     /// interface field it inherits.
     InheritedType {
-        owner: String,
+        owner: Name,
         field: Name,
         actual: TypeRef,
         expected: TypeRef,
     },
     /// `.as_object_ref(...)` declared a runtime-named object output.
     DynamicObject {
-        owner: String,
+        owner: Name,
         field: Name,
         original: TypeRef,
         model: &'static str,
     },
     /// `.as_dynamic(...)` declared an explicit runtime-named output type.
     DynamicType {
-        owner: String,
+        owner: Name,
         field: Name,
         rust: TypeRef,
         declared: TypeRef,
@@ -83,6 +83,13 @@ pub(crate) enum FieldSink<'a> {
 }
 
 impl FieldSink<'_> {
+    fn get(&self, name: &str) -> Option<&Field> {
+        match self {
+            Self::Object(fields) => fields.get(name),
+            Self::Fields(fields) => fields.iter().rev().find(|field| &*field.name == name),
+        }
+    }
+
     fn get_mut(&mut self, name: &str) -> Option<&mut Field> {
         match self {
             Self::Object(fields) => fields.get_mut(name),
@@ -276,8 +283,12 @@ pub struct FieldConfig<'a, Ctx: 'static> {
     /// Interface fields store authorization here so implementing objects inherit it.
     field_auth: Option<&'a mut IndexMap<Name, Arc<AuthGuard<Ctx>>>>,
     checks: Option<&'a mut Vec<FieldCheck>>,
-    owner: String,
-    original: TypeRef,
+    owner: Name,
+    /// The field's declared type when this config was created.
+    ///
+    /// Most fields never change their type, so this is captured on first use instead of cloning
+    /// the `TypeRef` (and its boxes) for every declared field.
+    original: OnceLock<TypeRef>,
     rust_nullable: bool,
     rust_type_name: &'static str,
     /// The Rust arguments type the field's resolvers coerce into.
@@ -287,12 +298,18 @@ pub struct FieldConfig<'a, Ctx: 'static> {
     marker: std::marker::PhantomData<fn() -> Ctx>,
 }
 
+/// A shared empty name for interface fields, which never report a field check.
+fn empty_name() -> Name {
+    static EMPTY: OnceLock<Name> = OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Name::from("")))
+}
+
 impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
     pub(crate) fn for_object_checked(
         registry: &'a mut TypeRegistry,
         fields: &'a mut IndexMap<Name, Field>,
         checks: &'a mut Vec<FieldCheck>,
-        owner: impl Into<String>,
+        owner: impl Into<Name>,
         name: Name,
         rust_nullable: bool,
         rust_type_name: &'static str,
@@ -325,7 +342,7 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
             FieldSink::Object(fields),
             name,
             None,
-            String::new(),
+            empty_name(),
             rust_nullable,
             rust_type_name,
             TypeId::of::<()>(),
@@ -339,7 +356,7 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
         registry: &'a mut TypeRegistry,
         fields: &'a mut Vec<Field>,
         checks: &'a mut Vec<FieldCheck>,
-        owner: impl Into<String>,
+        owner: impl Into<Name>,
         name: Name,
         rust_nullable: bool,
         rust_type_name: &'static str,
@@ -361,18 +378,15 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
 
     fn new(
         registry: &'a mut TypeRegistry,
-        mut sink: FieldSink<'a>,
+        sink: FieldSink<'a>,
         name: Name,
         checks: Option<&'a mut Vec<FieldCheck>>,
-        owner: String,
+        owner: Name,
         rust_nullable: bool,
         rust_type_name: &'static str,
         args_type: TypeId,
         validation: ValidationSlot<Ctx>,
     ) -> Self {
-        let original = sink
-            .get_mut(&name)
-            .map_or_else(|| TypeRef::Named(name.clone()), |field| field.ty.clone());
         Self {
             registry,
             sink,
@@ -385,13 +399,23 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
             field_auth: None,
             checks,
             owner,
-            original,
+            original: OnceLock::new(),
             rust_nullable,
             rust_type_name,
             args_type,
             validation,
             marker: std::marker::PhantomData,
         }
+    }
+
+    /// The field's declared type when this config was created.
+    fn original(&self) -> &TypeRef {
+        self.original.get_or_init(|| {
+            self.sink.get(&self.name).map_or_else(
+                || TypeRef::Named(Arc::clone(&self.name)),
+                |field| field.ty.clone(),
+            )
+        })
     }
 
     /// The GraphQL field name.
@@ -553,8 +577,8 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
         let abstract_name: Name = Arc::from(reference.abstract_name());
         let original = self
             .sink
-            .get_mut(&self.name)
-            .map_or_else(|| self.original.clone(), |field| field.ty.clone());
+            .get(&self.name)
+            .map_or_else(|| self.original().clone(), |field| field.ty.clone());
         if let Some(checks) = &mut self.checks {
             checks.push(FieldCheck::Abstract {
                 owner: self.owner.clone(),
@@ -580,13 +604,16 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
     /// error.
     pub fn as_object_ref<M: ObjectModel>(&mut self, reference: &ObjectRef<M>) -> &mut Self {
         self.registry.reference_object(reference.name());
-        if let Some(checks) = &mut self.checks {
-            checks.push(FieldCheck::DynamicObject {
-                owner: self.owner.clone(),
-                field: self.name.clone(),
-                original: self.original.clone(),
-                model: M::NAME,
-            });
+        if self.checks.is_some() {
+            let original = self.original().clone();
+            if let Some(checks) = &mut self.checks {
+                checks.push(FieldCheck::DynamicObject {
+                    owner: self.owner.clone(),
+                    field: self.name.clone(),
+                    original,
+                    model: M::NAME,
+                });
+            }
         }
         if let Some(field) = self.sink.get_mut(&self.name) {
             field.ty = replace_named_type(&field.ty, Arc::from(reference.name()));
@@ -606,8 +633,8 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
     pub fn as_dynamic(&mut self, ty: TypeRef) -> &mut Self {
         let current = self
             .sink
-            .get_mut(&self.name)
-            .map_or_else(|| self.original.clone(), |field| field.ty.clone());
+            .get(&self.name)
+            .map_or_else(|| self.original().clone(), |field| field.ty.clone());
         if let Some(checks) = &mut self.checks {
             checks.push(FieldCheck::DynamicType {
                 owner: self.owner.clone(),
@@ -656,13 +683,16 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
     fn override_type<T: OutputType>(&mut self) -> &mut Self {
         T::register_output(self.registry);
         let replacement = T::output_type();
-        if let Some(checks) = &mut self.checks {
-            checks.push(FieldCheck::TypeOverride {
-                owner: self.owner.clone(),
-                field: self.name.clone(),
-                original: self.original.clone(),
-                replacement: replacement.clone(),
-            });
+        if self.checks.is_some() {
+            let original = self.original().clone();
+            if let Some(checks) = &mut self.checks {
+                checks.push(FieldCheck::TypeOverride {
+                    owner: self.owner.clone(),
+                    field: self.name.clone(),
+                    original,
+                    replacement: replacement.clone(),
+                });
+            }
         }
         if let Some(field) = self.sink.get_mut(&self.name) {
             field.ty = replacement;

@@ -134,8 +134,7 @@ impl<T: GlobalIdType> GlobalId<T> {
     /// Encode as `Base64("TypeName:localId")`.
     #[must_use]
     pub fn encode(&self) -> String {
-        let raw = format!("{}:{}", Self::typename(), self.local_id);
-        base64::encode(raw.as_bytes())
+        base64::encode_parts(&[Self::typename().as_bytes(), b":", self.local_id.as_bytes()])
     }
 
     /// Decode and verify that the global ID belongs to `T`.

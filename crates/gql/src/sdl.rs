@@ -36,17 +36,19 @@ const DEDICATED_DIRECTIVES: [&str; 3] = ["deprecated", "specifiedBy", "oneOf"];
 /// Render a schema as GraphQL SDL.
 #[must_use]
 pub fn print_schema(schema: &Schema) -> String {
-    let mut definitions = Vec::new();
+    let mut output = String::new();
+    let mut wrote = false;
 
-    if let Some(definition) = print_schema_definition(schema) {
-        definitions.push(definition);
+    if write_schema_definition(schema, &mut output) {
+        wrote = true;
     }
 
     for (name, directive) in schema.directives() {
         if BUILT_IN_DIRECTIVES.contains(&name.as_ref()) {
             continue;
         }
-        definitions.push(print_directive(directive));
+        push_separator(&mut output, &mut wrote);
+        write_directive(&mut output, directive);
     }
 
     for (name, ty) in schema.types() {
@@ -62,16 +64,22 @@ pub fn print_schema(schema: &Schema) -> String {
         {
             continue;
         }
-        definitions.push(print_type(ty));
+        push_separator(&mut output, &mut wrote);
+        write_type(&mut output, ty);
     }
 
-    if definitions.is_empty() {
-        return String::new();
+    if wrote {
+        output.push('\n');
     }
-
-    let mut output = definitions.join("\n\n");
-    output.push('\n');
     output
+}
+
+/// Write the blank line between two definitions.
+fn push_separator(output: &mut String, wrote: &mut bool) {
+    if *wrote {
+        output.push_str("\n\n");
+    }
+    *wrote = true;
 }
 
 /// Print a runtime value using GraphQL literal syntax.
@@ -158,8 +166,10 @@ fn write_string(output: &mut String, value: &str) {
     output.push('"');
 }
 
-/// Print the `schema { ... }` definition when the defaults do not describe the schema.
-fn print_schema_definition(schema: &Schema) -> Option<String> {
+/// Write the `schema { ... }` definition when the defaults do not describe the schema.
+///
+/// Returns whether anything was written.
+fn write_schema_definition(schema: &Schema, output: &mut String) -> bool {
     let has_description = schema.description().is_some();
     let has_directives = !schema.applied_directives().is_empty();
     let custom_query = schema.query_name().as_ref() != "Query";
@@ -185,13 +195,12 @@ fn print_schema_definition(schema: &Schema) -> Option<String> {
         || shadowed_mutation
         || shadowed_subscription)
     {
-        return None;
+        return false;
     }
 
-    let mut output = String::new();
-    push_description(&mut output, schema.description(), "");
+    push_description(output, schema.description(), "");
     output.push_str("schema");
-    push_applied_directives(&mut output, schema.applied_directives());
+    push_applied_directives(output, schema.applied_directives());
     output.push_str(" {\n");
     let _ = writeln!(output, "  query: {}", schema.query_name());
     if let Some(name) = schema.mutation_name() {
@@ -201,125 +210,116 @@ fn print_schema_definition(schema: &Schema) -> Option<String> {
         let _ = writeln!(output, "  subscription: {name}");
     }
     output.push('}');
-    Some(output)
+    true
 }
 
-fn print_type(ty: &Type) -> String {
+fn write_type(output: &mut String, ty: &Type) {
     match ty {
-        Type::Scalar(scalar) => print_scalar(scalar),
-        Type::Object(object) => print_object(object),
-        Type::Interface(interface) => print_interface(interface),
-        Type::Union(union) => print_union(union),
-        Type::Enum(enumeration) => print_enum(enumeration),
-        Type::InputObject(input) => print_input_object(input),
+        Type::Scalar(scalar) => write_scalar(output, scalar),
+        Type::Object(object) => write_object(output, object),
+        Type::Interface(interface) => write_interface(output, interface),
+        Type::Union(union) => write_union(output, union),
+        Type::Enum(enumeration) => write_enum(output, enumeration),
+        Type::InputObject(input) => write_input_object(output, input),
     }
 }
 
-fn print_scalar(scalar: &ScalarType) -> String {
-    let mut output = String::new();
-    push_description(&mut output, scalar.description.as_deref(), "");
+fn write_scalar(output: &mut String, scalar: &ScalarType) {
+    push_description(output, scalar.description.as_deref(), "");
     let _ = write!(output, "scalar {}", scalar.name);
     if let Some(url) = &scalar.specified_by_url {
-        let _ = write!(
-            output,
-            " @specifiedBy(url: {})",
-            print_value(&Value::from(url.as_ref()))
-        );
+        output.push_str(" @specifiedBy(url: ");
+        write_string(output, url);
+        output.push(')');
     }
-    push_applied_directives(&mut output, &scalar.directives);
-    output
+    push_applied_directives(output, &scalar.directives);
 }
 
-fn print_object(object: &ObjectType) -> String {
-    let mut output = String::new();
-    push_description(&mut output, object.description.as_deref(), "");
+fn write_object(output: &mut String, object: &ObjectType) {
+    push_description(output, object.description.as_deref(), "");
     let _ = write!(output, "type {}", object.name);
-    push_implements(&mut output, &object.interfaces);
-    push_applied_directives(&mut output, &object.directives);
-    push_fields(&mut output, object.fields.values());
-    output
+    push_implements(output, &object.interfaces);
+    push_applied_directives(output, &object.directives);
+    push_fields(output, &object.fields);
 }
 
-fn print_interface(interface: &InterfaceType) -> String {
-    let mut output = String::new();
-    push_description(&mut output, interface.description.as_deref(), "");
+fn write_interface(output: &mut String, interface: &InterfaceType) {
+    push_description(output, interface.description.as_deref(), "");
     let _ = write!(output, "interface {}", interface.name);
-    push_implements(&mut output, &interface.interfaces);
-    push_applied_directives(&mut output, &interface.directives);
-    push_fields(&mut output, interface.fields.values());
-    output
+    push_implements(output, &interface.interfaces);
+    push_applied_directives(output, &interface.directives);
+    push_fields(output, &interface.fields);
 }
 
-fn print_union(union: &UnionType) -> String {
-    let mut output = String::new();
-    push_description(&mut output, union.description.as_deref(), "");
+fn write_union(output: &mut String, union: &UnionType) {
+    push_description(output, union.description.as_deref(), "");
     let _ = write!(output, "union {}", union.name);
-    push_applied_directives(&mut output, &union.directives);
+    push_applied_directives(output, &union.directives);
     if !union.types.is_empty() {
         output.push_str(" = ");
-        let members: Vec<&str> = union.types.iter().map(|name| name.as_ref()).collect();
-        output.push_str(&members.join(" | "));
+        for (index, name) in union.types.iter().enumerate() {
+            if index != 0 {
+                output.push_str(" | ");
+            }
+            output.push_str(name);
+        }
     }
-    output
 }
 
-fn print_enum(enumeration: &EnumType) -> String {
-    let mut output = String::new();
-    push_description(&mut output, enumeration.description.as_deref(), "");
+fn write_enum(output: &mut String, enumeration: &EnumType) {
+    push_description(output, enumeration.description.as_deref(), "");
     let _ = write!(output, "enum {}", enumeration.name);
-    push_applied_directives(&mut output, &enumeration.directives);
+    push_applied_directives(output, &enumeration.directives);
     if enumeration.values.is_empty() {
-        return output;
+        return;
     }
     output.push_str(" {\n");
     for value in enumeration.values.values() {
-        push_description(&mut output, value.description.as_deref(), "  ");
+        push_description(output, value.description.as_deref(), "  ");
         let _ = write!(output, "  {}", value.name);
-        push_deprecation(&mut output, value.deprecation_reason.as_deref());
-        push_applied_directives(&mut output, &value.directives);
+        push_deprecation(output, value.deprecation_reason.as_deref());
+        push_applied_directives(output, &value.directives);
         output.push('\n');
     }
     output.push('}');
-    output
 }
 
-fn print_input_object(input: &InputObjectType) -> String {
-    let mut output = String::new();
-    push_description(&mut output, input.description.as_deref(), "");
+fn write_input_object(output: &mut String, input: &InputObjectType) {
+    push_description(output, input.description.as_deref(), "");
     let _ = write!(output, "input {}", input.name);
     if input.one_of {
         output.push_str(" @oneOf");
     }
-    push_applied_directives(&mut output, &input.directives);
+    push_applied_directives(output, &input.directives);
     if input.fields.is_empty() {
-        return output;
+        return;
     }
     output.push_str(" {\n");
     for field in input.fields.values() {
-        push_description(&mut output, field.description.as_deref(), "  ");
-        let _ = writeln!(output, "  {}", print_input_value(field));
+        push_description(output, field.description.as_deref(), "  ");
+        output.push_str("  ");
+        write_input_value(output, field);
+        output.push('\n');
     }
     output.push('}');
-    output
 }
 
-fn print_directive(directive: &DirectiveDefinition) -> String {
-    let mut output = String::new();
-    push_description(&mut output, directive.description.as_deref(), "");
+fn write_directive(output: &mut String, directive: &DirectiveDefinition) {
+    push_description(output, directive.description.as_deref(), "");
     let _ = write!(output, "directive @{}", directive.name);
-    output.push_str(&print_arguments(&directive.args, ""));
+    write_arguments(output, &directive.args, "");
     if directive.repeatable {
         output.push_str(" repeatable");
     }
-    push_deprecation(&mut output, directive.deprecation_reason.as_deref());
-    push_applied_directives(&mut output, &directive.directives);
-    let locations: Vec<&str> = directive
-        .locations
-        .iter()
-        .map(|location| location.as_str())
-        .collect();
-    let _ = write!(output, " on {}", locations.join(" | "));
-    output
+    push_deprecation(output, directive.deprecation_reason.as_deref());
+    push_applied_directives(output, &directive.directives);
+    output.push_str(" on ");
+    for (index, location) in directive.locations.iter().enumerate() {
+        if index != 0 {
+            output.push_str(" | ");
+        }
+        output.push_str(location.as_str());
+    }
 }
 
 fn push_implements(output: &mut String, interfaces: &[Name]) {
@@ -327,38 +327,39 @@ fn push_implements(output: &mut String, interfaces: &[Name]) {
         return;
     }
     output.push_str(" implements ");
-    let names: Vec<&str> = interfaces.iter().map(|name| name.as_ref()).collect();
-    output.push_str(&names.join(" & "));
+    for (index, name) in interfaces.iter().enumerate() {
+        if index != 0 {
+            output.push_str(" & ");
+        }
+        output.push_str(name);
+    }
 }
 
-fn push_fields<'a>(output: &mut String, fields: impl Iterator<Item = &'a Field>) {
-    let fields: Vec<&Field> = fields.collect();
+fn push_fields(output: &mut String, fields: &IndexMap<Name, Field>) {
     if fields.is_empty() {
         return;
     }
     output.push_str(" {\n");
-    for field in fields {
-        output.push_str(&print_field(field, "  "));
+    for field in fields.values() {
+        write_field(output, field, "  ");
         output.push('\n');
     }
     output.push('}');
 }
 
-fn print_field(field: &Field, indent: &str) -> String {
-    let mut output = String::new();
-    push_description(&mut output, field.description.as_deref(), indent);
+fn write_field(output: &mut String, field: &Field, indent: &str) {
+    push_description(output, field.description.as_deref(), indent);
     output.push_str(indent);
     output.push_str(&field.name);
-    output.push_str(&print_arguments(&field.args, indent));
+    write_arguments(output, &field.args, indent);
     let _ = write!(output, ": {}", field.ty);
-    push_deprecation(&mut output, field.deprecation_reason.as_deref());
-    push_applied_directives(&mut output, &field.directives);
-    output
+    push_deprecation(output, field.deprecation_reason.as_deref());
+    push_applied_directives(output, &field.directives);
 }
 
-fn print_arguments(args: &IndexMap<Name, InputValue>, indent: &str) -> String {
+fn write_arguments(output: &mut String, args: &IndexMap<Name, InputValue>, indent: &str) {
     if args.is_empty() {
-        return String::new();
+        return;
     }
 
     let multiline = args.values().any(|argument| {
@@ -371,34 +372,42 @@ fn print_arguments(args: &IndexMap<Name, InputValue>, indent: &str) -> String {
     });
 
     if !multiline {
-        let arguments: Vec<String> = args.values().map(print_input_value).collect();
-        return format!("({})", arguments.join(", "));
+        output.push('(');
+        for (index, argument) in args.values().enumerate() {
+            if index != 0 {
+                output.push_str(", ");
+            }
+            write_input_value(output, argument);
+        }
+        output.push(')');
+        return;
     }
 
-    let inner = format!("{indent}  ");
-    let mut output = String::from("(\n");
+    let mut inner = String::with_capacity(indent.len() + 2);
+    inner.push_str(indent);
+    inner.push_str("  ");
+    output.push_str("(\n");
     for (index, argument) in args.values().enumerate() {
         if index != 0 {
             output.push('\n');
         }
-        push_description(&mut output, argument.description.as_deref(), &inner);
-        let _ = write!(output, "{inner}{}", print_input_value(argument));
+        push_description(output, argument.description.as_deref(), &inner);
+        output.push_str(&inner);
+        write_input_value(output, argument);
     }
     output.push('\n');
     output.push_str(indent);
     output.push(')');
-    output
 }
 
-fn print_input_value(value: &InputValue) -> String {
-    let mut output = format!("{}: {}", value.name, value.ty);
+fn write_input_value(output: &mut String, value: &InputValue) {
+    let _ = write!(output, "{}: {}", value.name, value.ty);
     if let Some(default) = &value.default_value {
         output.push_str(" = ");
-        output.push_str(&print_value(default));
+        write_value(output, default);
     }
-    push_deprecation(&mut output, value.deprecation_reason.as_deref());
-    push_applied_directives(&mut output, &value.directives);
-    output
+    push_deprecation(output, value.deprecation_reason.as_deref());
+    push_applied_directives(output, &value.directives);
 }
 
 fn push_deprecation(output: &mut String, reason: Option<&str>) {
@@ -406,11 +415,9 @@ fn push_deprecation(output: &mut String, reason: Option<&str>) {
     if reason == DEFAULT_DEPRECATION_REASON {
         output.push_str(" @deprecated");
     } else {
-        let _ = write!(
-            output,
-            " @deprecated(reason: {})",
-            print_value(&Value::from(reason))
-        );
+        output.push_str(" @deprecated(reason: ");
+        write_string(output, reason);
+        output.push(')');
     }
 }
 
@@ -432,7 +439,7 @@ fn push_applied_directives(output: &mut String, directives: &[AppliedDirective])
             }
             output.push_str(name);
             output.push_str(": ");
-            output.push_str(&print_value(value));
+            write_value(output, value);
         }
         output.push(')');
     }

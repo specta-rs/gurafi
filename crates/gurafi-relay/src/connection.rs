@@ -154,17 +154,23 @@ impl<T> Connection<T> {
     {
         args.validate()?;
 
-        let tokens: Vec<String> = items.iter().map(|item| cursor(item).into()).collect();
-        let cursors: Vec<String> = tokens.iter().map(|token| Cursor::encode(token)).collect();
-
         let mut start = 0;
         let mut end = items.len();
+
+        // Cursor tokens are only needed to locate a boundary. When the client sent neither
+        // `after` nor `before`, skip building the token list entirely and encode just the
+        // cursors of the returned page.
+        let tokens: Option<Vec<String>> = if args.after.is_some() || args.before.is_some() {
+            Some(items.iter().map(|item| cursor(item).into()).collect())
+        } else {
+            None
+        };
 
         if let Some(after) = &args.after {
             let token = Cursor::decode(after)?;
             let position = tokens
-                .iter()
-                .position(|candidate| candidate == &token)
+                .as_ref()
+                .and_then(|tokens| tokens.iter().position(|candidate| candidate == &token))
                 .ok_or_else(|| {
                     GraphQLError::new("Invalid `after` cursor: it is not in this list.")
                 })?;
@@ -173,8 +179,8 @@ impl<T> Connection<T> {
         if let Some(before) = &args.before {
             let token = Cursor::decode(before)?;
             let position = tokens
-                .iter()
-                .position(|candidate| candidate == &token)
+                .as_ref()
+                .and_then(|tokens| tokens.iter().position(|candidate| candidate == &token))
                 .ok_or_else(|| {
                     GraphQLError::new("Invalid `before` cursor: it is not in this list.")
                 })?;
@@ -199,12 +205,20 @@ impl<T> Connection<T> {
             start = start.max(end.saturating_sub(last as usize));
         }
 
-        let edges = (start..end)
-            .map(|index| Edge {
-                cursor: cursors[index].clone(),
+        let mut edges = Vec::with_capacity(end.saturating_sub(start));
+        for index in start..end {
+            let encoded = match &tokens {
+                Some(tokens) => Cursor::encode(&tokens[index]),
+                None => {
+                    let token: String = cursor(&items[index]).into();
+                    Cursor::encode(&token)
+                }
+            };
+            edges.push(Edge {
+                cursor: encoded,
                 node: items[index].clone(),
-            })
-            .collect::<Vec<_>>();
+            });
+        }
 
         let page_info = PageInfo {
             has_next_page,
@@ -253,7 +267,6 @@ impl<T> Connection<T> {
         T: Clone,
     {
         args.validate()?;
-        let position_cursor = |index: usize| Cursor::encode(&index.to_string());
         let mut start = 0;
         let mut end = items.len();
 
@@ -296,12 +309,13 @@ impl<T> Connection<T> {
             start = start.max(end.saturating_sub(last as usize));
         }
 
-        let edges = (start..end)
-            .map(|index| Edge {
-                cursor: position_cursor(index),
-                node: items[index].clone(),
-            })
-            .collect::<Vec<_>>();
+        let mut edges = Vec::with_capacity(end.saturating_sub(start));
+        for (index, item) in items.iter().enumerate().take(end).skip(start) {
+            edges.push(Edge {
+                cursor: Cursor::encode_index(index),
+                node: item.clone(),
+            });
+        }
         let page_info = PageInfo {
             has_next_page,
             has_previous_page,
@@ -324,6 +338,26 @@ impl Cursor {
     #[must_use]
     pub fn encode(token: &str) -> String {
         base64::encode(token.as_bytes())
+    }
+
+    /// Encode an item index as a cursor token.
+    ///
+    /// This is [`Cursor::encode`] for the decimal spelling of `index`, without allocating the
+    /// intermediate decimal string.
+    #[must_use]
+    pub fn encode_index(index: usize) -> String {
+        let mut digits = [0u8; 20];
+        let mut position = digits.len();
+        let mut remaining = index;
+        loop {
+            position -= 1;
+            digits[position] = b'0' + (remaining % 10) as u8;
+            remaining /= 10;
+            if remaining == 0 {
+                break;
+            }
+        }
+        base64::encode(&digits[position..])
     }
 
     /// Decode a cursor token.

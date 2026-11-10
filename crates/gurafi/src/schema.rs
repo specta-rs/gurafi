@@ -693,7 +693,7 @@ impl<Ctx: 'static> Schema<Ctx> {
             &mut self.registry,
             &mut object.fields,
             &mut self.checks,
-            object_name.to_string(),
+            Arc::clone(&object_name),
             field_name,
             T::is_optional(),
             std::any::type_name::<T>(),
@@ -1107,7 +1107,7 @@ impl<Ctx: 'static> Schema<Ctx> {
     fn merge_generated_types(&mut self, errors: &mut Vec<GraphQLError>) {
         let (objects, unions) = self.registry.take_generated();
         for (name, object) in objects {
-            if self.objects.contains_key(name.as_str()) {
+            if self.objects.contains_key(name.as_ref()) {
                 errors.push(GraphQLError::new(format!(
                     "Generated result-union success type `{name}` collides with an object type \
                      that is already registered. Give the field a different name, or register \
@@ -1115,10 +1115,10 @@ impl<Ctx: 'static> Schema<Ctx> {
                 )));
                 continue;
             }
-            self.objects.insert(Arc::from(name.as_str()), object);
+            self.objects.insert(name, object);
         }
         for (name, union) in unions {
-            if self.unions.contains_key(name.as_str()) {
+            if self.unions.contains_key(name.as_ref()) {
                 errors.push(GraphQLError::new(format!(
                     "Generated result-union type `{name}` collides with a union type that is \
                      already registered. Give the field a different name, or register the \
@@ -1126,7 +1126,7 @@ impl<Ctx: 'static> Schema<Ctx> {
                 )));
                 continue;
             }
-            self.unions.insert(Arc::from(name.as_str()), union);
+            self.unions.insert(name, union);
         }
         for (name, error) in self.registry.take_required_objects() {
             if !self.objects.contains_key(name.as_str()) {
@@ -1256,7 +1256,7 @@ impl<Ctx: 'static> Schema<Ctx> {
             };
             let actual = field.ty.clone();
             self.checks.push(FieldCheck::InheritedType {
-                owner: pending.object.to_string(),
+                owner: Arc::clone(&pending.object),
                 field: pending.field.clone(),
                 actual,
                 expected: interface_ty.clone(),
@@ -1886,7 +1886,7 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
             + Sync
             + 'static,
     {
-        let parent = self.object.name.to_string();
+        let parent = Arc::clone(&self.object.name);
         let (field, validation) = object_field_result_union_with_info::<M, Ctx, T, E, A, F>(
             name,
             resolver,
@@ -1948,7 +1948,7 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
             + Sync
             + 'static,
     {
-        let parent = self.object.name.to_string();
+        let parent = Arc::clone(&self.object.name);
         let (field, validation) = object_field_result_union_async_with_info::<M, Ctx, T, E, A, F>(
             name,
             resolver,
@@ -2181,7 +2181,7 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
         validation: ValidationSlot<Ctx>,
     ) -> FieldConfig<'_, Ctx> {
         let name = field.name.clone();
-        let owner = self.object.name.to_string();
+        let owner = Arc::clone(&self.object.name);
         self.object.insert_field(field);
         FieldConfig::for_object_checked(
             self.registry,

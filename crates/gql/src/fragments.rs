@@ -13,10 +13,76 @@ use std::fmt;
 
 use rustc_hash::FxHashMap;
 
-use crate::ast::{Document, FragmentDefinition};
+use crate::ast::{Definition, Document, FragmentDefinition};
 
 /// Above this many fragments, lookup uses a hash map instead of a linear scan.
 const INLINE_FRAGMENTS: usize = 8;
+
+/// A fragment index computed once for a document that will be executed repeatedly.
+///
+/// Names borrow the document's source text and the positions index [`Document::definitions`], so an
+/// index holds no reference to the document itself. Combining it with a borrow of the document at
+/// execution time produces a [`Fragments`] lookup without scanning the definitions or allocating
+/// again — the work a prepared document would otherwise repeat on every request and every
+/// subscription event.
+#[derive(Clone)]
+pub(crate) struct FragmentIndex<'a> {
+    /// Fragment names with the position of their definition, in source order.
+    ///
+    /// A `Vec` rather than an inline buffer: this is built once per prepared document, and keeping
+    /// the type covariant lets a [`Fragments`] built from it shrink to the executing borrow.
+    entries: Vec<(&'a str, usize)>,
+    /// Name to position, when there are enough fragments for hashing to win.
+    index: Option<FxHashMap<&'a str, usize>>,
+}
+
+impl<'a> FragmentIndex<'a> {
+    /// Index the fragment definitions of `document`.
+    ///
+    /// The first definition of a name wins, matching [`Fragments::new`].
+    ///
+    /// The borrow of the document is only used to read it: every name points into the source text
+    /// the document borrows, so the index itself is independent of the document's address.
+    #[must_use]
+    pub(crate) fn new(document: &Document<'a>) -> Self {
+        let mut entries: Vec<(&'a str, usize)> = Vec::new();
+        for (position, definition) in document.definitions.iter().enumerate() {
+            let Definition::Fragment(fragment) = definition else {
+                continue;
+            };
+            if entries.iter().any(|(name, _)| *name == fragment.name) {
+                continue;
+            }
+            entries.push((fragment.name, position));
+        }
+        let index = (entries.len() > INLINE_FRAGMENTS).then(|| {
+            entries
+                .iter()
+                .enumerate()
+                .map(|(position, (name, _))| (*name, position))
+                .collect()
+        });
+        Self { entries, index }
+    }
+
+    /// The position of the definition for `name`.
+    #[inline]
+    fn position(&self, name: &str) -> Option<usize> {
+        match &self.index {
+            Some(index) => index.get(name).map(|position| self.entries[*position].1),
+            None => self
+                .entries
+                .iter()
+                .find(|(known, _)| *known == name)
+                .map(|(_, position)| *position),
+        }
+    }
+
+    /// The number of indexed fragments.
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 
 /// A map of fragment definitions keyed by name, borrowed from a parsed document.
 ///
@@ -46,6 +112,11 @@ enum FragmentsInner<'a> {
     Large {
         entries: Vec<(&'a str, &'a FragmentDefinition<'a>)>,
         index: FxHashMap<&'a str, usize>,
+    },
+    /// A prepared document's lookup, resolved through its precomputed index.
+    Prepared {
+        document: &'a Document<'a>,
+        index: &'a FragmentIndex<'a>,
     },
 }
 
@@ -115,6 +186,17 @@ impl<'a> Fragments<'a> {
         }
     }
 
+    /// Build a fragment lookup from a prepared document's precomputed index.
+    ///
+    /// This is [`Fragments::new`] without the scan or the allocation: the index was computed when
+    /// the document was prepared, and this only pairs it with a borrow of the same document.
+    #[must_use]
+    pub(crate) fn prepared(document: &'a Document<'a>, index: &'a FragmentIndex<'a>) -> Self {
+        Self {
+            inner: FragmentsInner::Prepared { document, index },
+        }
+    }
+
     /// Look up a fragment definition by name.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&'a FragmentDefinition<'a>> {
@@ -126,6 +208,13 @@ impl<'a> Fragments<'a> {
                 .map(|(_, fragment)| *fragment),
             FragmentsInner::Large { entries, index } => {
                 index.get(name).map(|position| entries[*position].1)
+            }
+            FragmentsInner::Prepared { document, index } => {
+                let position = index.position(name)?;
+                match document.definitions.get(position) {
+                    Some(Definition::Fragment(fragment)) => Some(fragment),
+                    _ => None,
+                }
             }
         }
     }
@@ -142,6 +231,7 @@ impl<'a> Fragments<'a> {
         match &self.inner {
             FragmentsInner::Small { len, .. } => usize::from(*len),
             FragmentsInner::Large { entries, .. } => entries.len(),
+            FragmentsInner::Prepared { index, .. } => index.len(),
         }
     }
 
@@ -158,6 +248,9 @@ impl<'a> Fragments<'a> {
                 FragmentsIter::Small(entries[..usize::from(*len)].iter())
             }
             FragmentsInner::Large { entries, .. } => FragmentsIter::Large(entries.iter()),
+            FragmentsInner::Prepared { document, index } => {
+                FragmentsIter::Prepared(index.entries.iter(), document)
+            }
         }
     }
 }
@@ -191,6 +284,8 @@ pub enum FragmentsIter<'b, 'a> {
     Small(std::slice::Iter<'b, Option<(&'a str, &'a FragmentDefinition<'a>)>>),
     /// Iterating the ordered lookup.
     Large(std::slice::Iter<'b, (&'a str, &'a FragmentDefinition<'a>)>),
+    /// Iterating a prepared document's index, resolving positions against the document.
+    Prepared(std::slice::Iter<'a, (&'a str, usize)>, &'a Document<'a>),
 }
 
 impl<'a> Iterator for FragmentsIter<'_, 'a> {
@@ -200,6 +295,12 @@ impl<'a> Iterator for FragmentsIter<'_, 'a> {
         match self {
             Self::Small(iter) => iter.find_map(|entry| entry.map(|(_, fragment)| fragment)),
             Self::Large(iter) => iter.next().map(|(_, fragment)| *fragment),
+            Self::Prepared(entries, document) => loop {
+                let (_, position) = entries.next()?;
+                if let Some(Definition::Fragment(fragment)) = document.definitions.get(*position) {
+                    return Some(fragment);
+                }
+            },
         }
     }
 
@@ -207,6 +308,7 @@ impl<'a> Iterator for FragmentsIter<'_, 'a> {
         match self {
             Self::Small(iter) => (0, iter.size_hint().1),
             Self::Large(iter) => iter.size_hint(),
+            Self::Prepared(entries, _) => (0, entries.size_hint().1),
         }
     }
 }

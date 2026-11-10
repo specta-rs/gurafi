@@ -15,6 +15,12 @@
 //! request outside it still runs the exact analysis. Numbers are printed as `KEY=VALUE` so runs can
 //! be compared without a plotting dependency.
 //!
+//! Two workloads run. `Dashboard` is fragment-, alias- and variable-heavy and its types define no
+//! resolvers. `Records` selects plain properties and one nested object from a type that *does*
+//! define a resolver the query never selects: its prepared numbers show whether a selected-fields
+//! resolver check lets such a list complete synchronously, and its normal numbers are the control
+//! (normal execution always parses and validates, so it moves only with execution changes).
+//!
 //! Allocations are counted by a thin wrapper around the system allocator. The wrapper only
 //! delegates to `System`; there is no custom memory management.
 
@@ -105,6 +111,68 @@ fn post_type() -> ObjectType {
         .field(Field::new("published", TypeRef::boolean().non_null()))
 }
 
+/// A record type that defines a resolver the benchmark query does not select.
+///
+/// Completion has to stay synchronous for the selected properties even though the type has
+/// resolver-backed fields elsewhere: a type-wide "has a resolver" check would send every object
+/// of this list down the asynchronous path for nothing.
+fn record_type() -> ObjectType {
+    ObjectType::new("Record")
+        .field(Field::new("id", TypeRef::id().non_null()))
+        .field(Field::new("name", TypeRef::string().non_null()))
+        .field(Field::new("count", TypeRef::int().non_null()))
+        .field(Field::new("child", TypeRef::named("Record")))
+        .field(
+            Field::new("computed", TypeRef::string().non_null())
+                .resolve(|_| Box::pin(async { Ok(Value::from("computed")) })),
+        )
+}
+
+fn mixed_schema() -> Schema {
+    let child = Arc::new(Object::from_fields([
+        ("id", Value::from("child")),
+        ("name", Value::from("Child")),
+        ("count", Value::Int(1)),
+    ]));
+    let records: Arc<Vec<Arc<Object>>> = Arc::new(
+        (0..50)
+            .map(|index| {
+                Arc::new(Object::from_fields([
+                    ("id", Value::from(format!("record-{index}"))),
+                    ("name", Value::from("Record")),
+                    ("count", Value::Int(index)),
+                    ("child", Value::Object(Arc::clone(&child))),
+                ]))
+            })
+            .collect(),
+    );
+    let root = ObjectType::new("Query").field(
+        Field::new(
+            "records",
+            TypeRef::named("Record").non_null().list().non_null(),
+        )
+        .resolve({
+            let records = Arc::clone(&records);
+            move |_| {
+                let records = Arc::clone(&records);
+                Box::pin(async move {
+                    Ok(Value::List(
+                        records
+                            .iter()
+                            .map(|record| Value::Object(Arc::clone(record)))
+                            .collect(),
+                    ))
+                })
+            }
+        }),
+    );
+
+    let mut builder = Schema::builder();
+    builder.add_type(record_type().into());
+    builder.add_type(root.into());
+    builder.query("Query").build().expect("benchmark schema")
+}
+
 fn query_schema() -> Schema {
     let users: Arc<Vec<Arc<Object>>> = Arc::new(
         (0..5)
@@ -169,6 +237,22 @@ fragment UserFields on User {
   id
   name
   age @include(if: $active)
+}
+"#;
+
+/// The `record_type` query: scalar properties, one nested object, and a resolver field the query
+/// never selects.
+const MIXED_QUERY: &str = r#"
+query Records {
+  records {
+    id
+    name
+    count
+    child {
+      id
+      name
+    }
+  }
 }
 "#;
 
@@ -246,8 +330,27 @@ fn main() {
         black_box(response.data);
     });
 
+    let mixed_schema = mixed_schema();
+    let mixed_request = Request::new(MIXED_QUERY);
+    let mixed_prepared =
+        gql::prepared::PreparedQuery::new(&mixed_schema, "records", MIXED_QUERY, None)
+            .expect("prepared mixed query");
+    let (mixed_normal_time, mixed_normal_allocs) = measure(2_000, || {
+        let response = futures::executor::block_on(gql::execute(
+            &mixed_schema,
+            mixed_request,
+            &execution_options,
+        ));
+        black_box(response.data);
+    });
+    let (mixed_prepared_time, mixed_prepared_allocs) = measure(2_000, || {
+        let response =
+            futures::executor::block_on(mixed_prepared.execute(None, &execution_options));
+        black_box(response.data);
+    });
+
     println!(
-        "BENCH normal_ns={} normal_allocs={} prepared_ns={} prepared_allocs={} prepare_ns={} prepare_allocs={} parse_ns={} parse_allocs={} validate_ns={} validate_allocs={}",
+        "BENCH normal_ns={} normal_allocs={} prepared_ns={} prepared_allocs={} prepare_ns={} prepare_allocs={} parse_ns={} parse_allocs={} validate_ns={} validate_allocs={} mixed_normal_ns={} mixed_normal_allocs={} mixed_prepared_ns={} mixed_prepared_allocs={}",
         normal_time.as_nanos(),
         normal_allocs,
         prepared_time.as_nanos(),
@@ -258,5 +361,9 @@ fn main() {
         parse_allocs,
         validate_time.as_nanos(),
         validate_allocs,
+        mixed_normal_time.as_nanos(),
+        mixed_normal_allocs,
+        mixed_prepared_time.as_nanos(),
+        mixed_prepared_allocs,
     );
 }

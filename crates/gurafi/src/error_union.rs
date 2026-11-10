@@ -20,7 +20,7 @@
 //! list wrappers and abstract types); each error variant's own object type is a member. See the
 //! builder methods and [`crate::ErrorUnionModel`].
 
-use std::marker::PhantomData;
+use std::{marker::PhantomData, sync::Arc};
 
 use gql::{Field, GraphQLError, Name, ObjectType, TypeRef, UnionType, Value};
 
@@ -102,8 +102,10 @@ where
     T::register_output(registry);
 
     let suffix = pascal_case(field);
-    let success_name = format!("{parent}{suffix}Success");
-    let union_name = format!("{parent}{suffix}Result");
+    // Build each runtime name once and share it: the object, the union, its members and the
+    // registry key all refer to the same `Arc<str>`.
+    let success_name: Name = format!("{parent}{suffix}Success").into();
+    let union_name: Name = format!("{parent}{suffix}Result").into();
 
     // A result union's success payload is always present when the resolver returns `Ok`, so
     // `data` is non-null unless `T` itself is `Option<_>`, in which case the value may be null.
@@ -113,7 +115,7 @@ where
         T::output_type().non_null()
     };
 
-    let success = ObjectType::new(success_name.clone())
+    let success = ObjectType::new(Arc::clone(&success_name))
         .description(format!("The successful payload of `{parent}.{field}`."))
         .is_type_of(|value| value.as_external::<ResultSuccess>().is_some())
         .field(Field::new("data", data_type).resolve(|context| {
@@ -130,9 +132,9 @@ where
                     })
             })
         }));
-    registry.register_generated_object::<SuccessMarker<T>>(success_name.clone(), success);
+    registry.register_generated_object::<SuccessMarker<T>>(Arc::clone(&success_name), success);
 
-    let mut members: Vec<Name> = vec![Name::from(success_name.as_str())];
+    let mut members: Vec<Name> = vec![success_name];
     for member in E::members() {
         registry.require_object(member, parent, field, "Error union member");
         if !members.iter().any(|existing| existing.as_ref() == *member) {
@@ -140,11 +142,11 @@ where
         }
     }
 
-    let mut union = UnionType::new(union_name.clone()).description(format!(
+    let mut union = UnionType::new(Arc::clone(&union_name)).description(format!(
         "The result of `{parent}.{field}`: either its success payload or a typed error."
     ));
     union.types = members;
-    registry.register_generated_union::<UnionMarker<T, E>>(union_name.clone(), union);
+    registry.register_generated_union::<UnionMarker<T, E>>(Arc::clone(&union_name), union);
 
     TypeRef::named(union_name).non_null()
 }

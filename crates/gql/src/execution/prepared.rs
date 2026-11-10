@@ -12,6 +12,7 @@ use crate::{
     ast::{self, OperationKind},
     complexity::{self, StaticComplexity},
     error::{GraphQLError, Response},
+    fragments::{FragmentIndex, Fragments},
     schema::Schema,
     types::ObjectType,
 };
@@ -43,6 +44,11 @@ pub(crate) struct PreparedDocument<'a> {
     pub(crate) variables: Option<coerce::CompiledVariables>,
     /// The precompiled field collection plan for the selected operation.
     pub(crate) plan: PreparedPlan<'a>,
+    /// The document's fragment lookup, indexed once at preparation.
+    ///
+    /// Per-request and per-event execution pairs it with a borrow of the document instead of
+    /// scanning the definitions again.
+    pub(crate) fragment_index: FragmentIndex<'a>,
 }
 
 impl<'a> PreparedDocument<'a> {
@@ -82,6 +88,7 @@ pub(crate) async fn execute<'a>(
         operation,
         operation_name,
         &prepared.plan,
+        &prepared.fragment_index,
         root_type,
         prepared.static_complexity.as_ref(),
         prepared.variables.as_ref(),
@@ -108,7 +115,7 @@ pub(crate) async fn execute_event<'a>(
             "Schema is not configured for subscriptions.",
         ));
     };
-    let fragments = crate::fragments::Fragments::new(&prepared.document);
+    let fragments = Fragments::prepared(&prepared.document, &prepared.fragment_index);
     executor::run_operation(
         context,
         fragments,
@@ -199,6 +206,8 @@ pub(crate) fn build<'a>(
         _ => plan::build_empty(),
     };
 
+    let fragment_index = FragmentIndex::new(&document);
+
     let introspection_errors = if uses_introspection(&document) {
         // Normal validation reports every introspection field it finds (bounded by the request's
         // error limit). Storing all of them here lets a prepared request reproduce that exact
@@ -223,6 +232,7 @@ pub(crate) fn build<'a>(
         static_complexity,
         variables,
         plan,
+        fragment_index,
     })
 }
 
@@ -340,6 +350,8 @@ pub(crate) struct PreparedExecution<'a> {
     pub(crate) variables: Option<&'a coerce::CompiledVariables>,
     /// The precompiled field collection plan.
     pub(crate) plan: &'a PreparedPlan<'a>,
+    /// The document's precomputed fragment lookup.
+    pub(crate) fragments: Fragments<'a>,
 }
 
 /// Start a subscription from a prepared document.
@@ -368,6 +380,7 @@ pub(crate) async fn subscribe<'a>(
         static_complexity: prepared.static_complexity.as_ref(),
         variables: prepared.variables.as_ref(),
         plan: &prepared.plan,
+        fragments: Fragments::prepared(&prepared.document, &prepared.fragment_index),
     };
     subscribe_document(
         schema,
