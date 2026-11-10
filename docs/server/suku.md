@@ -42,6 +42,7 @@ let server = Server::new(schema)
 | `introspection` | `true` | Allow `__schema` and `__type`. |
 | `max_depth` | `32` | Maximum selection-set depth (parser hard cap is 96). |
 | `max_complexity` | `100_000` | Maximum estimated operation cost. |
+| `max_breadth` | `1_000` | Maximum distinct response keys in one selection set. |
 | `max_errors` | `100` | Errors reported before execution stops adding them. |
 | `max_body_bytes` | 1 MiB | HTTP body limit; `0` disables it. |
 | `timeout` | `30s` | Wall-clock timeout for one operation or subscription setup. |

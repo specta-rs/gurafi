@@ -6,7 +6,7 @@ use syn::{Data, DeriveInput, Fields, LitStr, Path, Type};
 
 use crate::{
     attr::{deprecation_reason, parse_field_attrs},
-    util::validate_graphql_name,
+    util::{validate_graphql_name, validate_type_name},
 };
 
 struct InputField {
@@ -87,7 +87,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         None => quote!(::core::option::Option::None),
     };
     if let Some(name) = &attrs.name {
-        validate_graphql_name(&graphql_type_name, name.span())?;
+        validate_type_name(&graphql_type_name, name.span())?;
     }
     if attrs.one_of && attrs.name.is_none() {
         return Err(syn::Error::new_spanned(
@@ -267,6 +267,17 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         }
     });
 
+    let field_values = parsed.iter().map(|field| {
+        let ident = &field.ident;
+        let name = &field.graphql_name;
+        quote! {
+            object.insert(
+                ::gurafi::gql::Name::from(#name),
+                ::gurafi::IntoValue::into_value(self.#ident)?,
+            );
+        }
+    });
+
     let field_validations = parsed.iter().filter_map(|field| {
         let path = field.validate.as_ref()?;
         let ident = &field.ident;
@@ -375,6 +386,22 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                         registry.unnamed_input::<Self>();
                     }
                     #(#nested_registrations)*
+                }
+            }
+
+            #[automatically_derived]
+            impl ::gurafi::IntoValue for #ident {
+                fn into_value(
+                    self,
+                ) -> ::core::result::Result<
+                    ::gurafi::gql::Value,
+                    ::gurafi::gql::GraphQLError,
+                > {
+                    let mut object = ::gurafi::gql::Object::new();
+                    #(#field_values)*
+                    ::core::result::Result::Ok(
+                        ::gurafi::gql::Value::Object(::std::sync::Arc::new(object)),
+                    )
                 }
             }
 

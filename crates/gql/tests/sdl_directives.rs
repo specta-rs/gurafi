@@ -680,3 +680,38 @@ fn scalar_and_interface_builder_directives_are_printable() {
         "{printed}"
     );
 }
+
+#[test]
+fn schema_level_directives_round_trip() {
+    let source = r#"
+        directive @link(url: String!) repeatable on SCHEMA
+        schema @link(url: "https://example.com/spec") @link(url: "https://example.com/other") {
+            query: Query
+        }
+        type Query { f: String }
+    "#;
+    let schema = Schema::from_sdl(source).expect("valid schema");
+    assert_eq!(schema.applied_directives().len(), 2);
+    let printed = schema.sdl();
+    assert!(
+        printed.contains("@link(url: \"https://example.com/spec\")"),
+        "{printed}"
+    );
+    let reparsed = Schema::from_sdl(&printed).expect("round-trip schema");
+    assert_eq!(reparsed.applied_directives().len(), 2);
+}
+
+#[test]
+fn code_first_schema_directives_are_validated_and_printed() {
+    use gql::{AppliedDirective, InputValue, TypeRef};
+    let directive = gql::DirectiveDefinition::new("tag")
+        .arg(InputValue::new("name", TypeRef::string().non_null()))
+        .location(gql::ast::DirectiveLocation::Schema);
+    let mut builder = Schema::builder()
+        .directive(directive)
+        .object(ObjectType::new("Query").field(Field::new("f", TypeRef::string())))
+        .query("Query");
+    builder = builder.schema_directive(AppliedDirective::new("tag").argument("name", "root"));
+    let schema = builder.build().expect("valid schema");
+    assert!(schema.sdl().contains("@tag(name: \"root\")"));
+}

@@ -107,6 +107,7 @@ fn describe(value: &Value) -> String {
         Value::Null => "null".to_owned(),
         Value::Boolean(value) => format!("bool:{value}"),
         Value::Int(value) => format!("i32:{value}"),
+        Value::BigInt(value) => format!("i128:{value}"),
         Value::Float(value) => format!("f64:{value:?}"),
         Value::String(value) => format!("str:{value}"),
         Value::Enum(value) => format!("enum:{value}"),

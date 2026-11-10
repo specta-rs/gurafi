@@ -280,6 +280,12 @@ fn check_sdl_directives(document: &ast::Document<'_>) -> Vec<GraphQLError> {
                 check(&extension.directives, Location::Schema, &specs, &mut errors);
             }
             TypeSystemDefinition::Directive(directive) => {
+                check(
+                    &directive.directives,
+                    Location::DirectiveDefinition,
+                    &specs,
+                    &mut errors,
+                );
                 // An argument of a directive definition may itself be annotated, and those
                 // applications use ARGUMENT_DEFINITION (not DIRECTIVE_DEFINITION).
                 for argument in &directive.arguments {
@@ -545,6 +551,8 @@ impl Definitions {
                     .map(|value| Arc::from(value.as_ref()));
                 result.repeatable = directive.repeatable;
                 result.locations = directive.locations.clone();
+                result.directives = parsed_directives(&directive.directives, &mut self.errors);
+                result.deprecation_reason = deprecation_reason(&result.directives);
                 for argument in &directive.arguments {
                     if let Some(argument) = input_value(argument, &mut self.errors) {
                         result = result.arg(argument);
@@ -560,11 +568,10 @@ impl Definitions {
                     )));
                     return;
                 }
-                if let Some(index) = self.seen.get(&name).copied() {
+                if self.seen.contains_key(&name) {
                     self.errors.push(GraphQLError::new(format!(
                         "There can be only one type named \"{name}\"."
                     )));
-                    let _ = index;
                     return;
                 }
                 let description = definition
@@ -587,7 +594,7 @@ impl Definitions {
                             .iter()
                             .map(|name| (*name).into())
                             .collect(),
-                        fields: self.fields("object", &object.fields),
+                        fields: self.fields(&object.fields),
                         directives,
                     },
                     TypeDefinitionKind::Interface(interface) => RawType::Interface {
@@ -598,7 +605,7 @@ impl Definitions {
                             .iter()
                             .map(|name| (*name).into())
                             .collect(),
-                        fields: self.fields("interface", &interface.fields),
+                        fields: self.fields(&interface.fields),
                         directives,
                     },
                     TypeDefinitionKind::Union(union) => RawType::Union {
@@ -642,10 +649,8 @@ impl Definitions {
                 };
                 let directives = parsed_directives(&extension.directives, &mut self.errors);
                 let mut extra_fields = match &extension.kind {
-                    TypeExtensionKind::Object(data) => Some(self.fields("object", &data.fields)),
-                    TypeExtensionKind::Interface(data) => {
-                        Some(self.fields("interface", &data.fields))
-                    }
+                    TypeExtensionKind::Object(data) => Some(self.fields(&data.fields)),
+                    TypeExtensionKind::Interface(data) => Some(self.fields(&data.fields)),
                     _ => None,
                 };
                 match (&mut self.types[index], &extension.kind) {
@@ -766,7 +771,7 @@ impl Definitions {
         }
     }
 
-    fn fields(&mut self, owner: &str, fields: &[ast::FieldDefinition<'_>]) -> Vec<Field> {
+    fn fields(&mut self, fields: &[ast::FieldDefinition<'_>]) -> Vec<Field> {
         fields
             .iter()
             .map(|field| {
@@ -782,7 +787,6 @@ impl Definitions {
                 }
                 result.directives = parsed_directives(&field.directives, &mut self.errors);
                 result.deprecation_reason = deprecation_reason(&result.directives);
-                let _ = owner;
                 result
             })
             .collect()
@@ -816,6 +820,7 @@ impl Definitions {
         if let Some(description) = self.description {
             builder = builder.description(description);
         }
+        builder = builder.schema_directives(self.applied_directives);
         for raw in self.types {
             let ty = match raw {
                 RawType::Scalar {
@@ -1047,14 +1052,7 @@ fn const_value(value: &ast::Value<'_>) -> Result<Value, GraphQLError> {
                 "Variable \"${name}\" is not allowed in a constant value."
             )));
         }
-        ast::Value::Int(value) => {
-            let value = i32::try_from(*value).map_err(|_| {
-                GraphQLError::new(format!(
-                    "Integer \"{value}\" is outside the 32-bit range of the Int scalar; use a custom scalar."
-                ))
-            })?;
-            Value::Int(value)
-        }
+        ast::Value::Int(value) => Value::integer(*value),
         ast::Value::Float(value) => Value::Float(*value),
         ast::Value::String(value) => Value::String(Arc::from(value.as_ref())),
         ast::Value::Boolean(value) => Value::Boolean(*value),
@@ -1136,6 +1134,8 @@ fn validate_directive_values(schema: &Schema, document: &ast::Document<'_>) -> V
                 check_directive_values(schema, &extension.directives, "the schema", &mut errors);
             }
             TypeSystemDefinition::Directive(directive) => {
+                let owner = format!("directive \"@{}\"", directive.name);
+                check_directive_values(schema, &directive.directives, &owner, &mut errors);
                 for argument in &directive.arguments {
                     let owner = format!(
                         "argument \"{}\" of directive \"@{}\"",
@@ -1330,6 +1330,12 @@ fn check_model_directives(schema: &Schema, errors: &mut Vec<GraphQLError>) {
     }
 
     for (_, directive) in schema.directives() {
+        check(
+            schema,
+            &directive.directives,
+            &format!("directive \"@{}\"", directive.name),
+            errors,
+        );
         for argument in directive.args.values() {
             let owner = format!(
                 "argument \"{}\" of directive \"@{}\"",
@@ -1340,18 +1346,16 @@ fn check_model_directives(schema: &Schema, errors: &mut Vec<GraphQLError>) {
     }
 }
 
-/// Validate a list of already-coerced applied directives against a built schema.
+/// Validate a list of applied directives against a built schema.
 ///
-/// SDL parsing uses the AST so it can report source locations; this helper exists for
-/// code-first builders, which have no AST. It checks that the directive exists, that it is
+/// SDL parsing also validates through the AST so it can report source locations; this helper
+/// covers code-first builders, which have no AST, and the built-schema pass that catches duplicate
+/// applications split across SDL extensions. It checks that the directive exists, that it is
 /// allowed at `location`, that every argument is declared and has the right type, that required
 /// arguments are present, and that a non-repeatable directive is not listed twice.
 ///
-/// `SchemaBuilder::build` can call this after all definitions are registered. The caller owns
+/// `SchemaBuilder::build` calls this after all definitions are registered. The caller owns
 /// `errors`, so several elements can be validated into one build error.
-// The SDL path validates through the AST so errors keep their source location; this entry point
-// is for the code-first builder.
-#[allow(dead_code)]
 pub(crate) fn validate_applied_directives(
     schema: &Schema,
     directives: &[AppliedDirective],

@@ -124,6 +124,11 @@ pub(crate) async fn subscribe(
     )
     .map_err(Response::error)?;
 
+    if collected.is_empty() {
+        return Err(Response::error(GraphQLError::new(
+            "A subscription selected no root fields; it must select exactly one.",
+        )));
+    }
     if collected.len() != 1 {
         return Err(Response::error(GraphQLError::new(
             "A subscription must select exactly one root field.",
@@ -131,7 +136,7 @@ pub(crate) async fn subscribe(
     }
     let Some((response_key, nodes, _)) = collected.first() else {
         return Err(Response::error(GraphQLError::new(
-            "A subscription must select exactly one root field.",
+            "A subscription selected no root fields; it must select exactly one.",
         )));
     };
     let Some(node) = nodes.first().copied() else {

@@ -6,7 +6,7 @@ use proc_macro2::TokenStream;
 use quote::{ToTokens, quote};
 use syn::{Data, DeriveInput, Fields, LitStr};
 
-use crate::util::validate_graphql_name;
+use crate::util::validate_type_name;
 
 pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     if !input.generics.params.is_empty() {
@@ -39,7 +39,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         .name
         .clone()
         .unwrap_or_else(|| LitStr::new(&graphql_type_name, ident.span()));
-    validate_graphql_name(&graphql_type_name, type_name_literal.span())?;
+    validate_type_name(&graphql_type_name, type_name_literal.span())?;
 
     let mut seen = HashSet::new();
     let mut variants = Vec::new();

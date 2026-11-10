@@ -83,6 +83,9 @@ fn write_value(output: &mut String, value: &Value) {
         Value::Int(value) => {
             let _ = write!(output, "{value}");
         }
+        Value::BigInt(value) => {
+            let _ = write!(output, "{value}");
+        }
         Value::Float(value) => {
             if value.is_finite() {
                 let printed = value.to_string();
@@ -149,6 +152,7 @@ fn write_string(output: &mut String, value: &str) {
 /// Print the `schema { ... }` definition when the defaults do not describe the schema.
 fn print_schema_definition(schema: &Schema) -> Option<String> {
     let has_description = schema.description().is_some();
+    let has_directives = !schema.applied_directives().is_empty();
     let custom_query = schema.query_name().as_ref() != "Query";
     let custom_mutation = schema
         .mutation_name()
@@ -157,13 +161,20 @@ fn print_schema_definition(schema: &Schema) -> Option<String> {
         .subscription_name()
         .is_some_and(|name| name.as_ref() != "Subscription");
 
-    if !(has_description || custom_query || custom_mutation || custom_subscription) {
+    if !(has_description
+        || has_directives
+        || custom_query
+        || custom_mutation
+        || custom_subscription)
+    {
         return None;
     }
 
     let mut output = String::new();
     push_description(&mut output, schema.description(), "");
-    output.push_str("schema {\n");
+    output.push_str("schema");
+    push_applied_directives(&mut output, schema.applied_directives());
+    output.push_str(" {\n");
     let _ = writeln!(output, "  query: {}", schema.query_name());
     if let Some(name) = schema.mutation_name() {
         let _ = writeln!(output, "  mutation: {name}");
@@ -283,6 +294,7 @@ fn print_directive(directive: &DirectiveDefinition) -> String {
         output.push_str(" repeatable");
     }
     push_deprecation(&mut output, directive.deprecation_reason.as_deref());
+    push_applied_directives(&mut output, &directive.directives);
     let locations: Vec<&str> = directive
         .locations
         .iter()

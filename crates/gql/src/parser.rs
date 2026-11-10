@@ -959,6 +959,7 @@ impl<'a> Parser<'a> {
         let (name, _) = self.expect_name()?;
         let arguments = self.parse_argument_definitions()?;
         let repeatable = self.skip_keyword("repeatable")?;
+        let directives = self.parse_directives(true)?;
         self.expect_keyword("on")?;
         let locations = self.parse_directive_locations()?;
         Ok(DirectiveDefinition {
@@ -966,6 +967,7 @@ impl<'a> Parser<'a> {
             name,
             arguments,
             repeatable,
+            directives,
             locations,
             location: start,
         })

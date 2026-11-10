@@ -640,7 +640,12 @@ impl<'a> Validator<'a> {
             None => "Anonymous subscription".to_owned(),
         };
 
-        if count != 1 {
+        if count == 0 {
+            self.push(
+                format!("{subject} selected no root fields; it must select exactly one."),
+                operation.location,
+            );
+        } else if count != 1 {
             self.push(
                 format!("{subject} must select only one top-level field."),
                 operation.location,

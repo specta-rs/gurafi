@@ -92,9 +92,9 @@ impl GraphQLRequest {
     ///
     /// # Errors
     ///
-    /// Returns a request error when a variable cannot be represented by the GraphQL input value
-    /// model. The only lossy case in JSON is an integer that does not fit in GraphQL's 32-bit
-    /// `Int`.
+    /// Returns a request error when a number cannot be represented by the GraphQL input value
+    /// model. JSON integers outside GraphQL's 32-bit `Int` become [`gql::Value::BigInt`]; the
+    /// input type that consumes them decides whether that is valid.
     pub fn variables_object(&self) -> Result<Option<Object>, RequestError> {
         self.variables
             .as_ref()
@@ -241,24 +241,41 @@ fn variables_to_object(
 
 /// Convert a JSON value into the GraphQL value model.
 ///
-/// GraphQL's built-in `Int` is 32-bit. A JSON integer outside that range cannot be represented
-/// without guessing at a custom scalar, so it is reported as a request error rather than silently
-/// truncated or turned into a lossy float.
+/// GraphQL's built-in `Int` is 32-bit, but a JSON number outside that range is not a request
+/// error: it becomes [`Value::BigInt`] and is range-checked by whichever input type finally
+/// consumes it. That lets built-in `Float` and `ID` accept 64-bit integers and lets a custom
+/// scalar receive them exactly. Integers beyond `i128` and non-integral numbers stay
+/// [`Value::Float`]; `i128` is the widest integer the value model stores.
 ///
 /// # Errors
 ///
-/// Returns an error for integers outside the `Int` range.
+/// Returns an error for a number JSON cannot represent at all (which `serde_json` does not
+/// produce, but another `JsonValue` implementation could).
 pub fn json_to_graphql(value: &JsonValue, path: &str) -> Result<Value, RequestError> {
     Ok(match value {
         JsonValue::Null => Value::Null,
         JsonValue::Bool(value) => Value::Boolean(*value),
         JsonValue::Number(number) => {
             if let Some(number) = number.as_i64() {
-                Value::Int(i32::try_from(number).map_err(|_| int_range_error(path))?)
+                Value::integer(i128::from(number))
             } else if let Some(number) = number.as_u64() {
-                Value::Int(i32::try_from(number).map_err(|_| int_range_error(path))?)
+                Value::integer(i128::from(number))
             } else if let Some(number) = number.as_f64() {
-                Value::Float(number)
+                // JSON numbers are not typed as integral or fractional. GraphQL's reference
+                // implementations accept `1.0` and `1e2` for `Int`, so preserve integral values
+                // and only fall back to `Float` for a real fraction.
+                if number.is_finite() && number.fract() == 0.0 {
+                    // The largest finite `f64` is far wider than `i128`, so a JSON number that
+                    // is integral but unrepresentable as an exact integer stays a float.
+                    let integer = number as i128;
+                    if integer as f64 == number {
+                        Value::integer(integer)
+                    } else {
+                        Value::Float(number)
+                    }
+                } else {
+                    Value::Float(number)
+                }
             } else {
                 return Err(RequestError::new(format!(
                     "Unsupported number at `{path}`."
@@ -279,10 +296,6 @@ pub fn json_to_graphql(value: &JsonValue, path: &str) -> Result<Value, RequestEr
     })
 }
 
-fn int_range_error(_path: &str) -> RequestError {
-    RequestError::new("Integer variable out of Int range; use a custom scalar.")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,12 +309,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_out_of_range_integers() {
+    fn preserves_64_bit_integers_as_bigints() {
         let request: GraphQLRequest =
-            serde_json::from_str(r#"{"query":"{ echo(n: 1) }","variables":{"n":2147483648}}"#)
+            serde_json::from_str(r#"{"query":"{ echo(n: 1) }","variables":{"n":10000000000}}"#)
                 .expect("valid request");
-        let error = request.variables_object().expect_err("out of range");
-        assert!(error.message().contains("Int range"));
+        let object = request
+            .variables_object()
+            .expect("variables")
+            .expect("object");
+        assert_eq!(object.get("n"), Some(&Value::integer(10_000_000_000)));
     }
 
     #[test]

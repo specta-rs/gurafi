@@ -1,5 +1,9 @@
 //! Request JSON parsing and conversion tests.
 
+use futures::executor::block_on;
+use gql::{
+    ExecutionOptions, Field, InputValue, Object, ObjectType, ScalarType, Schema, TypeRef, Value,
+};
 use serde_json::json;
 use suku::{GraphQLRequest, RequestPayload};
 
@@ -94,16 +98,82 @@ fn variables_convert_to_graphql_values() {
 }
 
 #[test]
-fn integers_outside_i32_are_rejected_with_a_clear_error() {
+fn integers_outside_i32_become_bigints() {
     let request: GraphQLRequest = serde_json::from_value(json!({
         "query": "{ echo }",
-        "variables": { "big": 2147483648_i64 }
+        "variables": { "big": 2147483648_i64, "huge": u64::MAX }
     }))
     .expect("valid request");
 
-    let error = request.variables_object().expect_err("should reject");
-    assert!(error.message().contains("Int range"));
-    assert!(error.message().contains("custom scalar"));
+    let variables = request.variables_object().expect("convert").expect("some");
+    assert_eq!(variables.get("big"), Some(&Value::integer(2_147_483_648)));
+    assert_eq!(
+        variables.get("huge"),
+        Some(&Value::integer(i128::from(u64::MAX)))
+    );
+}
+
+#[test]
+fn http_variables_preserve_64_bit_integers_for_every_input_type() {
+    let schema = Schema::builder()
+        .scalar(ScalarType::new("BigInt"))
+        .object(
+            ObjectType::new("Result")
+                .field(Field::new("id", TypeRef::id()))
+                .field(Field::new("float", TypeRef::float()))
+                .field(Field::new("big", TypeRef::named("BigInt"))),
+        )
+        .object(
+            ObjectType::new("Query").field(
+                Field::new("f", TypeRef::named("Result"))
+                    .arg(InputValue::new("id", TypeRef::id()))
+                    .arg(InputValue::new("float", TypeRef::float()))
+                    .arg(InputValue::new("big", TypeRef::named("BigInt")))
+                    .resolve(|context| {
+                        Box::pin(async move {
+                            let mut result = Object::new();
+                            for name in ["id", "float", "big"] {
+                                result.insert(
+                                    name,
+                                    context.args.get(name).cloned().unwrap_or(Value::Null),
+                                );
+                            }
+                            Ok(Value::object(result))
+                        })
+                    }),
+            ),
+        )
+        .query("Query")
+        .build()
+        .expect("valid schema");
+
+    let request: GraphQLRequest = serde_json::from_str(
+        r#"{
+            "query": "query($id: ID, $float: Float, $big: BigInt) { f(id: $id, float: $float, big: $big) { id float big } }",
+            "variables": { "id": 10000000000, "float": 10000000001, "big": 9223372036854775807 }
+        }"#,
+    )
+    .expect("valid request");
+    let variables = request.variables_object().expect("convert");
+    let response = block_on(gql::execute(
+        &schema,
+        request.as_gql(variables.as_ref()),
+        &ExecutionOptions::default(),
+    ));
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let result = response
+        .data
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("f"))
+        .and_then(Value::as_object)
+        .expect("f");
+    assert_eq!(result.get("id"), Some(&Value::from("10000000000")));
+    assert_eq!(result.get("float"), Some(&Value::Float(10_000_000_001.0)));
+    assert_eq!(
+        result.get("big"),
+        Some(&Value::integer(9_223_372_036_854_775_807))
+    );
 }
 
 #[test]
@@ -138,4 +208,25 @@ fn malformed_payloads_report_an_error() {
     let error =
         RequestPayload::from_json_slice(br#"[{"query":"{ hello }"}"#, 10).expect_err("bad json");
     assert!(error.message().contains("Invalid batch request"));
+}
+
+#[test]
+fn integral_json_floats_are_accepted_as_ints() {
+    let request: GraphQLRequest =
+        serde_json::from_str(r#"{"query":"query($n: Int){ f(n: $n) }","variables":{"n":1.0}}"#)
+            .expect("valid request");
+    let object = request
+        .variables_object()
+        .expect("variables")
+        .expect("object");
+    assert_eq!(object.get("n"), Some(&gql::Value::Int(1)));
+
+    let request: GraphQLRequest =
+        serde_json::from_str(r#"{"query":"query($n: Int){ f(n: $n) }","variables":{"n":1e2}}"#)
+            .expect("valid request");
+    let object = request
+        .variables_object()
+        .expect("variables")
+        .expect("object");
+    assert_eq!(object.get("n"), Some(&gql::Value::Int(100)));
 }

@@ -5,10 +5,9 @@
 //! and are coerced by [`coerce_argument_values`]. Both funnel into the same type-directed rules so
 //! custom scalars, enums and nested input objects behave identically everywhere.
 //!
-//! Document literals can carry integers up to `i128` (see [`crate::ast::Value::Int`]), which lets
-//! custom scalars receive values beyond the 32-bit `Int` range. JSON variable conversion happens
-//! in the transport layer (for example `suku`), outside this crate; those transports must stop
-//! narrowing JSON integers to `i32` before a custom scalar can receive a larger variable value.
+//! Document literals can carry integers up to `i128` (see [`crate::ast::Value::Int`]), and a
+//! transport such as `suku` preserves JSON integers outside the 32-bit range as
+//! [`Value::BigInt`], so custom scalars can receive values beyond GraphQL's built-in `Int`.
 
 use std::sync::Arc;
 
@@ -437,6 +436,14 @@ fn coerce_scalar_value(
         },
         "Int" => match value {
             Value::Int(_) => Ok(value.clone()),
+            Value::BigInt(integer) => i32::try_from(**integer).map(Value::Int).map_err(|_| {
+                at_path(
+                    GraphQLError::new(format!(
+                        "Int cannot represent non 32-bit signed integer value {integer}."
+                    )),
+                    path,
+                )
+            }),
             _ => Err(at_path(
                 GraphQLError::new(format!(
                     "Int cannot represent a value of type {}.",
@@ -448,6 +455,7 @@ fn coerce_scalar_value(
         "Float" => match value {
             Value::Float(_) => Ok(value.clone()),
             Value::Int(integer) => Ok(Value::Float(f64::from(*integer))),
+            Value::BigInt(integer) => Ok(Value::Float(**integer as f64)),
             _ => Err(at_path(
                 GraphQLError::new(format!(
                     "Float cannot represent a value of type {}.",
@@ -469,6 +477,7 @@ fn coerce_scalar_value(
         "ID" => match value {
             Value::String(value) | Value::Enum(value) => Ok(Value::String(value.clone())),
             Value::Int(value) => Ok(Value::String(Arc::from(value.to_string()))),
+            Value::BigInt(value) => Ok(Value::String(Arc::from(value.to_string()))),
             _ => Err(at_path(
                 GraphQLError::new(format!(
                     "ID cannot represent a value of type {}.",
@@ -757,14 +766,12 @@ fn coerce_scalar_literal(
 
     // Built-in scalars always register a literal parser, so this fallback belongs to custom
     // scalars: accept any JSON-shaped literal and let the scalar interpret it.
-    let _ = &scalar.name;
-    generic_literal(value, variables, path)
+    generic_literal(value, variables)
 }
 
 fn generic_literal(
     value: &ast::Value<'_>,
     variables: Option<&Object>,
-    path: &mut Vec<String>,
 ) -> Result<Option<Value>, GraphQLError> {
     match value {
         ast::Value::Variable(name) => {
@@ -772,28 +779,21 @@ fn generic_literal(
         }
         ast::Value::Null => Ok(Some(Value::Null)),
         ast::Value::Boolean(value) => Ok(Some(Value::Boolean(*value))),
-        ast::Value::Int(value) => Ok(Some(Value::Int(i32::try_from(*value).map_err(|_| {
-            at_path(
-                GraphQLError::new(format!(
-                    "Int cannot represent non 32-bit signed integer value {value}."
-                )),
-                path,
-            )
-        })?))),
+        ast::Value::Int(value) => Ok(Some(Value::integer(*value))),
         ast::Value::Float(value) => Ok(Some(Value::Float(*value))),
         ast::Value::String(value) => Ok(Some(Value::String(Arc::from(value.as_ref())))),
         ast::Value::Enum(value) => Ok(Some(Value::Enum((*value).into()))),
         ast::Value::List(items) => {
             let mut coerced = Vec::with_capacity(items.len());
             for item in items {
-                coerced.push(generic_literal(item, variables, path)?.unwrap_or(Value::Null));
+                coerced.push(generic_literal(item, variables)?.unwrap_or(Value::Null));
             }
             Ok(Some(Value::List(coerced)))
         }
         ast::Value::Object(fields) => {
             let mut object = Object::with_capacity(fields.len());
             for field in fields {
-                let value = generic_literal(&field.value, variables, path)?.unwrap_or(Value::Null);
+                let value = generic_literal(&field.value, variables)?.unwrap_or(Value::Null);
                 object.insert(field.name, value);
             }
             Ok(Some(Value::Object(Arc::new(object))))
@@ -908,6 +908,7 @@ fn render_value(value: &Value) -> String {
         Value::Null => "null".to_owned(),
         Value::Boolean(value) => value.to_string(),
         Value::Int(value) => value.to_string(),
+        Value::BigInt(value) => value.to_string(),
         Value::Float(value) => value.to_string(),
         Value::String(value) => format!("{value:?}"),
         Value::Enum(value) => value.to_string(),

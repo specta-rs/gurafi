@@ -206,6 +206,7 @@ pub(crate) async fn execute(
         options.root_value.clone(),
         deadline,
         matches!(operation.kind, OperationKind::Query),
+        false,
     )
     .await
 }
@@ -249,12 +250,14 @@ pub(crate) async fn run_operation<'doc>(
     parent: Value,
     deadline: Option<Instant>,
     parallel: bool,
+    skip_root_authorization: bool,
 ) -> Response {
     let executor = Executor {
         context,
         fragments,
         deadline,
         parallel,
+        skip_root_authorization,
     };
     let mut path = Path::new();
     let mut errors = Vec::new();
@@ -304,9 +307,11 @@ pub(crate) async fn run_operation<'doc>(
 /// normal `resolve` resolver runs (or the default property resolver reads the event's field name).
 ///
 /// The document is re-parsed because the returned response stream is `'static` and therefore
-/// cannot borrow the request string. Validation, variable coercion, complexity analysis and the
-/// single-root-field check all happened during setup and are not repeated; only resolution runs
-/// per event, with that event's own deadline.
+/// cannot borrow the request string; owning a parsed document would require the AST to own its
+/// source instead of borrowing it. Validation, variable coercion, complexity analysis and the
+/// single-root-field check all happened during setup and are not repeated, and the root field was
+/// authorized during setup, so event execution only resolves values with that event's own
+/// deadline. Re-parsing per event is a known cost for high-frequency subscriptions.
 pub(crate) async fn execute_subscription_event(
     context: &ExecutionContext,
     query: &str,
@@ -336,6 +341,7 @@ pub(crate) async fn execute_subscription_event(
         event,
         deadline,
         true,
+        true,
     )
     .await
 }
@@ -346,6 +352,12 @@ struct Executor<'doc> {
     deadline: Option<Instant>,
     /// Whether sibling fields at this level may resolve concurrently.
     parallel: bool,
+    /// Whether the operation's single root field was already authorized during setup.
+    ///
+    /// Subscription setup authorizes the root field before subscribing. Every source event then
+    /// re-executes the same root field, so running the authorizer again would repeat the same
+    /// decision once per event. Nested fields are still authorized for every event.
+    skip_root_authorization: bool,
 }
 
 impl<'doc> Executor<'doc> {
@@ -877,7 +889,7 @@ impl<'doc> Executor<'doc> {
                 schema: &self.context.schema,
             };
             let denial = match self.context.authorizer.as_ref() {
-                Some(authorizer) => {
+                Some(authorizer) if !(self.skip_root_authorization && path.len() == 1) => {
                     let authorization = AuthorizationContext {
                         context: self.context,
                         field_name: field.name.as_ref(),
@@ -889,7 +901,7 @@ impl<'doc> Executor<'doc> {
                     };
                     authorizer.authorize_async(&authorization).await.err()
                 }
-                None => None,
+                _ => None,
             };
             if let Some(error) = denial {
                 Err(error)
@@ -2985,7 +2997,12 @@ pub(crate) fn take_extensions(context: &ExecutionContext) -> Option<Object> {
 
 fn is_legal_scalar_value(value: &Value) -> bool {
     match value {
-        Value::Null | Value::Boolean(_) | Value::Int(_) | Value::String(_) | Value::Enum(_) => true,
+        Value::Null
+        | Value::Boolean(_)
+        | Value::Int(_)
+        | Value::BigInt(_)
+        | Value::String(_)
+        | Value::Enum(_) => true,
         // JSON has no representation for NaN or infinity, and the GraphQL `Float` scalar is
         // defined as a finite IEEE-754 double.
         Value::Float(value) => value.is_finite(),

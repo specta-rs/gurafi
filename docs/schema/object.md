@@ -87,6 +87,18 @@ o.field_with_info("path", |g: &Giraffe, _: NoArgs, _: &Ctx, info| {
 Root fields omit the model argument and receive `(Args, &Ctx)`; their
 `*_with_info` variants work the same way.
 
+When a resolver needs to write response `extensions`, use
+`field_with_execution` / `field_result_with_execution` on objects and roots.
+They append `&gql::ResolverContext<'_>`, which exposes the execution context,
+coerced arguments and schema:
+
+```rust
+o.field_with_execution("name", |g: &Giraffe, _: NoArgs, _: &Ctx, execution| {
+    execution.context.set_extension("servedBy", "gurafi");
+    g.name.clone()
+});
+```
+
 ### Field options
 
 `field` and `expose` return `FieldConfig`, which applies its options when the
@@ -145,9 +157,12 @@ o.field("date", |g: &Giraffe, _: NoArgs, _: &Ctx| g.date_string.clone())
 ```
 
 `as_type`/`returns` only accepts scalar-to-scalar, enum-to-enum, or a
-relationship to an abstract type that is truthful about possible types. It
-cannot see the runtime value, so a mismatched override still fails during
-execution; keep the Rust type and the override honest.
+relationship to an abstract type that is truthful about possible types. The
+override is also checked against the resolver's Rust type: it may loosen
+nullability (`String!` to `String`) but it cannot make a nullable position
+non-null (`Option<String>` to `String!`, or `Vec<Option<String>>` to
+`[String!]!`), and its list shape must match (`Vec<String>` cannot become
+`String!`). All of those are build errors, not runtime surprises.
 
 ## Arguments and input objects
 
@@ -223,6 +238,29 @@ q.field("create", |args: CreateArgs, _: &Ctx| args.name)
     });
 ```
 
+The type parameter must be the field's arguments type: `.validate::<OtherArgs>`
+on a field that takes `CreateArgs` is a build error, so the validator can never
+run with fabricated arguments. The hook runs after input-level validation and
+before the resolver, and the arguments are coerced once (subscription events
+reuse the arguments validated when the subscription started). Subscription
+fields run the field validator once per event.
+
+For a nested input field's default, either write the value inline or use a
+derived input type directly; `#[derive(Input)]` implements `IntoValue`, so this
+compiles:
+
+```rust
+#[derive(Input)]
+#[graphql(name = "PageInput")]
+struct Page { #[graphql(default = 20)] first: i32 }
+
+#[derive(Input)]
+struct ListArgs {
+    #[graphql(default = Page { first: 3 })]
+    page: Page,
+}
+```
+
 ### One-of inputs
 
 `#[graphql(one_of)]` registers a `@oneOf` input. Every field must be
@@ -237,6 +275,11 @@ struct SearchBy {
     name: Option<String>,
 }
 ```
+
+A one-of input must be an *input object*, so it cannot be used directly as a
+field's arguments type: wrap it in an args type (`struct Args { by: SearchBy }`)
+or the schema build fails. Derived type names may not shadow the built-in
+scalars (`String`, `Int`, `Float`, `Boolean`, `ID`).
 
 ## Enums, scalars and IDs
 
@@ -285,9 +328,15 @@ schema.object::<User>(|o| {
 ```
 
 At build time the matching interface field (including through interfaces that
-implement other interfaces) supplies the type, arguments, description when the
-object did not set one, and the build checks that the resolver's args type
-matches the interface declaration.
+implement other interfaces) supplies the type, arguments, description,
+deprecation reason and directives when the object did not set one, and the build
+checks that the resolver's args type matches the interface declaration.
+
+Interfaces implemented indirectly are added automatically: if `Resource`
+implements `Node`, an object that implements `Resource` also gets `Node`
+without repeating `o.implements(node)`. Reopening an interface or object with
+another `auth(...)` rule composes with the earlier rule (all must allow); a
+later `auth_error(...)` refines the message instead of replacing the rule.
 
 Unions list their members, and fields can declare an abstract return type:
 
@@ -305,7 +354,9 @@ schema.query(|q| {
 ```
 
 Concrete models travel through the executor as `Value::External`; the object's
-generated `is_type_of` check tells the engine which member it is.
+generated `is_type_of` check tells the engine which member it is. `member::<M>()`
+registers a reference to `M`, so forgetting `schema.object::<M>(...)` is
+reported as the usual "never registered" build error.
 
 ## Roots and subscriptions
 

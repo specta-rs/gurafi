@@ -55,6 +55,7 @@ let server = suku::Server::new(schema)
     .introspection(true)
     .max_depth(15)
     .max_complexity(1_000)
+    .max_breadth(1_000)
     .max_errors(50)
     .max_body_bytes(512 * 1024)
     .timeout(Duration::from_secs(10))
@@ -87,9 +88,10 @@ let response = server
 # }
 ```
 
-`GraphQLRequest` converts JSON variables into `gql::Value`. Integers outside GraphQL's 32-bit
-`Int` range produce a request error ("Integer variable out of Int range; use a custom scalar.")
-instead of being truncated.
+`GraphQLRequest` converts JSON variables into `gql::Value`. An integer outside GraphQL's 32-bit
+`Int` range becomes `gql::Value::BigInt` instead of failing the request, so a custom scalar can
+receive it exactly and `Float`/`ID` can accept it. The built-in `Int` scalar still rejects it
+during GraphQL variable coercion.
 
 ## Transport behaviour
 

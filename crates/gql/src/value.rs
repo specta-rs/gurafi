@@ -4,7 +4,8 @@
 //! arguments, and the *result* value model embedded in a response. Rust's type system does not
 //! need to distinguish them at runtime because both are JSON-shaped, so a single [`Value`] type
 //! serves both sides. Scalars are represented by the closest JSON primitive; [`Value::Enum`]
-//! exists so enum names stay distinguishable without allocating a second string.
+//! exists so enum names stay distinguishable without allocating a second string, and
+//! [`Value::BigInt`] keeps integers that do not fit GraphQL's 32-bit `Int` exact.
 
 use core::fmt;
 use std::{any::Any, borrow::Cow, sync::Arc};
@@ -20,9 +21,18 @@ pub enum Value {
     Null,
     /// A boolean.
     Boolean(bool),
-    /// A 32-bit signed integer. GraphQL's built-in `Int` is 32-bit; larger integers belong to a
-    /// custom scalar (represent them as a string or float).
+    /// A 32-bit signed integer. GraphQL's built-in `Int` is 32-bit.
     Int(i32),
+    /// An integer that does not fit in GraphQL's built-in 32-bit `Int`.
+    ///
+    /// Document literals can carry integers up to `i128` and JSON transports preserve 64-bit
+    /// integers. Keeping them as an exact integer lets a custom scalar receive them unchanged,
+    /// lets `Float` widen them to a double, and lets `ID` render them as a decimal string.
+    /// The built-in `Int` scalar rejects a `BigInt` outside its 32-bit range at coercion time.
+    ///
+    /// The value is boxed so this variant does not widen [`Value`] on every other value and
+    /// stack frame; use [`Value::integer`] to construct one and [`Value::as_i128`] to read it.
+    BigInt(Box<i128>),
     /// A 64-bit IEEE-754 floating point number.
     Float(f64),
     /// A string.
@@ -91,6 +101,12 @@ impl Value {
         Self::Object(Arc::new(object.into()))
     }
 
+    /// Construct an integer value, narrowing to [`Value::Int`] when it fits.
+    #[must_use]
+    pub fn integer(value: i128) -> Self {
+        i32::try_from(value).map_or_else(|_| Self::BigInt(Box::new(value)), Self::Int)
+    }
+
     /// Whether the value is explicit `null`.
     #[must_use]
     pub const fn is_null(&self) -> bool {
@@ -103,7 +119,7 @@ impl Value {
         match self {
             Self::Null => "null",
             Self::Boolean(_) => "boolean",
-            Self::Int(_) | Self::Float(_) => "number",
+            Self::Int(_) | Self::BigInt(_) | Self::Float(_) => "number",
             Self::String(_) => "string",
             Self::Enum(_) => "enum",
             Self::List(_) => "list",
@@ -132,10 +148,20 @@ impl Value {
     }
 
     /// Borrow the value as an `i32`.
+    ///
+    /// A [`Value::BigInt`] also converts when it fits, so callers that accept the built-in `Int`
+    /// range do not have to spell out both variants.
     #[must_use]
     pub const fn as_i32(&self) -> Option<i32> {
         match self {
             Self::Int(value) => Some(*value),
+            Self::BigInt(value) => {
+                if **value >= i32::MIN as i128 && **value <= i32::MAX as i128 {
+                    Some(**value as i32)
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -145,16 +171,37 @@ impl Value {
     pub const fn as_i64(&self) -> Option<i64> {
         match self {
             Self::Int(value) => Some(*value as i64),
+            Self::BigInt(value) => {
+                if **value >= i64::MIN as i128 && **value <= i64::MAX as i128 {
+                    Some(**value as i64)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Borrow the value as an exact `i128`.
+    #[must_use]
+    pub const fn as_i128(&self) -> Option<i128> {
+        match self {
+            Self::Int(value) => Some(*value as i128),
+            Self::BigInt(value) => Some(**value),
             _ => None,
         }
     }
 
     /// Borrow the value as an `f64`.
+    ///
+    /// Integers widen exactly as the `Float` scalar does. Values outside `i128` are not
+    /// representable by this type at all.
     #[must_use]
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Self::Float(value) => Some(*value),
             Self::Int(value) => Some(f64::from(*value)),
+            Self::BigInt(value) => Some(**value as f64),
             _ => None,
         }
     }
@@ -232,6 +279,7 @@ impl fmt::Display for Value {
             Self::Null => f.write_str("null"),
             Self::Boolean(value) => write!(f, "{value}"),
             Self::Int(value) => write!(f, "{value}"),
+            Self::BigInt(value) => write!(f, "{value}"),
             Self::Float(value) => write!(f, "{value}"),
             Self::String(value) => write!(f, "{value}"),
             Self::Enum(value) => f.write_str(value),
@@ -261,6 +309,30 @@ macro_rules! impl_from_int {
 }
 
 impl_from_int!(i8, i16, i32, u8, u16);
+
+impl From<i64> for Value {
+    fn from(value: i64) -> Self {
+        Self::integer(i128::from(value))
+    }
+}
+
+impl From<i128> for Value {
+    fn from(value: i128) -> Self {
+        Self::integer(value)
+    }
+}
+
+impl From<u32> for Value {
+    fn from(value: u32) -> Self {
+        Self::integer(i128::from(value))
+    }
+}
+
+impl From<u64> for Value {
+    fn from(value: u64) -> Self {
+        Self::integer(i128::from(value))
+    }
+}
 
 impl From<f32> for Value {
     fn from(value: f32) -> Self {
@@ -478,6 +550,7 @@ impl serde::Serialize for Value {
             Self::Null => serializer.serialize_none(),
             Self::Boolean(value) => serializer.serialize_bool(*value),
             Self::Int(value) => serializer.serialize_i32(*value),
+            Self::BigInt(value) => serializer.serialize_i128(**value),
             Self::Float(value) => serializer.serialize_f64(*value),
             Self::String(value) | Self::Enum(value) => serializer.serialize_str(value),
             Self::List(values) => {

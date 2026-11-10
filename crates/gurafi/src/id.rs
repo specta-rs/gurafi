@@ -108,6 +108,7 @@ impl FromValue for ID {
         match value {
             Value::String(string) | Value::Enum(string) => Ok(Self(string.to_string())),
             Value::Int(number) => Ok(Self(number.to_string())),
+            Value::BigInt(number) => Ok(Self(number.to_string())),
             other => Err(GraphQLError::new(format!(
                 "`ID` cannot represent a value of kind {}.",
                 other.kind()

@@ -287,18 +287,13 @@ pub(crate) fn model_ref<'a, M: ObjectModel>(
 }
 
 /// Coerce the executor's argument object into a typed args value, adding field context to any
-/// error.
+/// error, and run the input type's own validation once.
 pub(crate) fn coerce_args<A: InputObject>(
     args: &gql::Object,
     parent_type: &str,
     field_name: &str,
 ) -> Result<A, GraphQLError> {
-    let value = A::from_object(args).map_err(|error| {
-        GraphQLError::new(format!(
-            "Invalid arguments for \"{parent_type}.{field_name}\": {}",
-            error.message()
-        ))
-    })?;
+    let value = coerce_args_without_validation::<A>(args, parent_type, field_name)?;
     value.validate().map_err(|error| {
         GraphQLError::new(format!(
             "Invalid arguments for \"{parent_type}.{field_name}\": {}",
@@ -306,4 +301,21 @@ pub(crate) fn coerce_args<A: InputObject>(
         ))
     })?;
     Ok(value)
+}
+
+/// Coerce arguments without running [`InputObject::validate`].
+///
+/// Subscription events use this after the setup path already validated the arguments, so a
+/// per-event validation hook does not turn input-level validation into a per-event side effect.
+pub(crate) fn coerce_args_without_validation<A: InputObject>(
+    args: &gql::Object,
+    parent_type: &str,
+    field_name: &str,
+) -> Result<A, GraphQLError> {
+    A::from_object(args).map_err(|error| {
+        GraphQLError::new(format!(
+            "Invalid arguments for \"{parent_type}.{field_name}\": {}",
+            error.message()
+        ))
+    })
 }

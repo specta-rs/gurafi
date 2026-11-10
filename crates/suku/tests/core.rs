@@ -25,6 +25,13 @@ fn schema() -> Schema {
             Box::pin(async move { Ok(Value::from(message)) })
         });
 
+    let echo_int = Field::new("echoInt", TypeRef::int().non_null())
+        .arg(InputValue::new("value", TypeRef::int().non_null()))
+        .resolve(|context| {
+            let value = context.args.get("value").cloned().unwrap_or(Value::Null);
+            Box::pin(async move { Ok(value) })
+        });
+
     let whoami = Field::new("whoami", TypeRef::string().non_null()).resolve(|context| {
         let name = context
             .context
@@ -36,6 +43,7 @@ fn schema() -> Schema {
     let query = ObjectType::new("Query")
         .field(hello)
         .field(echo)
+        .field(echo_int)
         .field(whoami);
 
     let countdown = Field::new("countdown", TypeRef::int().non_null())
@@ -122,21 +130,26 @@ async fn passes_the_context_to_resolvers() {
 }
 
 #[tokio::test]
-async fn rejects_out_of_range_integer_variables_as_a_request_error() {
-    let request = GraphQLRequest::new("{ echo(message: \"x\") }").variables(
-        serde_json::json!({ "value": 2_147_483_648_i64 })
-            .as_object()
-            .cloned()
-            .expect("object"),
-    );
+async fn out_of_range_integer_variables_fail_graphql_coercion_not_the_request() {
+    let request = GraphQLRequest::new("query EchoInt($value: Int!) { echoInt(value: $value) }")
+        .variables(
+            serde_json::json!({ "value": 2_147_483_648_i64 })
+                .as_object()
+                .cloned()
+                .expect("object"),
+        );
 
+    // The variable survives JSON conversion as a `BigInt`; the built-in `Int` scalar is what
+    // rejects it, at GraphQL coercion time.
     let response = server().execute(&request, Context::empty()).await;
     assert!(response.data.is_none());
     assert!(
         response
             .errors
             .iter()
-            .any(|error| error.message().contains("Int range"))
+            .any(|error| error.message().contains("32-bit")),
+        "{:?}",
+        response.errors
     );
 }
 

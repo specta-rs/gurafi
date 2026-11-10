@@ -38,11 +38,13 @@ use indexmap::IndexMap;
 use crate::{
     error::SchemaError,
     expose::Expose,
-    field::{AuthGuard, FieldCheck, FieldConfig, InterfaceFieldConfig, apply_auth_guard},
+    field::{
+        AuthGuard, FieldCheck, FieldConfig, InterfaceFieldConfig, ValidationSlot, apply_auth_guard,
+    },
     registry::TypeRegistry,
     traits::{
         EnumModel, InputObject, IntoValue, ObjectModel, OutputType, ScalarValue, coerce_args,
-        model_ref,
+        coerce_args_without_validation, model_ref,
     },
 };
 
@@ -186,8 +188,12 @@ pub struct Schema<Ctx: 'static = ()> {
     subscription_name: String,
     description: Option<Arc<str>>,
     checks: Vec<FieldCheck>,
-    object_auth: IndexMap<String, Arc<AuthGuard<Ctx>>>,
-    interface_auth: IndexMap<String, Arc<AuthGuard<Ctx>>>,
+    object_auth: IndexMap<String, Vec<Arc<AuthGuard<Ctx>>>>,
+    /// The latest `auth_error` declared for an object, even when that declaration added no
+    /// predicate. It is applied to the existing rule instead of replacing it.
+    object_auth_error: IndexMap<String, Arc<str>>,
+    interface_auth: IndexMap<String, Vec<Arc<AuthGuard<Ctx>>>>,
+    interface_auth_error: IndexMap<String, Arc<str>>,
     interface_field_auth: IndexMap<String, IndexMap<Name, Arc<AuthGuard<Ctx>>>>,
     pending_inherited: Vec<PendingInherited>,
     marker: PhantomData<fn() -> Ctx>,
@@ -211,7 +217,9 @@ impl<Ctx: 'static> Clone for Schema<Ctx> {
             description: self.description.clone(),
             checks: self.checks.clone(),
             object_auth: self.object_auth.clone(),
+            object_auth_error: self.object_auth_error.clone(),
             interface_auth: self.interface_auth.clone(),
+            interface_auth_error: self.interface_auth_error.clone(),
             interface_field_auth: self.interface_field_auth.clone(),
             pending_inherited: self.pending_inherited.clone(),
             marker: PhantomData,
@@ -261,7 +269,9 @@ impl<Ctx: 'static> Schema<Ctx> {
             description: None,
             checks: Vec::new(),
             object_auth: IndexMap::new(),
+            object_auth_error: IndexMap::new(),
             interface_auth: IndexMap::new(),
+            interface_auth_error: IndexMap::new(),
             interface_field_auth: IndexMap::new(),
             pending_inherited: Vec::new(),
             marker: PhantomData,
@@ -321,17 +331,38 @@ impl<Ctx: 'static> Schema<Ctx> {
             }
         }
         let existing = self.objects.shift_remove(M::NAME);
+        let existing_auth_error = self.object_auth_error.get(M::NAME).cloned();
         let mut builder = ObjectBuilder::<Ctx, M>::new(
             existing,
+            existing_auth_error,
             &mut self.registry,
             &mut self.checks,
             &mut self.pending_inherited,
             M::NAME,
         );
         build(&mut builder);
-        let (object, auth) = builder.finish();
-        if let Some(auth) = auth {
-            self.object_auth.insert(M::NAME.to_owned(), auth);
+        let (object, auth, auth_error) = builder.finish();
+        if let Some(message) = auth_error {
+            self.object_auth_error
+                .insert(M::NAME.to_owned(), Arc::clone(&message));
+        }
+        if auth.is_empty() {
+            // An `auth_error` without a predicate refines the rule already installed by an
+            // earlier declaration; it must not make the object less guarded.
+            if let Some(message) = self.object_auth_error.get(M::NAME).cloned() {
+                if let Some(previous) = self
+                    .object_auth
+                    .get_mut(M::NAME)
+                    .and_then(|guards| guards.last_mut())
+                {
+                    *previous = previous.with_message(Some(message));
+                }
+            }
+        } else {
+            self.object_auth
+                .entry(M::NAME.to_owned())
+                .or_default()
+                .extend(auth);
         }
         self.objects.insert(M::NAME, object);
         self
@@ -380,7 +411,8 @@ impl<Ctx: 'static> Schema<Ctx> {
         if !self.objects.contains_key(M::NAME) {
             self.objects.insert(M::NAME, new_object::<M>());
         }
-        let field = object_field::<M, Ctx, T, A, F>(name, resolver, &mut self.registry);
+        let (field, validation) =
+            object_field::<M, Ctx, T, A, F>(name, resolver, &mut self.registry);
         let field_name = field.name.clone();
         let object = self
             .objects
@@ -395,6 +427,8 @@ impl<Ctx: 'static> Schema<Ctx> {
             field_name,
             T::is_optional(),
             std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
         )
     }
 
@@ -411,16 +445,39 @@ impl<Ctx: 'static> Schema<Ctx> {
         build: impl FnOnce(&mut InterfaceBuilder<'_, Ctx>),
     ) -> InterfaceRef {
         let existing = self.interfaces.shift_remove(name);
+        let existing_auth_error = self.interface_auth_error.get(name).cloned();
         let field_auth = self
             .interface_field_auth
             .shift_remove(name)
             .unwrap_or_default();
-        let mut builder =
-            InterfaceBuilder::<Ctx>::new(existing, field_auth, &mut self.registry, name);
+        let mut builder = InterfaceBuilder::<Ctx>::new(
+            existing,
+            field_auth,
+            existing_auth_error,
+            &mut self.registry,
+            name,
+        );
         build(&mut builder);
-        let (interface, auth, field_auth) = builder.finish();
-        if let Some(auth) = auth {
-            self.interface_auth.insert(name.to_owned(), auth);
+        let (interface, auth, auth_error, field_auth) = builder.finish();
+        if let Some(message) = auth_error {
+            self.interface_auth_error
+                .insert(name.to_owned(), Arc::clone(&message));
+        }
+        if auth.is_empty() {
+            if let Some(message) = self.interface_auth_error.get(name).cloned() {
+                if let Some(previous) = self
+                    .interface_auth
+                    .get_mut(name)
+                    .and_then(|guards| guards.last_mut())
+                {
+                    *previous = previous.with_message(Some(message));
+                }
+            }
+        } else {
+            self.interface_auth
+                .entry(name.to_owned())
+                .or_default()
+                .extend(auth);
         }
         self.interface_field_auth
             .insert(name.to_owned(), field_auth);
@@ -453,9 +510,10 @@ impl<Ctx: 'static> Schema<Ctx> {
         build: impl FnOnce(&mut UnionBuilder<Ctx>),
     ) -> UnionRef {
         let existing = self.unions.shift_remove(name);
-        let mut builder = UnionBuilder::<Ctx>::new(existing, name);
+        let mut builder = UnionBuilder::<Ctx>::new(existing, name, &mut self.registry);
         build(&mut builder);
-        self.unions.insert(name, builder.finish());
+        let union = builder.finish();
+        self.unions.insert(name, union);
         UnionRef { name }
     }
 
@@ -572,6 +630,7 @@ impl<Ctx: 'static> Schema<Ctx> {
             }
         }
 
+        self.expand_transitive_interfaces();
         self.resolve_inherited(&mut errors);
         self.apply_guards();
 
@@ -673,6 +732,41 @@ impl<Ctx: 'static> Schema<Ctx> {
         self.clone().build()
     }
 
+    /// Add interfaces that are only implemented transitively.
+    ///
+    /// The specification requires an object that implements `Resource` to also declare every
+    /// interface `Resource` implements (`Node`). Repeating that by hand is easy to forget, so the
+    /// builder closes the relation before it hands the definitions to `gql`.
+    fn expand_transitive_interfaces(&mut self) {
+        let parents = interface_parents(&self.interfaces);
+        for (name, interface) in &mut self.interfaces {
+            let reachable = reachable_interfaces(&interface.interfaces, &parents);
+            for parent in reachable {
+                if parent != *name
+                    && !interface
+                        .interfaces
+                        .iter()
+                        .any(|existing| existing.as_ref() == parent)
+                {
+                    interface.interfaces.push(Arc::from(parent));
+                }
+            }
+        }
+        let parents = interface_parents(&self.interfaces);
+        for object in self.objects.values_mut() {
+            let reachable = reachable_interfaces(&object.interfaces, &parents);
+            for name in reachable {
+                if !object
+                    .interfaces
+                    .iter()
+                    .any(|existing| existing.as_ref() == name)
+                {
+                    object.interfaces.push(Arc::from(name));
+                }
+            }
+        }
+    }
+
     /// Rewrite fields declared with [`ObjectBuilder::resolve_inherited`] from the matching
     /// interface field.
     fn resolve_inherited(&mut self, errors: &mut Vec<GraphQLError>) {
@@ -692,18 +786,11 @@ impl<Ctx: 'static> Schema<Ctx> {
                     continue;
                 };
                 if let Some(field) = interface.fields.get(&pending.field) {
-                    source = Some((
-                        field.ty.clone(),
-                        field.args.clone(),
-                        field.description.clone(),
-                        interface_name.clone(),
-                    ));
+                    source = Some((field.clone(), interface_name.clone()));
                     break;
                 }
             }
-            let Some((interface_ty, interface_args, interface_description, interface_name)) =
-                source
-            else {
+            let Some((interface_field, interface_name)) = source else {
                 errors.push(GraphQLError::new(format!(
                     "Object `{}` declares field `{}` with `resolve_inherited`, but no implemented \
                      interface has that field. Declare it on an interface with \
@@ -712,6 +799,8 @@ impl<Ctx: 'static> Schema<Ctx> {
                 )));
                 continue;
             };
+            let interface_ty = interface_field.ty.clone();
+            let interface_args = interface_field.args.clone();
             if pending.expected_args.len() != interface_args.len()
                 || pending
                     .expected_args
@@ -744,7 +833,19 @@ impl<Ctx: 'static> Schema<Ctx> {
             field.ty = interface_ty;
             field.args = interface_args;
             if field.description.is_none() {
-                field.description = interface_description;
+                field.description = interface_field.description;
+            }
+            if field.deprecation_reason.is_none() {
+                field.deprecation_reason = interface_field.deprecation_reason;
+            }
+            for directive in interface_field.directives {
+                if !field
+                    .directives
+                    .iter()
+                    .any(|existing| existing.name == directive.name)
+                {
+                    field.directives.push(directive);
+                }
             }
         }
     }
@@ -754,21 +855,25 @@ impl<Ctx: 'static> Schema<Ctx> {
         let parents = interface_parents(&self.interfaces);
         for (object_name, object) in &mut self.objects {
             let reachable = reachable_interfaces(&object.interfaces, &parents);
-            let object_guard = self.object_auth.get(*object_name).cloned();
+            let object_guards = self.object_auth.get(*object_name).cloned();
             for field in object.fields.values_mut() {
-                if let Some(guard) = &object_guard {
-                    apply_auth_guard(field, Arc::clone(guard));
-                }
-                for interface_name in &reachable {
-                    if let Some(guard) = self.interface_auth.get(interface_name.as_str()) {
+                if let Some(guards) = &object_guards {
+                    for guard in guards {
                         apply_auth_guard(field, Arc::clone(guard));
                     }
-                    if let Some(fields) = self
+                }
+                for interface_name in &reachable {
+                    if let Some(guards) = self.interface_auth.get(interface_name.as_str()) {
+                        for guard in guards {
+                            apply_auth_guard(field, Arc::clone(guard));
+                        }
+                    }
+                    if let Some(guard) = self
                         .interface_field_auth
                         .get(interface_name.as_str())
                         .and_then(|fields| fields.get(&field.name))
                     {
-                        apply_auth_guard(field, Arc::clone(fields));
+                        apply_auth_guard(field, Arc::clone(guard));
                     }
                 }
             }
@@ -825,7 +930,7 @@ pub struct ObjectBuilder<'a, Ctx: 'static, M: ObjectModel> {
     object: gql::ObjectType,
     checks: &'a mut Vec<FieldCheck>,
     pending_inherited: &'a mut Vec<PendingInherited>,
-    auth: Option<Arc<AuthGuard<Ctx>>>,
+    auth: Vec<Arc<AuthGuard<Ctx>>>,
     auth_error: Option<Arc<str>>,
     marker: PhantomData<fn() -> (Ctx, M)>,
 }
@@ -833,6 +938,7 @@ pub struct ObjectBuilder<'a, Ctx: 'static, M: ObjectModel> {
 impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
     fn new(
         existing: Option<gql::ObjectType>,
+        existing_auth_error: Option<Arc<str>>,
         registry: &'a mut TypeRegistry,
         checks: &'a mut Vec<FieldCheck>,
         pending_inherited: &'a mut Vec<PendingInherited>,
@@ -850,14 +956,14 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
             object,
             checks,
             pending_inherited,
-            auth: None,
-            auth_error: None,
+            auth: Vec::new(),
+            auth_error: existing_auth_error,
             marker: PhantomData,
         }
     }
 
-    fn finish(self) -> (gql::ObjectType, Option<Arc<AuthGuard<Ctx>>>) {
-        (self.object, self.auth)
+    fn finish(self) -> (gql::ObjectType, Vec<Arc<AuthGuard<Ctx>>>, Option<Arc<str>>) {
+        (self.object, self.auth, self.auth_error)
     }
 
     /// Set the object's description, overriding the one from the derive.
@@ -884,9 +990,12 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
     ///
     /// The check is applied to fields declared in every `object`/`object_fields` call for this
     /// model, including calls in other modules, and to fields added through
-    /// [`ObjectBuilder::resolve_inherited`]. A denial follows normal null propagation.
+    /// [`ObjectBuilder::resolve_inherited`]. Declaring another rule on a reopened object composes
+    /// with the existing one (all rules must allow); it never replaces an earlier rule. A denial
+    /// follows normal null propagation.
     pub fn auth(&mut self, predicate: impl Fn(&Ctx) -> bool + Send + Sync + 'static) -> &mut Self {
-        self.auth = Some(crate::field::sync_guard(predicate, self.auth_error.clone()));
+        self.auth
+            .push(crate::field::sync_guard(predicate, self.auth_error.clone()));
         self
     }
 
@@ -895,7 +1004,7 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
         &mut self,
         predicate: impl for<'r> Fn(&'r Ctx) -> BoxFuture<'r, bool> + Send + Sync + 'static,
     ) -> &mut Self {
-        self.auth = Some(crate::field::async_guard(
+        self.auth.push(crate::field::async_guard(
             predicate,
             self.auth_error.clone(),
         ));
@@ -905,8 +1014,8 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
     /// Set the message returned when the object-level authorization denies access.
     pub fn auth_error(&mut self, message: impl Into<Arc<str>>) -> &mut Self {
         self.auth_error = Some(message.into());
-        if let Some(auth) = self.auth.take() {
-            self.auth = Some(auth.with_message(self.auth_error.clone()));
+        if let Some(auth) = self.auth.last_mut() {
+            *auth = auth.with_message(self.auth_error.clone());
         }
         self
     }
@@ -931,7 +1040,13 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
                 (get)(model).into_value()
             })
         });
-        self.push(field, T::is_optional(), std::any::type_name::<T>())
+        self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<()>(),
+            ValidationSlot::new(),
+        )
     }
 
     /// Add a synchronous field whose resolver cannot fail.
@@ -961,8 +1076,15 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
         A: InputObject,
         F: for<'r> Fn(&'r M, A, &'r Ctx, &'r gql::ResolveInfo<'r>) -> T + Send + Sync + 'static,
     {
-        let field = object_field_with_info::<M, Ctx, T, A, F>(name, resolver, self.registry);
-        self.push(field, T::is_optional(), std::any::type_name::<T>())
+        let (field, validation) =
+            object_field_with_info::<M, Ctx, T, A, F>(name, resolver, self.registry);
+        self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
+        )
     }
 
     /// Add a synchronous field whose resolver returns a `Result`.
@@ -991,8 +1113,15 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
             + Sync
             + 'static,
     {
-        let field = object_field_result_with_info::<M, Ctx, T, A, F>(name, resolver, self.registry);
-        self.push(field, T::is_optional(), std::any::type_name::<T>())
+        let (field, validation) =
+            object_field_result_with_info::<M, Ctx, T, A, F>(name, resolver, self.registry);
+        self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
+        )
     }
 
     /// Add an asynchronous field whose resolver cannot fail.
@@ -1023,8 +1152,15 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
             + Sync
             + 'static,
     {
-        let field = object_field_async_with_info::<M, Ctx, T, A, F>(name, resolver, self.registry);
-        self.push(field, T::is_optional(), std::any::type_name::<T>())
+        let (field, validation) =
+            object_field_async_with_info::<M, Ctx, T, A, F>(name, resolver, self.registry);
+        self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
+        )
     }
 
     /// Add an asynchronous field whose resolver returns a `Result`.
@@ -1066,9 +1202,80 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
             + Sync
             + 'static,
     {
-        let field =
+        let (field, validation) =
             object_field_result_async_with_info::<M, Ctx, T, A, F>(name, resolver, self.registry);
-        self.push(field, T::is_optional(), std::any::type_name::<T>())
+        self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
+        )
+    }
+
+    /// Add a field whose resolver also receives the executor's [`gql::ResolverContext`].
+    ///
+    /// This is the escape hatch for request-level response data: call
+    /// `execution.context.set_extension("key", value)` from the resolver and the value appears
+    /// in the response's `extensions` object. Everything the other resolver variants expose is
+    /// reachable from `execution.info` and `execution.args`.
+    ///
+    /// ```
+    /// # use gurafi::{NoArgs, Object, Schema};
+    /// # struct Ctx;
+    /// # #[derive(Object)] struct Giraffe { name: String }
+    /// # let mut schema = Schema::<Ctx>::new();
+    /// # schema.object::<Giraffe>(|o| {
+    /// o.field_with_execution("name", |g: &Giraffe, _: NoArgs, _: &Ctx, execution| {
+    ///     execution.context.set_extension("servedBy", "gurafi");
+    ///     g.name.clone()
+    /// });
+    /// # });
+    /// ```
+    pub fn field_with_execution<T, A, F>(
+        &mut self,
+        name: &'static str,
+        resolver: F,
+    ) -> FieldConfig<'_, Ctx>
+    where
+        T: OutputType + IntoValue + Send + 'static,
+        A: InputObject,
+        F: for<'r> Fn(&'r M, A, &'r Ctx, &'r gql::ResolverContext<'r>) -> T + Send + Sync + 'static,
+    {
+        let (field, validation) =
+            object_field_with_execution::<M, Ctx, T, A, F>(name, resolver, self.registry);
+        self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
+        )
+    }
+
+    /// Like [`ObjectBuilder::field_with_execution`], but the resolver returns a `Result`.
+    pub fn field_result_with_execution<T, A, F>(
+        &mut self,
+        name: &'static str,
+        resolver: F,
+    ) -> FieldConfig<'_, Ctx>
+    where
+        T: OutputType + IntoValue + Send + 'static,
+        A: InputObject,
+        F: for<'r> Fn(&'r M, A, &'r Ctx, &'r gql::ResolverContext<'r>) -> Result<T, GraphQLError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let (field, validation) =
+            object_field_result_with_execution::<M, Ctx, T, A, F>(name, resolver, self.registry);
+        self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
+        )
     }
 
     /// Add a field whose type and arguments come from an implemented interface.
@@ -1130,6 +1337,8 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
         field: gql::Field,
         rust_nullable: bool,
         rust_type_name: &'static str,
+        args_type: TypeId,
+        validation: ValidationSlot<Ctx>,
     ) -> FieldConfig<'_, Ctx> {
         let name = field.name.clone();
         self.object.insert_field(field);
@@ -1141,6 +1350,8 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
             name,
             rust_nullable,
             rust_type_name,
+            args_type,
+            validation,
         )
     }
 }
@@ -1158,7 +1369,7 @@ pub struct InterfaceBuilder<'a, Ctx: 'static> {
     registry: &'a mut TypeRegistry,
     interface: gql::InterfaceType,
     field_auth: IndexMap<Name, Arc<AuthGuard<Ctx>>>,
-    auth: Option<Arc<AuthGuard<Ctx>>>,
+    auth: Vec<Arc<AuthGuard<Ctx>>>,
     auth_error: Option<Arc<str>>,
     marker: PhantomData<fn() -> Ctx>,
 }
@@ -1167,6 +1378,7 @@ impl<'a, Ctx: 'static> InterfaceBuilder<'a, Ctx> {
     fn new(
         existing: Option<gql::InterfaceType>,
         field_auth: IndexMap<Name, Arc<AuthGuard<Ctx>>>,
+        existing_auth_error: Option<Arc<str>>,
         registry: &'a mut TypeRegistry,
         name: &'static str,
     ) -> Self {
@@ -1174,8 +1386,8 @@ impl<'a, Ctx: 'static> InterfaceBuilder<'a, Ctx> {
             registry,
             interface: existing.unwrap_or_else(|| gql::InterfaceType::new(name)),
             field_auth,
-            auth: None,
-            auth_error: None,
+            auth: Vec::new(),
+            auth_error: existing_auth_error,
             marker: PhantomData,
         }
     }
@@ -1184,10 +1396,11 @@ impl<'a, Ctx: 'static> InterfaceBuilder<'a, Ctx> {
         self,
     ) -> (
         gql::InterfaceType,
-        Option<Arc<AuthGuard<Ctx>>>,
+        Vec<Arc<AuthGuard<Ctx>>>,
+        Option<Arc<str>>,
         IndexMap<Name, Arc<AuthGuard<Ctx>>>,
     ) {
-        (self.interface, self.auth, self.field_auth)
+        (self.interface, self.auth, self.auth_error, self.field_auth)
     }
 
     /// Set the interface's description.
@@ -1213,9 +1426,11 @@ impl<'a, Ctx: 'static> InterfaceBuilder<'a, Ctx> {
     /// Require every field of every implementing object to satisfy `predicate`.
     ///
     /// The rule is inherited by objects that implement this interface, directly or through
-    /// another interface. It composes with object-level and field-level checks.
+    /// another interface. It composes with object-level and field-level checks. A rule declared
+    /// when the interface is reopened adds to the existing rules rather than replacing them.
     pub fn auth(&mut self, predicate: impl Fn(&Ctx) -> bool + Send + Sync + 'static) -> &mut Self {
-        self.auth = Some(crate::field::sync_guard(predicate, self.auth_error.clone()));
+        self.auth
+            .push(crate::field::sync_guard(predicate, self.auth_error.clone()));
         self
     }
 
@@ -1224,7 +1439,7 @@ impl<'a, Ctx: 'static> InterfaceBuilder<'a, Ctx> {
         &mut self,
         predicate: impl for<'r> Fn(&'r Ctx) -> BoxFuture<'r, bool> + Send + Sync + 'static,
     ) -> &mut Self {
-        self.auth = Some(crate::field::async_guard(
+        self.auth.push(crate::field::async_guard(
             predicate,
             self.auth_error.clone(),
         ));
@@ -1234,8 +1449,8 @@ impl<'a, Ctx: 'static> InterfaceBuilder<'a, Ctx> {
     /// Set the message returned when the interface-level authorization denies access.
     pub fn auth_error(&mut self, message: impl Into<Arc<str>>) -> &mut Self {
         self.auth_error = Some(message.into());
-        if let Some(auth) = self.auth.take() {
-            self.auth = Some(auth.with_message(self.auth_error.clone()));
+        if let Some(auth) = self.auth.last_mut() {
+            *auth = auth.with_message(self.auth_error.clone());
         }
         self
     }
@@ -1303,15 +1518,21 @@ impl<Ctx> std::fmt::Debug for InterfaceBuilder<'_, Ctx> {
 }
 
 /// Builder for one union type, received by [`Schema::union`].
-pub struct UnionBuilder<Ctx: 'static> {
+pub struct UnionBuilder<'a, Ctx: 'static> {
     union: gql::UnionType,
+    registry: &'a mut TypeRegistry,
     marker: PhantomData<fn() -> Ctx>,
 }
 
-impl<Ctx: 'static> UnionBuilder<Ctx> {
-    fn new(existing: Option<gql::UnionType>, name: &'static str) -> Self {
+impl<'a, Ctx: 'static> UnionBuilder<'a, Ctx> {
+    fn new(
+        existing: Option<gql::UnionType>,
+        name: &'static str,
+        registry: &'a mut TypeRegistry,
+    ) -> Self {
         Self {
             union: existing.unwrap_or_else(|| gql::UnionType::new(name)),
+            registry,
             marker: PhantomData,
         }
     }
@@ -1327,7 +1548,11 @@ impl<Ctx: 'static> UnionBuilder<Ctx> {
     }
 
     /// Add an object type as a union member.
+    ///
+    /// The model is registered as referenced, so a missing `schema.object::<M>(...)` gives the
+    /// usual "was never registered" build error instead of `gql` failing to find the name.
     pub fn member<M: ObjectModel>(&mut self) -> &mut Self {
+        self.registry.reference_object(M::NAME);
         let name: Name = Arc::from(M::NAME);
         if !self.union.types.iter().any(|existing| **existing == *name) {
             self.union.types.push(name);
@@ -1350,7 +1575,7 @@ impl<Ctx: 'static> UnionBuilder<Ctx> {
     }
 }
 
-impl<Ctx> std::fmt::Debug for UnionBuilder<Ctx> {
+impl<Ctx> std::fmt::Debug for UnionBuilder<'_, Ctx> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UnionBuilder")
             .field("union", &self.union)
@@ -1404,8 +1629,15 @@ impl<'a, Ctx: 'static> RootBuilder<'a, Ctx> {
         A: InputObject,
         F: for<'r> Fn(A, &'r Ctx, &'r gql::ResolveInfo<'r>) -> T + Send + Sync + 'static,
     {
-        let field = root_field_with_info::<Ctx, T, A, F>(name, resolver, self.registry);
-        self.push(field, T::is_optional(), std::any::type_name::<T>())
+        let (field, validation) =
+            root_field_with_info::<Ctx, T, A, F>(name, resolver, self.registry);
+        self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
+        )
     }
 
     /// Add a synchronous root field whose resolver returns a `Result`.
@@ -1434,8 +1666,15 @@ impl<'a, Ctx: 'static> RootBuilder<'a, Ctx> {
             + Sync
             + 'static,
     {
-        let field = root_field_result_with_info::<Ctx, T, A, F>(name, resolver, self.registry);
-        self.push(field, T::is_optional(), std::any::type_name::<T>())
+        let (field, validation) =
+            root_field_result_with_info::<Ctx, T, A, F>(name, resolver, self.registry);
+        self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
+        )
     }
 
     /// Add an asynchronous root field whose resolver cannot fail.
@@ -1464,8 +1703,15 @@ impl<'a, Ctx: 'static> RootBuilder<'a, Ctx> {
             + Sync
             + 'static,
     {
-        let field = root_field_async_with_info::<Ctx, T, A, F>(name, resolver, self.registry);
-        self.push(field, T::is_optional(), std::any::type_name::<T>())
+        let (field, validation) =
+            root_field_async_with_info::<Ctx, T, A, F>(name, resolver, self.registry);
+        self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
+        )
     }
 
     /// Add an asynchronous root field whose resolver returns a `Result`.
@@ -1503,9 +1749,64 @@ impl<'a, Ctx: 'static> RootBuilder<'a, Ctx> {
             + Sync
             + 'static,
     {
-        let field =
+        let (field, validation) =
             root_field_result_async_with_info::<Ctx, T, A, F>(name, resolver, self.registry);
-        self.push(field, T::is_optional(), std::any::type_name::<T>())
+        self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
+        )
+    }
+
+    /// Add a root field whose resolver also receives the executor's [`gql::ResolverContext`].
+    ///
+    /// Use it to set response extensions with `execution.context.set_extension("key", value)`.
+    pub fn field_with_execution<T, A, F>(
+        &mut self,
+        name: &'static str,
+        resolver: F,
+    ) -> FieldConfig<'_, Ctx>
+    where
+        T: OutputType + IntoValue + Send + 'static,
+        A: InputObject,
+        F: for<'r> Fn(A, &'r Ctx, &'r gql::ResolverContext<'r>) -> T + Send + Sync + 'static,
+    {
+        let (field, validation) =
+            root_field_with_execution::<Ctx, T, A, F>(name, resolver, self.registry);
+        self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
+        )
+    }
+
+    /// Like [`RootBuilder::field_with_execution`], but the resolver returns a `Result`.
+    pub fn field_result_with_execution<T, A, F>(
+        &mut self,
+        name: &'static str,
+        resolver: F,
+    ) -> FieldConfig<'_, Ctx>
+    where
+        T: OutputType + IntoValue + Send + 'static,
+        A: InputObject,
+        F: for<'r> Fn(A, &'r Ctx, &'r gql::ResolverContext<'r>) -> Result<T, GraphQLError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let (field, validation) =
+            root_field_result_with_execution::<Ctx, T, A, F>(name, resolver, self.registry);
+        self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
+        )
     }
 
     fn push(
@@ -1513,6 +1814,8 @@ impl<'a, Ctx: 'static> RootBuilder<'a, Ctx> {
         field: gql::Field,
         rust_nullable: bool,
         rust_type_name: &'static str,
+        args_type: TypeId,
+        validation: ValidationSlot<Ctx>,
     ) -> FieldConfig<'_, Ctx> {
         let name = field.name.clone();
         self.fields.push(field);
@@ -1524,6 +1827,8 @@ impl<'a, Ctx: 'static> RootBuilder<'a, Ctx> {
             name,
             rust_nullable,
             rust_type_name,
+            args_type,
+            validation,
         )
     }
 }
@@ -1598,8 +1903,15 @@ impl<'a, Ctx: 'static> SubscriptionBuilder<'a, Ctx> {
         S: Stream<Item = Result<T, GraphQLError>> + Send + 'static,
         F: for<'r> Fn(A, &'r Ctx, &'r gql::ResolveInfo<'r>) -> S + Send + Sync + 'static,
     {
-        let field = subscription_field::<Ctx, A, T, F, S>(name, subscribe, self.registry);
-        self.push(field, T::is_optional(), std::any::type_name::<T>())
+        let (field, validation) =
+            subscription_field::<Ctx, A, T, F, S>(name, subscribe, self.registry);
+        self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
+        )
     }
 
     /// Add a subscription whose events are mapped to the field value by a resolver.
@@ -1608,12 +1920,34 @@ impl<'a, Ctx: 'static> SubscriptionBuilder<'a, Ctx> {
     /// event into the field's value `T`. Use it when the event carries more than the field's
     /// own value (an envelope with metadata, or several correlated updates).
     ///
-    /// ```ignore
-    /// s.field_map(
-    ///     "giraffeBorn",
-    ///     |_: NoArgs, _: &Ctx| events(),
-    ///     |event: &BornEvent, _: NoArgs, _: &Ctx| Ok(event.giraffe.clone()),
-    /// );
+    /// ```
+    /// use futures::stream;
+    /// use gurafi::{NoArgs, Schema};
+    ///
+    /// struct Ctx;
+    ///
+    /// #[derive(Clone)]
+    /// struct BornEvent {
+    ///     name: String,
+    /// }
+    ///
+    /// let mut schema = Schema::<Ctx>::new();
+    /// schema.query(|q| {
+    ///     q.field("ok", |_: NoArgs, _: &Ctx| true);
+    /// });
+    /// schema.subscription(|s| {
+    ///     s.field_map::<NoArgs, BornEvent, String, _, _, _>(
+    ///         "giraffeBorn",
+    ///         |_: NoArgs, _: &Ctx| {
+    ///             stream::iter(vec![Ok(BornEvent {
+    ///                 name: "Melman".into(),
+    ///             })])
+    ///         },
+    ///         |event: &BornEvent, _: NoArgs, _: &Ctx| Ok(event.name.clone()),
+    ///     );
+    /// });
+    /// let schema = schema.build().expect("schema builds");
+    /// # let _ = schema;
     /// ```
     pub fn field_map<A, E, T, F, S, R>(
         &mut self,
@@ -1631,11 +1965,14 @@ impl<'a, Ctx: 'static> SubscriptionBuilder<'a, Ctx> {
     {
         T::register_output(self.registry);
         A::register_args(self.registry);
+        let validation = ValidationSlot::new();
+        let resolve_validation = validation.clone();
         let subscribe = Arc::new(subscribe);
         let resolve = Arc::new(resolve);
         let field = add_arguments::<A>(gql::Field::new(name, T::output_type()), self.registry)
             .resolve(move |context| {
                 let resolve = Arc::clone(&resolve);
+                let validation = resolve_validation.clone();
                 Box::pin(async move {
                     let event = context.parent.as_external::<E>().ok_or_else(|| {
                         GraphQLError::new(format!(
@@ -1643,12 +1980,16 @@ impl<'a, Ctx: 'static> SubscriptionBuilder<'a, Ctx> {
                             context.info.field_name
                         ))
                     })?;
-                    let args = coerce_args::<A>(
+                    // The subscription already validated the input once. Per-event resolution
+                    // converts the same coerced arguments without re-running input-level
+                    // validation, then runs the field validator exactly once per event.
+                    let args = coerce_args_without_validation::<A>(
                         context.args,
                         context.info.parent_type,
                         context.info.field_name,
                     )?;
                     let ctx = context.context.require_data::<Ctx>()?;
+                    validation.run(&args, ctx)?;
                     match resolve(event, args, ctx) {
                         Ok(value) => value.into_value(),
                         Err(error) => Err(error),
@@ -1672,7 +2013,13 @@ impl<'a, Ctx: 'static> SubscriptionBuilder<'a, Ctx> {
                     Ok(Box::pin(mapped) as gql::SubscriptionStream)
                 })
             });
-        self.push(field, T::is_optional(), std::any::type_name::<T>())
+        self.push(
+            field,
+            T::is_optional(),
+            std::any::type_name::<T>(),
+            TypeId::of::<A>(),
+            validation,
+        )
     }
 
     fn push(
@@ -1680,6 +2027,8 @@ impl<'a, Ctx: 'static> SubscriptionBuilder<'a, Ctx> {
         field: gql::Field,
         rust_nullable: bool,
         rust_type_name: &'static str,
+        args_type: TypeId,
+        validation: ValidationSlot<Ctx>,
     ) -> FieldConfig<'_, Ctx> {
         let name = field.name.clone();
         self.fields.push(field);
@@ -1691,6 +2040,8 @@ impl<'a, Ctx: 'static> SubscriptionBuilder<'a, Ctx> {
             name,
             rust_nullable,
             rust_type_name,
+            args_type,
+            validation,
         )
     }
 }
@@ -1704,6 +2055,15 @@ impl<Ctx> std::fmt::Debug for SubscriptionBuilder<'_, Ctx> {
 }
 
 fn add_arguments<A: InputObject>(mut field: gql::Field, registry: &mut TypeRegistry) -> gql::Field {
+    if A::one_of() {
+        registry.push_error(GraphQLError::new(format!(
+            "`{}` is a `@oneOf` input and cannot be used directly as field `{}`'s arguments. Wrap \
+             it in an arguments type so it stays one argument: `struct Args {{ by: {} }}`.",
+            std::any::type_name::<A>(),
+            field.name,
+            std::any::type_name::<A>(),
+        )));
+    }
     match A::fields() {
         Ok(arguments) => {
             for argument in arguments {
@@ -1723,7 +2083,7 @@ fn object_field<M, Ctx, T, A, F>(
     name: &'static str,
     resolver: F,
     registry: &mut TypeRegistry,
-) -> gql::Field
+) -> (gql::Field, ValidationSlot<Ctx>)
 where
     M: ObjectModel,
     Ctx: 'static,
@@ -1742,7 +2102,7 @@ fn object_field_with_info<M, Ctx, T, A, F>(
     name: &'static str,
     resolver: F,
     registry: &mut TypeRegistry,
-) -> gql::Field
+) -> (gql::Field, ValidationSlot<Ctx>)
 where
     M: ObjectModel,
     Ctx: 'static,
@@ -1753,30 +2113,37 @@ where
     T::register_output(registry);
     A::register_args(registry);
     let resolver = Arc::new(resolver);
-    add_arguments::<A>(gql::Field::new(name, T::output_type()), registry).resolve(move |context| {
-        let resolver = Arc::clone(&resolver);
-        Box::pin(async move {
-            let model = model_ref::<M>(
-                context.parent,
-                context.info.parent_type,
-                context.info.field_name,
-            )?;
-            let args = coerce_args::<A>(
-                context.args,
-                context.info.parent_type,
-                context.info.field_name,
-            )?;
-            let ctx = context.context.require_data::<Ctx>()?;
-            (resolver)(model, args, ctx, context.info).into_value()
-        })
-    })
+    let validation = ValidationSlot::new();
+    let hook = validation.clone();
+    let field = add_arguments::<A>(gql::Field::new(name, T::output_type()), registry).resolve(
+        move |context| {
+            let resolver = Arc::clone(&resolver);
+            let hook = hook.clone();
+            Box::pin(async move {
+                let model = model_ref::<M>(
+                    context.parent,
+                    context.info.parent_type,
+                    context.info.field_name,
+                )?;
+                let args = coerce_args::<A>(
+                    context.args,
+                    context.info.parent_type,
+                    context.info.field_name,
+                )?;
+                let ctx = context.context.require_data::<Ctx>()?;
+                hook.run(&args, ctx)?;
+                (resolver)(model, args, ctx, context.info).into_value()
+            })
+        },
+    );
+    (field, validation)
 }
 
 fn object_field_result_with_info<M, Ctx, T, A, F>(
     name: &'static str,
     resolver: F,
     registry: &mut TypeRegistry,
-) -> gql::Field
+) -> (gql::Field, ValidationSlot<Ctx>)
 where
     M: ObjectModel,
     Ctx: 'static,
@@ -1790,33 +2157,40 @@ where
     T::register_output(registry);
     A::register_args(registry);
     let resolver = Arc::new(resolver);
-    add_arguments::<A>(gql::Field::new(name, T::output_type()), registry).resolve(move |context| {
-        let resolver = Arc::clone(&resolver);
-        Box::pin(async move {
-            let model = model_ref::<M>(
-                context.parent,
-                context.info.parent_type,
-                context.info.field_name,
-            )?;
-            let args = coerce_args::<A>(
-                context.args,
-                context.info.parent_type,
-                context.info.field_name,
-            )?;
-            let ctx = context.context.require_data::<Ctx>()?;
-            match (resolver)(model, args, ctx, context.info) {
-                Ok(value) => value.into_value(),
-                Err(error) => Err(error),
-            }
-        })
-    })
+    let validation = ValidationSlot::new();
+    let hook = validation.clone();
+    let field = add_arguments::<A>(gql::Field::new(name, T::output_type()), registry).resolve(
+        move |context| {
+            let resolver = Arc::clone(&resolver);
+            let hook = hook.clone();
+            Box::pin(async move {
+                let model = model_ref::<M>(
+                    context.parent,
+                    context.info.parent_type,
+                    context.info.field_name,
+                )?;
+                let args = coerce_args::<A>(
+                    context.args,
+                    context.info.parent_type,
+                    context.info.field_name,
+                )?;
+                let ctx = context.context.require_data::<Ctx>()?;
+                hook.run(&args, ctx)?;
+                match (resolver)(model, args, ctx, context.info) {
+                    Ok(value) => value.into_value(),
+                    Err(error) => Err(error),
+                }
+            })
+        },
+    );
+    (field, validation)
 }
 
 fn object_field_async_with_info<M, Ctx, T, A, F>(
     name: &'static str,
     resolver: F,
     registry: &mut TypeRegistry,
-) -> gql::Field
+) -> (gql::Field, ValidationSlot<Ctx>)
 where
     M: ObjectModel,
     Ctx: 'static,
@@ -1830,32 +2204,39 @@ where
     T::register_output(registry);
     A::register_args(registry);
     let resolver = Arc::new(resolver);
-    add_arguments::<A>(gql::Field::new(name, T::output_type()), registry).resolve(move |context| {
-        let resolver = Arc::clone(&resolver);
-        Box::pin(async move {
-            let model = model_ref::<M>(
-                context.parent,
-                context.info.parent_type,
-                context.info.field_name,
-            )?;
-            let args = coerce_args::<A>(
-                context.args,
-                context.info.parent_type,
-                context.info.field_name,
-            )?;
-            let ctx = context.context.require_data::<Ctx>()?;
-            (resolver)(model, args, ctx, context.info)
-                .await
-                .into_value()
-        })
-    })
+    let validation = ValidationSlot::new();
+    let hook = validation.clone();
+    let field = add_arguments::<A>(gql::Field::new(name, T::output_type()), registry).resolve(
+        move |context| {
+            let resolver = Arc::clone(&resolver);
+            let hook = hook.clone();
+            Box::pin(async move {
+                let model = model_ref::<M>(
+                    context.parent,
+                    context.info.parent_type,
+                    context.info.field_name,
+                )?;
+                let args = coerce_args::<A>(
+                    context.args,
+                    context.info.parent_type,
+                    context.info.field_name,
+                )?;
+                let ctx = context.context.require_data::<Ctx>()?;
+                hook.run(&args, ctx)?;
+                (resolver)(model, args, ctx, context.info)
+                    .await
+                    .into_value()
+            })
+        },
+    );
+    (field, validation)
 }
 
 fn object_field_result_async_with_info<M, Ctx, T, A, F>(
     name: &'static str,
     resolver: F,
     registry: &mut TypeRegistry,
-) -> gql::Field
+) -> (gql::Field, ValidationSlot<Ctx>)
 where
     M: ObjectModel,
     Ctx: 'static,
@@ -1874,33 +2255,128 @@ where
     T::register_output(registry);
     A::register_args(registry);
     let resolver = Arc::new(resolver);
-    add_arguments::<A>(gql::Field::new(name, T::output_type()), registry).resolve(move |context| {
-        let resolver = Arc::clone(&resolver);
-        Box::pin(async move {
-            let model = model_ref::<M>(
-                context.parent,
-                context.info.parent_type,
-                context.info.field_name,
-            )?;
-            let args = coerce_args::<A>(
-                context.args,
-                context.info.parent_type,
-                context.info.field_name,
-            )?;
-            let ctx = context.context.require_data::<Ctx>()?;
-            match (resolver)(model, args, ctx, context.info).await {
-                Ok(value) => value.into_value(),
-                Err(error) => Err(error),
-            }
-        })
-    })
+    let validation = ValidationSlot::new();
+    let hook = validation.clone();
+    let field = add_arguments::<A>(gql::Field::new(name, T::output_type()), registry).resolve(
+        move |context| {
+            let resolver = Arc::clone(&resolver);
+            let hook = hook.clone();
+            Box::pin(async move {
+                let model = model_ref::<M>(
+                    context.parent,
+                    context.info.parent_type,
+                    context.info.field_name,
+                )?;
+                let args = coerce_args::<A>(
+                    context.args,
+                    context.info.parent_type,
+                    context.info.field_name,
+                )?;
+                let ctx = context.context.require_data::<Ctx>()?;
+                hook.run(&args, ctx)?;
+                match (resolver)(model, args, ctx, context.info).await {
+                    Ok(value) => value.into_value(),
+                    Err(error) => Err(error),
+                }
+            })
+        },
+    );
+    (field, validation)
+}
+
+fn object_field_with_execution<M, Ctx, T, A, F>(
+    name: &'static str,
+    resolver: F,
+    registry: &mut TypeRegistry,
+) -> (gql::Field, ValidationSlot<Ctx>)
+where
+    M: ObjectModel,
+    Ctx: 'static,
+    T: OutputType + IntoValue + Send + 'static,
+    A: InputObject,
+    F: for<'r> Fn(&'r M, A, &'r Ctx, &'r gql::ResolverContext<'r>) -> T + Send + Sync + 'static,
+{
+    T::register_output(registry);
+    A::register_args(registry);
+    let resolver = Arc::new(resolver);
+    let validation = ValidationSlot::new();
+    let hook = validation.clone();
+    let field = add_arguments::<A>(gql::Field::new(name, T::output_type()), registry).resolve(
+        move |context| {
+            let resolver = Arc::clone(&resolver);
+            let hook = hook.clone();
+            Box::pin(async move {
+                let model = model_ref::<M>(
+                    context.parent,
+                    context.info.parent_type,
+                    context.info.field_name,
+                )?;
+                let args = coerce_args::<A>(
+                    context.args,
+                    context.info.parent_type,
+                    context.info.field_name,
+                )?;
+                let ctx = context.context.require_data::<Ctx>()?;
+                hook.run(&args, ctx)?;
+                (resolver)(model, args, ctx, &context).into_value()
+            })
+        },
+    );
+    (field, validation)
+}
+
+fn object_field_result_with_execution<M, Ctx, T, A, F>(
+    name: &'static str,
+    resolver: F,
+    registry: &mut TypeRegistry,
+) -> (gql::Field, ValidationSlot<Ctx>)
+where
+    M: ObjectModel,
+    Ctx: 'static,
+    T: OutputType + IntoValue + Send + 'static,
+    A: InputObject,
+    F: for<'r> Fn(&'r M, A, &'r Ctx, &'r gql::ResolverContext<'r>) -> Result<T, GraphQLError>
+        + Send
+        + Sync
+        + 'static,
+{
+    T::register_output(registry);
+    A::register_args(registry);
+    let resolver = Arc::new(resolver);
+    let validation = ValidationSlot::new();
+    let hook = validation.clone();
+    let field = add_arguments::<A>(gql::Field::new(name, T::output_type()), registry).resolve(
+        move |context| {
+            let resolver = Arc::clone(&resolver);
+            let hook = hook.clone();
+            Box::pin(async move {
+                let model = model_ref::<M>(
+                    context.parent,
+                    context.info.parent_type,
+                    context.info.field_name,
+                )?;
+                let args = coerce_args::<A>(
+                    context.args,
+                    context.info.parent_type,
+                    context.info.field_name,
+                )?;
+                let ctx = context.context.require_data::<Ctx>()?;
+                hook.run(&args, ctx)?;
+                match (resolver)(model, args, ctx, &context) {
+                    Ok(value) => value.into_value(),
+                    Err(error) => Err(error),
+                }
+            })
+        },
+    );
+    (field, validation)
 }
 
 fn root_field_with_info<Ctx, T, A, F>(
     name: &'static str,
     resolver: F,
     registry: &mut TypeRegistry,
-) -> gql::Field
+) -> (gql::Field, ValidationSlot<Ctx>)
 where
     Ctx: 'static,
     T: OutputType + IntoValue + Send + 'static,
@@ -1910,25 +2386,32 @@ where
     T::register_output(registry);
     A::register_args(registry);
     let resolver = Arc::new(resolver);
-    add_arguments::<A>(gql::Field::new(name, T::output_type()), registry).resolve(move |context| {
-        let resolver = Arc::clone(&resolver);
-        Box::pin(async move {
-            let args = coerce_args::<A>(
-                context.args,
-                context.info.parent_type,
-                context.info.field_name,
-            )?;
-            let ctx = context.context.require_data::<Ctx>()?;
-            (resolver)(args, ctx, context.info).into_value()
-        })
-    })
+    let validation = ValidationSlot::new();
+    let hook = validation.clone();
+    let field = add_arguments::<A>(gql::Field::new(name, T::output_type()), registry).resolve(
+        move |context| {
+            let resolver = Arc::clone(&resolver);
+            let hook = hook.clone();
+            Box::pin(async move {
+                let args = coerce_args::<A>(
+                    context.args,
+                    context.info.parent_type,
+                    context.info.field_name,
+                )?;
+                let ctx = context.context.require_data::<Ctx>()?;
+                hook.run(&args, ctx)?;
+                (resolver)(args, ctx, context.info).into_value()
+            })
+        },
+    );
+    (field, validation)
 }
 
 fn root_field_result_with_info<Ctx, T, A, F>(
     name: &'static str,
     resolver: F,
     registry: &mut TypeRegistry,
-) -> gql::Field
+) -> (gql::Field, ValidationSlot<Ctx>)
 where
     Ctx: 'static,
     T: OutputType + IntoValue + Send + 'static,
@@ -1941,28 +2424,35 @@ where
     T::register_output(registry);
     A::register_args(registry);
     let resolver = Arc::new(resolver);
-    add_arguments::<A>(gql::Field::new(name, T::output_type()), registry).resolve(move |context| {
-        let resolver = Arc::clone(&resolver);
-        Box::pin(async move {
-            let args = coerce_args::<A>(
-                context.args,
-                context.info.parent_type,
-                context.info.field_name,
-            )?;
-            let ctx = context.context.require_data::<Ctx>()?;
-            match (resolver)(args, ctx, context.info) {
-                Ok(value) => value.into_value(),
-                Err(error) => Err(error),
-            }
-        })
-    })
+    let validation = ValidationSlot::new();
+    let hook = validation.clone();
+    let field = add_arguments::<A>(gql::Field::new(name, T::output_type()), registry).resolve(
+        move |context| {
+            let resolver = Arc::clone(&resolver);
+            let hook = hook.clone();
+            Box::pin(async move {
+                let args = coerce_args::<A>(
+                    context.args,
+                    context.info.parent_type,
+                    context.info.field_name,
+                )?;
+                let ctx = context.context.require_data::<Ctx>()?;
+                hook.run(&args, ctx)?;
+                match (resolver)(args, ctx, context.info) {
+                    Ok(value) => value.into_value(),
+                    Err(error) => Err(error),
+                }
+            })
+        },
+    );
+    (field, validation)
 }
 
 fn root_field_async_with_info<Ctx, T, A, F>(
     name: &'static str,
     resolver: F,
     registry: &mut TypeRegistry,
-) -> gql::Field
+) -> (gql::Field, ValidationSlot<Ctx>)
 where
     Ctx: 'static,
     T: OutputType + IntoValue + Send + 'static,
@@ -1972,25 +2462,32 @@ where
     T::register_output(registry);
     A::register_args(registry);
     let resolver = Arc::new(resolver);
-    add_arguments::<A>(gql::Field::new(name, T::output_type()), registry).resolve(move |context| {
-        let resolver = Arc::clone(&resolver);
-        Box::pin(async move {
-            let args = coerce_args::<A>(
-                context.args,
-                context.info.parent_type,
-                context.info.field_name,
-            )?;
-            let ctx = context.context.require_data::<Ctx>()?;
-            (resolver)(args, ctx, context.info).await.into_value()
-        })
-    })
+    let validation = ValidationSlot::new();
+    let hook = validation.clone();
+    let field = add_arguments::<A>(gql::Field::new(name, T::output_type()), registry).resolve(
+        move |context| {
+            let resolver = Arc::clone(&resolver);
+            let hook = hook.clone();
+            Box::pin(async move {
+                let args = coerce_args::<A>(
+                    context.args,
+                    context.info.parent_type,
+                    context.info.field_name,
+                )?;
+                let ctx = context.context.require_data::<Ctx>()?;
+                hook.run(&args, ctx)?;
+                (resolver)(args, ctx, context.info).await.into_value()
+            })
+        },
+    );
+    (field, validation)
 }
 
 fn root_field_result_async_with_info<Ctx, T, A, F>(
     name: &'static str,
     resolver: F,
     registry: &mut TypeRegistry,
-) -> gql::Field
+) -> (gql::Field, ValidationSlot<Ctx>)
 where
     Ctx: 'static,
     T: OutputType + IntoValue + Send + 'static,
@@ -2003,28 +2500,111 @@ where
     T::register_output(registry);
     A::register_args(registry);
     let resolver = Arc::new(resolver);
-    add_arguments::<A>(gql::Field::new(name, T::output_type()), registry).resolve(move |context| {
-        let resolver = Arc::clone(&resolver);
-        Box::pin(async move {
-            let args = coerce_args::<A>(
-                context.args,
-                context.info.parent_type,
-                context.info.field_name,
-            )?;
-            let ctx = context.context.require_data::<Ctx>()?;
-            match (resolver)(args, ctx, context.info).await {
-                Ok(value) => value.into_value(),
-                Err(error) => Err(error),
-            }
-        })
-    })
+    let validation = ValidationSlot::new();
+    let hook = validation.clone();
+    let field = add_arguments::<A>(gql::Field::new(name, T::output_type()), registry).resolve(
+        move |context| {
+            let resolver = Arc::clone(&resolver);
+            let hook = hook.clone();
+            Box::pin(async move {
+                let args = coerce_args::<A>(
+                    context.args,
+                    context.info.parent_type,
+                    context.info.field_name,
+                )?;
+                let ctx = context.context.require_data::<Ctx>()?;
+                hook.run(&args, ctx)?;
+                match (resolver)(args, ctx, context.info).await {
+                    Ok(value) => value.into_value(),
+                    Err(error) => Err(error),
+                }
+            })
+        },
+    );
+    (field, validation)
+}
+
+fn root_field_with_execution<Ctx, T, A, F>(
+    name: &'static str,
+    resolver: F,
+    registry: &mut TypeRegistry,
+) -> (gql::Field, ValidationSlot<Ctx>)
+where
+    Ctx: 'static,
+    T: OutputType + IntoValue + Send + 'static,
+    A: InputObject,
+    F: for<'r> Fn(A, &'r Ctx, &'r gql::ResolverContext<'r>) -> T + Send + Sync + 'static,
+{
+    T::register_output(registry);
+    A::register_args(registry);
+    let resolver = Arc::new(resolver);
+    let validation = ValidationSlot::new();
+    let hook = validation.clone();
+    let field = add_arguments::<A>(gql::Field::new(name, T::output_type()), registry).resolve(
+        move |context| {
+            let resolver = Arc::clone(&resolver);
+            let hook = hook.clone();
+            Box::pin(async move {
+                let args = coerce_args::<A>(
+                    context.args,
+                    context.info.parent_type,
+                    context.info.field_name,
+                )?;
+                let ctx = context.context.require_data::<Ctx>()?;
+                hook.run(&args, ctx)?;
+                (resolver)(args, ctx, &context).into_value()
+            })
+        },
+    );
+    (field, validation)
+}
+
+fn root_field_result_with_execution<Ctx, T, A, F>(
+    name: &'static str,
+    resolver: F,
+    registry: &mut TypeRegistry,
+) -> (gql::Field, ValidationSlot<Ctx>)
+where
+    Ctx: 'static,
+    T: OutputType + IntoValue + Send + 'static,
+    A: InputObject,
+    F: for<'r> Fn(A, &'r Ctx, &'r gql::ResolverContext<'r>) -> Result<T, GraphQLError>
+        + Send
+        + Sync
+        + 'static,
+{
+    T::register_output(registry);
+    A::register_args(registry);
+    let resolver = Arc::new(resolver);
+    let validation = ValidationSlot::new();
+    let hook = validation.clone();
+    let field = add_arguments::<A>(gql::Field::new(name, T::output_type()), registry).resolve(
+        move |context| {
+            let resolver = Arc::clone(&resolver);
+            let hook = hook.clone();
+            Box::pin(async move {
+                let args = coerce_args::<A>(
+                    context.args,
+                    context.info.parent_type,
+                    context.info.field_name,
+                )?;
+                let ctx = context.context.require_data::<Ctx>()?;
+                hook.run(&args, ctx)?;
+                match (resolver)(args, ctx, &context) {
+                    Ok(value) => value.into_value(),
+                    Err(error) => Err(error),
+                }
+            })
+        },
+    );
+    (field, validation)
 }
 
 fn subscription_field<Ctx, A, T, F, S>(
     name: &'static str,
     subscribe: F,
     registry: &mut TypeRegistry,
-) -> gql::Field
+) -> (gql::Field, ValidationSlot<Ctx>)
 where
     Ctx: 'static,
     A: InputObject,
@@ -2035,9 +2615,22 @@ where
     T::register_output(registry);
     A::register_args(registry);
     let subscribe = Arc::new(subscribe);
-    add_arguments::<A>(gql::Field::new(name, T::output_type()), registry)
+    let validation = ValidationSlot::new();
+    let hook = validation.clone();
+    let field = add_arguments::<A>(gql::Field::new(name, T::output_type()), registry)
         .resolve(move |context| {
+            let hook = hook.clone();
             Box::pin(async move {
+                // Arguments were validated once when the subscription started. Conversion still
+                // happens per event so the field validator sees the same typed arguments, but
+                // input-level validation is not repeated.
+                let args = coerce_args_without_validation::<A>(
+                    context.args,
+                    context.info.parent_type,
+                    context.info.field_name,
+                )?;
+                let ctx = context.context.require_data::<Ctx>()?;
+                hook.run(&args, ctx)?;
                 context
                     .parent
                     .as_object()
@@ -2073,7 +2666,29 @@ where
                 });
                 Ok(Box::pin(mapped) as gql::SubscriptionStream)
             })
-        })
+        });
+    (field, validation)
+}
+
+/// Whether `actual`'s wrappers are at least as strict as `declared`'s.
+///
+/// `actual` is what the resolver's Rust type can produce; `declared` is what the schema claims.
+/// Every non-null position in `declared` must also be non-null in `actual`, because a `None`
+/// would violate the schema. Nullable positions may replace non-null ones (loosening), and the
+/// list structure must match exactly.
+fn wrapper_compatible(actual: &TypeRef, declared: &TypeRef) -> bool {
+    match (actual, declared) {
+        (TypeRef::NonNull(actual), TypeRef::NonNull(declared)) => {
+            wrapper_compatible(actual, declared)
+        }
+        // A non-null value satisfies a nullable declaration.
+        (TypeRef::NonNull(actual), declared) => wrapper_compatible(actual, declared),
+        // A value the Rust type may omit cannot satisfy a non-null declaration.
+        (_, TypeRef::NonNull(_)) => false,
+        (TypeRef::List(actual), TypeRef::List(declared)) => wrapper_compatible(actual, declared),
+        (TypeRef::Named(_), TypeRef::Named(_)) => true,
+        _ => false,
+    }
 }
 
 /// Whether a value of `actual` can be completed as `expected`.
@@ -2142,6 +2757,19 @@ fn validate_checks(schema: &gql::Schema, checks: &[FieldCheck], errors: &mut Vec
                 original,
                 replacement,
             } => {
+                // The override may loosen nullability, but it must never claim a non-null
+                // position the resolver can fill with `None`, and it cannot turn a list into a
+                // scalar (or vice versa) because the resolver still returns the Rust collection.
+                if !wrapper_compatible(original, replacement) {
+                    errors.push(GraphQLError::new(format!(
+                        "Field `{owner}.{field}` overrides its type from `{original}` to \
+                         `{replacement}`, which is not compatible with the resolver's Rust type. \
+                         The override must not make a nullable position non-null, and its list \
+                         wrappers must match the Rust collection. Remove the `Option` or `Vec` \
+                         from the override, or change the resolver's return type."
+                    )));
+                    continue;
+                }
                 let original_name = original.named_type();
                 let replacement_name = replacement.named_type();
                 if original_name == replacement_name {

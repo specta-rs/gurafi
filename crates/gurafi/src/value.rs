@@ -124,6 +124,13 @@ macro_rules! impl_int {
                                 stringify!($ty)
                             ))
                         }),
+                        Value::BigInt(number) => <$ty>::try_from(**number).map_err(|_| {
+                            GraphQLError::new(format!(
+                                "{} is outside the range of GraphQL `Int` for `{}`.",
+                                number,
+                                stringify!($ty)
+                            ))
+                        }),
                         other => Err(GraphQLError::new(format!(
                             "Expected an integer for `{}` but found {}.",
                             stringify!($ty),
@@ -164,6 +171,7 @@ macro_rules! impl_float {
                     match value {
                         Value::Float(number) => Ok(*number as $ty),
                         Value::Int(number) => Ok(*number as $ty),
+                        Value::BigInt(number) => Ok(**number as $ty),
                         other => Err(GraphQLError::new(format!(
                             "Expected a number for `{}` but found {}.",
                             stringify!($ty),
@@ -340,9 +348,7 @@ pub(crate) fn literal_to_value(literal: &gql::ast::Value<'_>) -> Result<Value, G
     match literal {
         gql::ast::Value::Null => Ok(Value::Null),
         gql::ast::Value::Boolean(boolean) => Ok(Value::Boolean(*boolean)),
-        gql::ast::Value::Int(number) => i32::try_from(*number).map(Value::Int).map_err(|_| {
-            GraphQLError::new(format!("{number} is outside the range of GraphQL `Int`."))
-        }),
+        gql::ast::Value::Int(number) => Ok(Value::integer(*number)),
         gql::ast::Value::Float(number) => Ok(Value::Float(*number)),
         gql::ast::Value::String(string) => Ok(Value::String(Arc::from(string.as_ref()))),
         gql::ast::Value::Enum(name) => Ok(Value::Enum(Arc::from(*name))),

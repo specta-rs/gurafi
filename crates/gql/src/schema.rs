@@ -7,10 +7,11 @@ use indexmap::IndexMap;
 use rustc_hash::{FxBuildHasher, FxHashSet};
 
 use crate::{
+    Value,
     error::GraphQLError,
     types::{
-        DirectiveDefinition, EnumType, Field, InputObjectType, InputValue, InterfaceType, Name,
-        ObjectType, ScalarType, Type, TypeKind, TypeRef, UnionType,
+        AppliedDirective, DirectiveDefinition, EnumType, Field, InputObjectType, InputValue,
+        InterfaceType, Name, ObjectType, ScalarType, Type, TypeKind, TypeRef, UnionType,
     },
 };
 
@@ -83,7 +84,7 @@ impl From<GraphQLError> for SchemaError {
 /// trusted definitions (and for documents, which `collect` already hashes with `FxHash`).
 pub(crate) type TypeMap<V> = IndexMap<Name, V, FxBuildHasher>;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct SchemaInner {
     /// Types in definition order, hashed with `FxHash`.
     ///
@@ -95,6 +96,7 @@ pub(crate) struct SchemaInner {
     pub(crate) mutation: Option<Name>,
     pub(crate) subscription: Option<Name>,
     pub(crate) directives: TypeMap<DirectiveDefinition>,
+    pub(crate) applied_directives: Vec<crate::types::AppliedDirective>,
     pub(crate) description: Option<Arc<str>>,
 }
 
@@ -124,6 +126,12 @@ impl Schema {
     #[must_use]
     pub fn description(&self) -> Option<&str> {
         self.inner.description.as_deref()
+    }
+
+    /// Directives applied to the schema itself, in source order.
+    #[must_use]
+    pub fn applied_directives(&self) -> &[crate::types::AppliedDirective] {
+        &self.inner.applied_directives
     }
 
     /// Look up a named type.
@@ -327,6 +335,7 @@ pub struct SchemaBuilder {
     mutation: Option<Name>,
     subscription: Option<Name>,
     directives: TypeMap<DirectiveDefinition>,
+    applied_directives: Vec<crate::types::AppliedDirective>,
     description: Option<Arc<str>>,
     errors: SchemaError,
 }
@@ -361,6 +370,7 @@ impl SchemaBuilder {
             mutation: None,
             subscription: None,
             directives,
+            applied_directives: Vec::new(),
             description: None,
             errors: SchemaError::default(),
         }
@@ -370,6 +380,23 @@ impl SchemaBuilder {
     #[must_use]
     pub fn description(mut self, description: impl Into<Arc<str>>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// Add a directive application to the schema itself.
+    #[must_use]
+    pub fn schema_directive(mut self, directive: crate::types::AppliedDirective) -> Self {
+        self.applied_directives.push(directive);
+        self
+    }
+
+    /// Add several schema-level directive applications.
+    #[must_use]
+    pub fn schema_directives(
+        mut self,
+        directives: impl IntoIterator<Item = crate::types::AppliedDirective>,
+    ) -> Self {
+        self.applied_directives.extend(directives);
         self
     }
 
@@ -549,26 +576,279 @@ impl SchemaBuilder {
 
         add_referenced_builtin_scalars(&mut self.types, &self.directives);
 
+        apply_dedicated_directives(&mut self.types, &mut self.directives);
+
         resolve_field_type_indices(&mut self.types);
 
         let inner = SchemaInner {
             types: self.types,
+            applied_directives: self.applied_directives,
             query,
             mutation: self.mutation,
             subscription: self.subscription,
             directives: self.directives,
             description: self.description,
         };
-        let schema = Schema {
+        let mut schema = Schema {
             inner: Arc::new(inner),
         };
 
         validate_schema(&schema, &mut self.errors);
+        validate_applied_directives(&schema, &mut self.errors);
+        if self.errors.is_empty() {
+            coerce_applied_directive_arguments(&mut schema, &mut self.errors);
+        }
 
         if self.errors.is_empty() {
             Ok(schema)
         } else {
             Err(self.errors)
+        }
+    }
+}
+
+/// The specification's default `@deprecated` reason.
+const DEFAULT_DEPRECATION_REASON: &str = "No longer supported";
+
+/// Copy dedicated built-in directive applications into their authoritative model fields.
+///
+/// `@deprecated`, `@specifiedBy` and `@oneOf` have first-class fields on the type model, and the
+/// SDL printer deliberately skips the directive form to avoid printing the same fact twice. A
+/// code-first schema that applies one through [`AppliedDirective`] would therefore lose it unless
+/// it is mapped here. The application itself is kept in the `directives` list so it is still
+/// validated; mapping only supplies the authoritative field.
+///
+/// SDL-imported built-ins are mapped here too. The mapping is idempotent, so they are not
+/// reported or printed twice.
+fn apply_dedicated_directives(
+    types: &mut TypeMap<Type>,
+    definitions: &mut TypeMap<DirectiveDefinition>,
+) {
+    fn deprecation(directives: &[AppliedDirective]) -> Option<Option<Arc<str>>> {
+        let directive = directives
+            .iter()
+            .rev()
+            .find(|directive| directive.name.as_ref() == "deprecated")?;
+        Some(match directive.get_argument("reason") {
+            Some(Value::String(reason)) => Some(reason.clone()),
+            Some(Value::Null) | None => Some(Arc::from(DEFAULT_DEPRECATION_REASON)),
+            // Validation reports a wrong-typed reason; leave the field untouched so a broken
+            // application cannot become a deprecation reason.
+            Some(_) => None,
+        })
+    }
+
+    fn apply_deprecation(directives: &[AppliedDirective], target: &mut Option<Arc<str>>) {
+        if let Some(reason) = deprecation(directives) {
+            *target = reason;
+        }
+    }
+
+    fn string_argument(
+        directives: &[AppliedDirective],
+        directive_name: &str,
+        argument_name: &str,
+    ) -> Option<Arc<str>> {
+        let directive = directives
+            .iter()
+            .rev()
+            .find(|directive| directive.name.as_ref() == directive_name)?;
+        match directive.get_argument(argument_name) {
+            Some(Value::String(value)) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    fn apply_input_value(value: &mut InputValue) {
+        apply_deprecation(&value.directives, &mut value.deprecation_reason);
+    }
+
+    fn apply_field(field: &mut Field) {
+        apply_deprecation(&field.directives, &mut field.deprecation_reason);
+        for argument in field.args.values_mut() {
+            apply_input_value(argument);
+        }
+    }
+
+    for ty in types.values_mut() {
+        match ty {
+            Type::Scalar(scalar) => {
+                let scalar = Arc::make_mut(scalar);
+                if let Some(url) = string_argument(&scalar.directives, "specifiedBy", "url") {
+                    scalar.specified_by_url = Some(url);
+                }
+            }
+            Type::Object(object) => {
+                let object = Arc::make_mut(object);
+                for field in object.fields.values_mut() {
+                    apply_field(field);
+                }
+            }
+            Type::Interface(interface) => {
+                let interface = Arc::make_mut(interface);
+                for field in interface.fields.values_mut() {
+                    apply_field(field);
+                }
+            }
+            Type::Union(_) => {}
+            Type::Enum(enumeration) => {
+                let enumeration = Arc::make_mut(enumeration);
+                for value in enumeration.values.values_mut() {
+                    apply_deprecation(&value.directives, &mut value.deprecation_reason);
+                }
+            }
+            Type::InputObject(input) => {
+                let input = Arc::make_mut(input);
+                if input
+                    .directives
+                    .iter()
+                    .any(|directive| directive.name.as_ref() == "oneOf")
+                {
+                    input.one_of = true;
+                }
+                for field in input.fields.values_mut() {
+                    apply_input_value(field);
+                }
+            }
+        }
+    }
+
+    for directive in definitions.values_mut() {
+        apply_deprecation(&directive.directives, &mut directive.deprecation_reason);
+        for argument in directive.args.values_mut() {
+            apply_input_value(argument);
+        }
+    }
+}
+
+/// Coerce every applied directive argument to the input type its definition declares.
+///
+/// Directive applications are stored as values, not as AST literals, so SDL parsing turns a
+/// literal into its runtime shape first and this pass then applies the same rules as a variable
+/// value: `ID` renders an integer as a decimal string, `Float` widens an integer, `Int` rejects a
+/// value outside 32 bits, and a custom scalar's `parse_value` runs.
+///
+/// A schema is needed to resolve named input types, and the schema owns the values being
+/// rewritten, so the pass snapshots the build and mutates through `Arc::make_mut`. It runs only
+/// when validation succeeded, which also means every coercion here succeeds; anything else is
+/// still reported rather than silently kept.
+fn coerce_applied_directive_arguments(schema: &mut Schema, errors: &mut SchemaError) {
+    fn coerce(
+        lookup: &Schema,
+        directives: &mut [AppliedDirective],
+        owner: &str,
+        errors: &mut SchemaError,
+    ) {
+        for directive in directives {
+            let Some(definition) = lookup.get_directive(&directive.name) else {
+                continue;
+            };
+            for (name, value) in &mut directive.arguments {
+                let Some(declared) = definition.args.get(name) else {
+                    continue;
+                };
+                let mut path = Vec::new();
+                match crate::execution::coerce::coerce_input_value(
+                    lookup,
+                    value,
+                    &declared.ty,
+                    &mut path,
+                ) {
+                    Ok(coerced) => *value = coerced,
+                    Err(error) => errors.push(format!(
+                        "Argument \"{name}\" of directive \"@{}\" on {owner} is invalid: {}",
+                        directive.name,
+                        error.message()
+                    )),
+                }
+            }
+        }
+    }
+
+    fn input_value(lookup: &Schema, value: &mut InputValue, owner: &str, errors: &mut SchemaError) {
+        coerce(lookup, &mut value.directives, owner, errors);
+    }
+
+    fn field(lookup: &Schema, field: &mut Field, owner: &str, errors: &mut SchemaError) {
+        coerce(lookup, &mut field.directives, owner, errors);
+        for argument in field.args.values_mut() {
+            let owner = format!("argument \"{}\" of {owner}", argument.name);
+            input_value(lookup, argument, &owner, errors);
+        }
+    }
+
+    let lookup = schema.clone();
+    let inner = Arc::make_mut(&mut schema.inner);
+
+    coerce(&lookup, &mut inner.applied_directives, "the schema", errors);
+    for ty in inner.types.values_mut() {
+        match ty {
+            Type::Scalar(scalar) => {
+                let scalar = Arc::make_mut(scalar);
+                coerce(
+                    &lookup,
+                    &mut scalar.directives,
+                    &format!("scalar \"{}\"", scalar.name),
+                    errors,
+                );
+            }
+            Type::Object(object) => {
+                let object = Arc::make_mut(object);
+                for field_value in object.fields.values_mut() {
+                    let owner = format!("field \"{}.{}\"", object.name, field_value.name);
+                    field(&lookup, field_value, &owner, errors);
+                }
+            }
+            Type::Interface(interface) => {
+                let interface = Arc::make_mut(interface);
+                for field_value in interface.fields.values_mut() {
+                    let owner = format!("field \"{}.{}\"", interface.name, field_value.name);
+                    field(&lookup, field_value, &owner, errors);
+                }
+            }
+            Type::Union(union) => {
+                let union = Arc::make_mut(union);
+                coerce(
+                    &lookup,
+                    &mut union.directives,
+                    &format!("union \"{}\"", union.name),
+                    errors,
+                );
+            }
+            Type::Enum(enumeration) => {
+                let enumeration = Arc::make_mut(enumeration);
+                coerce(
+                    &lookup,
+                    &mut enumeration.directives,
+                    &format!("enum \"{}\"", enumeration.name),
+                    errors,
+                );
+                for value in enumeration.values.values_mut() {
+                    let owner = format!("enum value \"{}.{}\"", enumeration.name, value.name);
+                    coerce(&lookup, &mut value.directives, &owner, errors);
+                }
+            }
+            Type::InputObject(input) => {
+                let input = Arc::make_mut(input);
+                coerce(
+                    &lookup,
+                    &mut input.directives,
+                    &format!("input object \"{}\"", input.name),
+                    errors,
+                );
+                for field_value in input.fields.values_mut() {
+                    let owner = format!("input field \"{}.{}\"", input.name, field_value.name);
+                    input_value(&lookup, field_value, &owner, errors);
+                }
+            }
+        }
+    }
+    for directive in inner.directives.values_mut() {
+        let owner = format!("directive \"@{}\"", directive.name);
+        coerce(&lookup, &mut directive.directives, &owner, errors);
+        for argument in directive.args.values_mut() {
+            let owner = format!("argument \"{}\" of {owner}", argument.name);
+            input_value(&lookup, argument, &owner, errors);
         }
     }
 }
@@ -769,6 +1049,135 @@ fn validate_arguments(
                 argument.name
             ));
         }
+    }
+}
+
+/// Validate directive applications built through the code-first API.
+fn validate_applied_directives(schema: &Schema, errors: &mut SchemaError) {
+    use crate::ast::DirectiveLocation;
+
+    crate::sdl_schema::validate_applied_directives(
+        schema,
+        schema.applied_directives(),
+        DirectiveLocation::Schema,
+        "the schema",
+        errors,
+    );
+    for (_name, ty) in schema.types() {
+        match ty {
+            Type::Scalar(scalar) => crate::sdl_schema::validate_applied_directives(
+                schema,
+                &scalar.directives,
+                DirectiveLocation::Scalar,
+                &format!("scalar \"{}\"", scalar.name),
+                errors,
+            ),
+            Type::Object(object) => {
+                crate::sdl_schema::validate_applied_directives(
+                    schema,
+                    &object.directives,
+                    DirectiveLocation::Object,
+                    &format!("object \"{}\"", object.name),
+                    errors,
+                );
+                for field in object.fields.values() {
+                    validate_field_directives(schema, field, errors);
+                }
+            }
+            Type::Interface(interface) => {
+                crate::sdl_schema::validate_applied_directives(
+                    schema,
+                    &interface.directives,
+                    DirectiveLocation::Interface,
+                    &format!("interface \"{}\"", interface.name),
+                    errors,
+                );
+                for field in interface.fields.values() {
+                    validate_field_directives(schema, field, errors);
+                }
+            }
+            Type::Union(union) => crate::sdl_schema::validate_applied_directives(
+                schema,
+                &union.directives,
+                DirectiveLocation::Union,
+                &format!("union \"{}\"", union.name),
+                errors,
+            ),
+            Type::Enum(enumeration) => {
+                crate::sdl_schema::validate_applied_directives(
+                    schema,
+                    &enumeration.directives,
+                    DirectiveLocation::Enum,
+                    &format!("enum \"{}\"", enumeration.name),
+                    errors,
+                );
+                for value in enumeration.values.values() {
+                    crate::sdl_schema::validate_applied_directives(
+                        schema,
+                        &value.directives,
+                        DirectiveLocation::EnumValue,
+                        &format!("enum value \"{}.{}\"", enumeration.name, value.name),
+                        errors,
+                    );
+                }
+            }
+            Type::InputObject(input) => {
+                crate::sdl_schema::validate_applied_directives(
+                    schema,
+                    &input.directives,
+                    DirectiveLocation::InputObject,
+                    &format!("input object \"{}\"", input.name),
+                    errors,
+                );
+                for field in input.fields.values() {
+                    crate::sdl_schema::validate_applied_directives(
+                        schema,
+                        &field.directives,
+                        DirectiveLocation::InputFieldDefinition,
+                        &format!("input field \"{}.{}\"", input.name, field.name),
+                        errors,
+                    );
+                }
+            }
+        }
+    }
+    for directive in schema.directives() {
+        crate::sdl_schema::validate_applied_directives(
+            schema,
+            &directive.1.directives,
+            DirectiveLocation::DirectiveDefinition,
+            &format!("directive \"@{}\"", directive.1.name),
+            errors,
+        );
+        for argument in directive.1.args.values() {
+            crate::sdl_schema::validate_applied_directives(
+                schema,
+                &argument.directives,
+                DirectiveLocation::ArgumentDefinition,
+                &format!("argument \"{}\"", argument.name),
+                errors,
+            );
+        }
+    }
+}
+
+fn validate_field_directives(schema: &Schema, field: &Field, errors: &mut SchemaError) {
+    use crate::ast::DirectiveLocation;
+    crate::sdl_schema::validate_applied_directives(
+        schema,
+        &field.directives,
+        DirectiveLocation::FieldDefinition,
+        &format!("field \"{}\"", field.name),
+        errors,
+    );
+    for argument in field.args.values() {
+        crate::sdl_schema::validate_applied_directives(
+            schema,
+            &argument.directives,
+            DirectiveLocation::ArgumentDefinition,
+            &format!("argument \"{}\"", argument.name),
+            errors,
+        );
     }
 }
 

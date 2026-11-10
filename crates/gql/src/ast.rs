@@ -523,6 +523,8 @@ pub struct DirectiveDefinition<'a> {
     pub arguments: Vec<InputValueDefinition<'a>>,
     /// Whether the directive may appear multiple times in one location.
     pub repeatable: bool,
+    /// Directives applied to the definition itself.
+    pub directives: Vec<Directive<'a>>,
     /// Locations the directive may appear in.
     pub locations: Vec<DirectiveLocation>,
     /// Where the definition starts.

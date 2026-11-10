@@ -8,7 +8,7 @@ use syn::{Data, DeriveInput, Fields, LitStr};
 
 use crate::{
     attr::{deprecation_reason, parse_field_attrs},
-    util::validate_graphql_name,
+    util::{validate_graphql_name, validate_type_name},
 };
 
 pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
@@ -42,7 +42,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         .name
         .clone()
         .unwrap_or_else(|| LitStr::new(&graphql_type_name, ident.span()));
-    validate_graphql_name(&graphql_type_name, type_name_literal.span())?;
+    validate_type_name(&graphql_type_name, type_name_literal.span())?;
 
     let mut seen = HashSet::new();
     let mut variants = Vec::new();

@@ -4,7 +4,7 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{Data, DeriveInput};
 
-use crate::{attr::parse_type_attrs, util::validate_graphql_name};
+use crate::{attr::parse_type_attrs, util::validate_type_name};
 
 pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     if !input.generics.params.is_empty() {
@@ -33,7 +33,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         .name
         .clone()
         .unwrap_or_else(|| syn::LitStr::new(&name, ident.span()));
-    validate_graphql_name(&name, name_literal.span())?;
+    validate_type_name(&name, name_literal.span())?;
     if let Some(specified_by) = &attrs.specified_by {
         return Err(syn::Error::new_spanned(
             specified_by,

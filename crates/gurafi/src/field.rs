@@ -1,6 +1,9 @@
 //! Field options: descriptions, deprecation, complexity, authorization and type overrides.
 
-use std::sync::Arc;
+use std::{
+    any::TypeId,
+    sync::{Arc, OnceLock},
+};
 
 use futures::future::BoxFuture;
 use gql::{ComplexityFn, Field, GraphQLError, Name, TypeRef};
@@ -142,6 +145,73 @@ impl<Ctx: 'static> AuthGuard<Ctx> {
     }
 }
 
+/// The arguments-type check installed by [`FieldConfig::validate`].
+///
+/// The slot is cloned into the field's resolver before the builder returns it, so a validation
+/// hook installed afterwards can run inside the resolver's single argument-coercion step. That
+/// keeps input-level validation from running a second time and keeps the validator independent
+/// of the resolver's concrete `A` at the type level (the arguments [`TypeId`] is checked when the
+/// hook is installed).
+pub(crate) struct ValidationSlot<Ctx: 'static> {
+    hook: Arc<OnceLock<ErasedValidator<Ctx>>>,
+}
+
+impl<Ctx: 'static> Clone for ValidationSlot<Ctx> {
+    fn clone(&self) -> Self {
+        Self {
+            hook: Arc::clone(&self.hook),
+        }
+    }
+}
+
+type ErasedValidator<Ctx> =
+    Arc<dyn Fn(&dyn std::any::Any, &Ctx) -> Result<(), GraphQLError> + Send + Sync>;
+
+impl<Ctx: 'static> Default for ValidationSlot<Ctx> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<Ctx: 'static> ValidationSlot<Ctx> {
+    pub(crate) fn new() -> Self {
+        Self {
+            hook: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Install a validator for arguments of type `A`.
+    pub(crate) fn install<A: 'static>(
+        &self,
+        validator: impl Fn(&A, &Ctx) -> Result<(), GraphQLError> + Send + Sync + 'static,
+    ) {
+        let validator = Arc::new(validator);
+        let _ = self
+            .hook
+            .set(Arc::new(move |args: &dyn std::any::Any, ctx: &Ctx| {
+                let args = args.downcast_ref::<A>().ok_or_else(|| {
+                    GraphQLError::new(
+                        "Internal error: a field validator received arguments of a different type.",
+                    )
+                })?;
+                validator(args, ctx)
+            }));
+    }
+
+    /// Whether a validator was already installed.
+    pub(crate) fn is_installed(&self) -> bool {
+        self.hook.get().is_some()
+    }
+
+    /// Run the installed validator, if any.
+    pub(crate) fn run<A: 'static>(&self, args: &A, ctx: &Ctx) -> Result<(), GraphQLError> {
+        match self.hook.get() {
+            Some(hook) => hook(args, ctx),
+            None => Ok(()),
+        }
+    }
+}
+
 enum Complexity {
     Fixed(u32),
     Custom(ComplexityFn),
@@ -182,6 +252,10 @@ pub struct FieldConfig<'a, Ctx: 'static> {
     original: TypeRef,
     rust_nullable: bool,
     rust_type_name: &'static str,
+    /// The Rust arguments type the field's resolvers coerce into.
+    args_type: TypeId,
+    /// Validator installed by [`FieldConfig::validate`], read inside the resolver.
+    validation: ValidationSlot<Ctx>,
     marker: std::marker::PhantomData<fn() -> Ctx>,
 }
 
@@ -194,6 +268,8 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
         name: Name,
         rust_nullable: bool,
         rust_type_name: &'static str,
+        args_type: TypeId,
+        validation: ValidationSlot<Ctx>,
     ) -> Self {
         Self::new(
             registry,
@@ -203,6 +279,8 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
             owner.into(),
             rust_nullable,
             rust_type_name,
+            args_type,
+            validation,
         )
     }
 
@@ -222,6 +300,8 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
             String::new(),
             rust_nullable,
             rust_type_name,
+            TypeId::of::<()>(),
+            ValidationSlot::new(),
         );
         config.field_auth = Some(field_auth);
         config
@@ -235,6 +315,8 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
         name: Name,
         rust_nullable: bool,
         rust_type_name: &'static str,
+        args_type: TypeId,
+        validation: ValidationSlot<Ctx>,
     ) -> Self {
         Self::new(
             registry,
@@ -244,6 +326,8 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
             owner.into(),
             rust_nullable,
             rust_type_name,
+            args_type,
+            validation,
         )
     }
 
@@ -255,6 +339,8 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
         owner: String,
         rust_nullable: bool,
         rust_type_name: &'static str,
+        args_type: TypeId,
+        validation: ValidationSlot<Ctx>,
     ) -> Self {
         let original = sink
             .get_mut(&name)
@@ -274,6 +360,8 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
             original,
             rust_nullable,
             rust_type_name,
+            args_type,
+            validation,
             marker: std::marker::PhantomData,
         }
     }
@@ -346,62 +434,71 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
 
     /// Validate coerced arguments before the resolver runs.
     ///
-    /// `A` must be the field's arguments type. A validation error is reported as a normal field
-    /// error, exactly like a failed coercion. This is the builder-side counterpart to
-    /// `#[graphql(validate = "...")]`, for rules that need the request context.
+    /// `A` must be the field's arguments type. Naming a different type is a schema build error,
+    /// because the validator would otherwise be handed arguments the resolver never sees. A
+    /// validation error is reported as a normal field error, exactly like a failed coercion.
+    /// This is the builder-side counterpart to `#[graphql(validate = "...")]`, for rules that
+    /// need the request context.
     ///
-    /// ```ignore
-    /// q.field("greet", |args: GreetArgs, _: &Ctx| args.name)
-    ///     .validate::<GreetArgs>(|args, ctx| {
-    ///         if args.name.is_empty() {
-    ///             Err(gql::GraphQLError::new("name must not be empty"))
-    ///         } else if !ctx.logged_in {
-    ///             Err(gql::GraphQLError::new("sign in first"))
-    ///         } else {
-    ///             Ok(())
-    ///         }
-    ///     });
+    /// The hook runs inside the resolver's single argument-coercion step, after input-level
+    /// validation and before the resolver closure. It never coerces or re-validates the
+    /// arguments a second time. For subscription fields it runs once per event, after the
+    /// arguments were validated once when the subscription was set up.
+    ///
+    /// ```
+    /// use gurafi::{Input, Schema};
+    ///
+    /// struct Ctx {
+    ///     logged_in: bool,
+    /// }
+    ///
+    /// #[derive(Input)]
+    /// struct GreetArgs {
+    ///     name: String,
+    /// }
+    ///
+    /// let mut schema = Schema::<Ctx>::new();
+    /// schema.query(|q| {
+    ///     q.field("greet", |args: GreetArgs, _: &Ctx| args.name)
+    ///         .validate::<GreetArgs>(|args, ctx| {
+    ///             if args.name.is_empty() {
+    ///                 Err(gurafi::GraphQLError::new("name must not be empty"))
+    ///             } else if !ctx.logged_in {
+    ///                 Err(gurafi::GraphQLError::new("sign in first"))
+    ///             } else {
+    ///                 Ok(())
+    ///             }
+    ///         });
+    /// });
+    /// let schema = schema.build().expect("schema builds");
+    /// # let _ = schema;
     /// ```
     pub fn validate<A: InputObject>(
         &mut self,
         validator: impl Fn(&A, &Ctx) -> Result<(), GraphQLError> + Send + Sync + 'static,
     ) -> &mut Self {
-        let Some(field) = self.sink.get_mut(&self.name) else {
+        if TypeId::of::<A>() != self.args_type {
+            self.registry.push_error(GraphQLError::new(format!(
+                "Field `{}.{}` calls `validate::<{}>()`, but its resolver's arguments type is \
+                 not `{}`. Use the field's actual arguments type, or change the resolver to take \
+                 `{}`.",
+                self.owner,
+                self.name,
+                std::any::type_name::<A>(),
+                std::any::type_name::<A>(),
+                std::any::type_name::<A>(),
+            )));
             return self;
-        };
-        let validator = Arc::new(validator);
-        if let Some(resolve) = field.resolve.take() {
-            let validator = Arc::clone(&validator);
-            field.resolve = Some(Arc::new(move |context| {
-                let resolve = Arc::clone(&resolve);
-                let validator = Arc::clone(&validator);
-                Box::pin(async move {
-                    let args = crate::traits::coerce_args::<A>(
-                        context.args,
-                        context.info.parent_type,
-                        context.info.field_name,
-                    )?;
-                    validator(&args, context.context.require_data::<Ctx>()?)?;
-                    resolve(context).await
-                })
-            }));
         }
-        if let Some(subscribe) = field.subscribe.take() {
-            let validator = Arc::clone(&validator);
-            field.subscribe = Some(Arc::new(move |context| {
-                let subscribe = Arc::clone(&subscribe);
-                let validator = Arc::clone(&validator);
-                Box::pin(async move {
-                    let args = crate::traits::coerce_args::<A>(
-                        context.args,
-                        context.info.parent_type,
-                        context.info.field_name,
-                    )?;
-                    validator(&args, context.context.require_data::<Ctx>()?)?;
-                    subscribe(context).await
-                })
-            }));
+        if self.validation.is_installed() {
+            self.registry.push_error(GraphQLError::new(format!(
+                "Field `{}.{}` installs more than one `validate` hook. Combine the checks into \
+                 one validator.",
+                self.owner, self.name,
+            )));
+            return self;
         }
+        self.validation.install::<A>(validator);
         self
     }
 
@@ -437,15 +534,18 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
     ///
     /// The override is checked when the schema is built. It is only accepted between scalars,
     /// between enums, or to and from an abstract type when the Rust type is a possible type of
-    /// it. Wrappers (list and non-null) are taken from `T`, unlike [`FieldConfig::as_abstract`]
-    /// which preserves them.
+    /// it. Wrappers are taken from `T`, unlike [`FieldConfig::as_abstract`] which preserves them,
+    /// but they must be truthful for the resolver's Rust type: nullability may be loosened and
+    /// never tightened, and the list shape must match. `Option<String>` cannot be declared
+    /// `String!`, `Vec<Option<String>>` cannot be declared `[String!]!`, and `Vec<String>` cannot
+    /// be declared `String!`.
     ///
     /// # Runtime risk
     ///
-    /// Schema validation cannot see the runtime value. If the resolver returns a value the new
-    /// type cannot serialize (for example `T` is an object but the resolver returns a scalar),
-    /// the request fails with a field error at execution time. Keep the Rust return type and the
-    /// override honest.
+    /// Schema validation cannot see the runtime value of a scalar that is serialized by a custom
+    /// conversion. If the resolver returns a value the new named type cannot serialize, the
+    /// request still fails with a field error at execution time. Keep the Rust return type and
+    /// the override honest.
     pub fn as_type<T: OutputType>(&mut self) -> &mut Self {
         self.override_type::<T>()
     }

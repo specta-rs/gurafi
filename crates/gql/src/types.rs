@@ -83,15 +83,23 @@ pub type SubscriptionStream = BoxStream<'static, FieldResult>;
 
 /// A directive applied to a schema element.
 ///
-/// `arguments` holds the directive's arguments in source order, already converted to runtime
-/// values. Applied directives are preserved so `Schema::from_sdl` round-trips through
+/// `arguments` holds the directive's arguments in source order. Values parsed from SDL start as
+/// the literal's runtime shape and code-first callers supply a runtime [`Value`]; when the schema
+/// is built every argument is coerced to the input type declared by the directive definition,
+/// using the same rules as field arguments (`ID` renders integers as strings, `Float` widens
+/// integers, a custom scalar's `parse_value` runs, and built-in `Int` rejects values outside 32
+/// bits). A wrong-typed argument makes the build fail.
+///
+/// Applied directives are preserved so `Schema::from_sdl` round-trips through
 /// [`Schema::sdl`](crate::Schema::sdl), and so code-first schemas can describe directives that
 /// have no dedicated field in the type model.
 ///
 /// The built-in `@deprecated`, `@specifiedBy` and `@oneOf` directives are also recorded here
 /// when they are parsed, but their authoritative data lives in the dedicated
-/// `deprecation_reason`, `specified_by_url` and `one_of` fields. The SDL printer reads those
-/// fields, so a built-in application is never printed twice.
+/// `deprecation_reason`, `specified_by_url` and `one_of` fields.
+/// [`SchemaBuilder`](crate::SchemaBuilder) copies a code-first application into those fields as
+/// well, and the SDL printer reads the fields, so a built-in application is never lost or printed
+/// twice.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppliedDirective {
     /// The directive's name without `@`.
@@ -485,10 +493,16 @@ impl ScalarType {
             .description("The `Int` scalar type represents non-fractional signed whole numeric values. Int can represent values between -(2^31) and 2^31 - 1.")
             .serialize(|value| match value {
                 Value::Int(value) => Ok(Value::Int(*value)),
+                Value::BigInt(value) => i32::try_from(**value)
+                    .map(Value::Int)
+                    .map_err(|_| "Int cannot represent non 32-bit signed integer value".into()),
                 _ => Err(format!("Int cannot represent a value of type {}", value.kind())),
             })
             .parse_value(|value| match value {
                 Value::Int(value) => Ok(Value::Int(*value)),
+                Value::BigInt(value) => i32::try_from(**value)
+                    .map(Value::Int)
+                    .map_err(|_| "Int cannot represent non 32-bit signed integer value".into()),
                 _ => Err(format!("Int cannot represent a value of type {}", value.kind())),
             })
             .parse_literal(|value| match value {
@@ -508,12 +522,14 @@ impl ScalarType {
             .serialize(|value| match value {
                 Value::Float(value) if value.is_finite() => Ok(Value::Float(*value)),
                 Value::Int(value) => Ok(Value::Float(f64::from(*value))),
+                Value::BigInt(value) => Ok(Value::Float(**value as f64)),
                 Value::Float(_) => Err("Float cannot represent a non-finite value".into()),
                 _ => Err(format!("Float cannot represent a value of type {}", value.kind())),
             })
             .parse_value(|value| match value {
                 Value::Float(value) if value.is_finite() => Ok(Value::Float(*value)),
                 Value::Int(value) => Ok(Value::Float(f64::from(*value))),
+                Value::BigInt(value) => Ok(Value::Float(**value as f64)),
                 Value::Float(_) => Err("Float cannot represent a non-finite value".into()),
                 _ => Err(format!("Float cannot represent a value of type {}", value.kind())),
             })
@@ -562,11 +578,13 @@ impl ScalarType {
             .serialize(|value| match value {
                 Value::String(value) | Value::Enum(value) => Ok(Value::String(value.clone())),
                 Value::Int(value) => Ok(Value::String(Arc::from(value.to_string()))),
+                Value::BigInt(value) => Ok(Value::String(Arc::from(value.to_string()))),
                 _ => Err(format!("ID cannot represent a value of type {}", value.kind())),
             })
             .parse_value(|value| match value {
                 Value::String(value) | Value::Enum(value) => Ok(Value::String(value.clone())),
                 Value::Int(value) => Ok(Value::String(Arc::from(value.to_string()))),
+                Value::BigInt(value) => Ok(Value::String(Arc::from(value.to_string()))),
                 _ => Err(format!("ID cannot represent a value of type {}", value.kind())),
             })
             .parse_literal(|value| match value {
@@ -597,6 +615,10 @@ impl ScalarType {
 }
 
 /// One value of an enum type.
+///
+/// This is `PartialEq` but not `Eq`, because [`Self::directives`] holds [`Value`]s and
+/// [`Value::Float`] contains an `f64`. Equality is therefore the usual IEEE-754 comparison
+/// (`NaN != NaN`) and cannot honestly implement `Eq`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EnumValue {
     /// The value's name.
@@ -1490,6 +1512,12 @@ pub struct DirectiveDefinition {
     pub locations: Vec<ast::DirectiveLocation>,
     /// Whether the directive may be repeated in a single location.
     pub repeatable: bool,
+    /// Directives applied to the definition itself, in application order.
+    ///
+    /// `@deprecated` is also recorded here; its authoritative reason lives in
+    /// `deprecation_reason`. The SDL printer reads that field and skips the dedicated directive,
+    /// so an application is never printed twice.
+    pub directives: Vec<AppliedDirective>,
     /// Why the directive is deprecated, when it is.
     pub deprecation_reason: Option<Arc<str>>,
     /// Duplicate argument names encountered while building, reported by schema validation.
@@ -1506,6 +1534,7 @@ impl DirectiveDefinition {
             args: IndexMap::new(),
             locations: Vec::new(),
             repeatable: false,
+            directives: Vec::new(),
             deprecation_reason: None,
             duplicate_args: Vec::new(),
         }
@@ -1539,6 +1568,13 @@ impl DirectiveDefinition {
     #[must_use]
     pub fn repeatable(mut self) -> Self {
         self.repeatable = true;
+        self
+    }
+
+    /// Add an applied directive to the definition itself.
+    #[must_use]
+    pub fn directive(mut self, directive: AppliedDirective) -> Self {
+        self.directives.push(directive);
         self
     }
 
