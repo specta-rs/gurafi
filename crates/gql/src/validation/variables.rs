@@ -208,9 +208,10 @@ fn collect_selection_usages<'a>(
     for selection in &selection_set.items {
         match selection {
             Selection::Field(field) => {
-                collect_field_usages(schema, options, parent, field, out);
+                // One context per field: its arguments and its child selection set both need it.
+                let context = field_context(schema, options, parent, field);
+                collect_field_usages(schema, &context, field, out);
                 if let Some(child_set) = &field.selection_set {
-                    let context = field_context(schema, options, parent, field);
                     let child = context
                         .return_type
                         .as_ref()
@@ -278,14 +279,12 @@ fn collect_inline_usages<'a>(
 
 fn collect_field_usages<'a>(
     schema: &'a Schema,
-    options: &ValidationOptions,
-    parent: Option<&'a Type>,
+    context: &crate::validation::visitor::FieldContext<'a>,
     field: &'a Field<'a>,
     out: &mut Usages<'a>,
 ) {
-    let context = field_context(schema, options, parent, field);
     for argument in &field.arguments {
-        match field_argument_info(&context, argument.name) {
+        match field_argument_info(context, argument.name) {
             Some(info) => collect_value_usages(
                 schema,
                 &argument.value,

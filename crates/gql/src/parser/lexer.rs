@@ -738,10 +738,24 @@ fn is_name_start_byte(byte: u8) -> bool {
 }
 
 /// Whether a byte may continue a name.
+///
+/// A table replaces the two range checks the predicate would otherwise do per byte, and names are
+/// scanned for every token in a document.
 #[inline]
 fn is_name_continue_byte(byte: u8) -> bool {
-    byte == b'_' || byte.is_ascii_alphanumeric()
+    NAME_CONTINUE[byte as usize]
 }
+
+/// Which bytes may continue a name, indexed by byte value.
+static NAME_CONTINUE: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut byte = 0usize;
+    while byte < 256 {
+        table[byte] = matches!(byte as u8, b'_' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z');
+        byte += 1;
+    }
+    table
+};
 
 /// The class of an ignored byte, used to skip whitespace runs in one step.
 const IGNORED_NONE: u8 = 0;
@@ -753,15 +767,21 @@ const IGNORED_COMMENT: u8 = 4;
 
 /// Classify one byte for [`Lexer::skip_ignored`].
 #[inline]
-const fn ignored_class(byte: u8) -> u8 {
-    match byte {
-        b' ' | b'\t' | b',' => IGNORED_PLAIN,
-        b'\n' => IGNORED_NEWLINE,
-        b'\r' => IGNORED_CARRIAGE_RETURN,
-        b'#' => IGNORED_COMMENT,
-        _ => IGNORED_NONE,
-    }
+fn ignored_class(byte: u8) -> u8 {
+    IGNORED_CLASS[byte as usize]
 }
+
+/// The ignored-character class of every byte value.
+static IGNORED_CLASS: [u8; 256] = {
+    let mut table = [IGNORED_NONE; 256];
+    table[b' ' as usize] = IGNORED_PLAIN;
+    table[b'\t' as usize] = IGNORED_PLAIN;
+    table[b',' as usize] = IGNORED_PLAIN;
+    table[b'\n' as usize] = IGNORED_NEWLINE;
+    table[b'\r' as usize] = IGNORED_CARRIAGE_RETURN;
+    table[b'#' as usize] = IGNORED_COMMENT;
+    table
+};
 
 /// Render a code point the way the reference implementation does in messages.
 fn print_code_point(ch: char) -> String {

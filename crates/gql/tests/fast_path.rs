@@ -514,3 +514,147 @@ fn deeply_nested_default_objects_stay_within_a_small_stack() {
         .join()
         .expect("join");
 }
+
+/// A schema whose objects mix built-in scalar properties, an aliased scalar, and scalars that
+/// need the registered serializer to convert the value (`ID` from an integer, `Float` from an
+/// integer) or to reject a wrong shape.
+fn scalar_schema(extra: impl FnOnce(&mut gql::SchemaBuilder)) -> Schema {
+    let thing = ObjectType::new("Thing")
+        .field(Field::new("text", TypeRef::string().non_null()))
+        .field(Field::new("count", TypeRef::int()))
+        .field(Field::new("ratio", TypeRef::float()))
+        .field(Field::new("id", TypeRef::id().non_null()))
+        .field(Field::new("flag", TypeRef::boolean().non_null()));
+
+    let root = ObjectType::new("Query")
+        .field(
+            Field::new("thing", TypeRef::named("Thing").non_null()).resolve(|_| {
+                Box::pin(async {
+                    Ok(Value::object(Object::from_fields([
+                        // `ID` from an integer and `Float` from an integer must both be converted
+                        // by the scalar's serializer, not passed through.
+                        ("id", Value::Int(7)),
+                        ("ratio", Value::Int(3)),
+                        ("text", Value::from("hello")),
+                        ("flag", Value::Boolean(true)),
+                    ])))
+                })
+            }),
+        )
+        .field(
+            Field::new("broken", TypeRef::named("Thing").non_null()).resolve(|_| {
+                Box::pin(async {
+                    Ok(Value::object(Object::from_fields([
+                        ("id", Value::from("1")),
+                        ("text", Value::Int(1)),
+                        ("flag", Value::Boolean(false)),
+                    ])))
+                })
+            }),
+        );
+
+    let mut builder = Schema::builder();
+    builder.add_type(thing.into());
+    builder.add_type(root.into());
+    extra(&mut builder);
+    builder.query("Query").build().expect("valid schema")
+}
+
+#[test]
+fn builtin_scalar_properties_complete_and_still_convert() {
+    let schema = scalar_schema(|_| {});
+    let response = run(&schema, "{ thing { text count ratio id flag } }");
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let thing = response
+        .data
+        .as_ref()
+        .and_then(|data| data.as_object())
+        .and_then(|data| data.get("thing"))
+        .and_then(Value::as_object)
+        .expect("thing");
+
+    assert_eq!(thing.get("text").and_then(Value::as_str), Some("hello"));
+    // A property that is absent from the parent stays `null` for a nullable field.
+    assert_eq!(thing.get("count"), Some(&Value::Null));
+    // The serializers for `ID` and `Float` still run: both convert an integer.
+    assert_eq!(thing.get("id").and_then(Value::as_str), Some("7"));
+    assert_eq!(thing.get("ratio").and_then(Value::as_f64), Some(3.0));
+    assert_eq!(thing.get("flag").and_then(Value::as_bool), Some(true));
+}
+
+#[test]
+fn an_aliased_scalar_uses_its_alias_as_the_response_key() {
+    let schema = scalar_schema(|_| {});
+    let response = run(&schema, "{ thing { label: text } }");
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let thing = response
+        .data
+        .as_ref()
+        .and_then(|data| data.as_object())
+        .and_then(|data| data.get("thing"))
+        .and_then(Value::as_object)
+        .expect("thing");
+    assert_eq!(thing.get("label").and_then(Value::as_str), Some("hello"));
+    assert!(thing.get("text").is_none());
+}
+
+#[test]
+fn a_builtin_scalar_of_the_wrong_shape_still_reports_the_serializer_error() {
+    let schema = scalar_schema(|_| {});
+    let response = run(&schema, "{ broken { text } }");
+    assert_eq!(response.errors.len(), 1, "{:?}", response.errors);
+    let error = &response.errors[0];
+    assert_eq!(
+        error.message(),
+        "Field Thing.text could not be serialized: String cannot represent a value of type number"
+    );
+    // `text` and `broken` are both non-null, so the failure bubbles to the root data entry.
+    assert_eq!(response.data, Some(Value::Null));
+    let path: Vec<String> = error
+        .path()
+        .expect("path")
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(path, ["broken", "text"]);
+    assert_eq!(error.locations().len(), 1);
+}
+
+#[test]
+fn a_custom_scalar_still_runs_its_serializer() {
+    let mut builder = Schema::builder();
+    builder.add_type(
+        ScalarType::new("Weird")
+            .serialize(|value| Ok(Value::String(Arc::from(format!("custom:{value}")))))
+            .into(),
+    );
+    let holder =
+        ObjectType::new("Holder").field(Field::new("value", TypeRef::named("Weird").non_null()));
+    let root = ObjectType::new("Query").field(
+        Field::new("holder", TypeRef::named("Holder").non_null()).resolve(|_| {
+            Box::pin(async {
+                Ok(Value::object(Object::from_fields([(
+                    "value",
+                    Value::Boolean(false),
+                )])))
+            })
+        }),
+    );
+    builder.add_type(holder.into());
+    builder.add_type(root.into());
+    let schema = builder.query("Query").build().expect("valid schema");
+
+    let response = run(&schema, "{ holder { value } }");
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let holder = response
+        .data
+        .as_ref()
+        .and_then(|data| data.as_object())
+        .and_then(|data| data.get("holder"))
+        .and_then(Value::as_object)
+        .expect("holder");
+    assert_eq!(
+        holder.get("value").and_then(Value::as_str),
+        Some("custom:false")
+    );
+}

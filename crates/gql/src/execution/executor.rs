@@ -1851,6 +1851,19 @@ impl<'doc> Executor<'doc> {
                         .with_path(path.to_vec()),
                 );
             }
+            // A property of a built-in scalar type is the single most common field in a response,
+            // and it cannot fail: no resolver, no arguments, no sub-selection and a value that
+            // already has the scalar's shape. Handling it here skips the path bookkeeping and the
+            // general completion path entirely; every other case falls through unchanged.
+            if let Some(field) = *field {
+                if nodes.first().is_some_and(|first| first.alias.is_none()) {
+                    if let Some((key, value)) = self.scalar_property(field, parent) {
+                        object.push_unchecked(key, value);
+                        index += 1;
+                        continue;
+                    }
+                }
+            }
             let Some((response_key, outcome)) = self.execute_field_sync(
                 object_type,
                 parent,
@@ -1867,6 +1880,31 @@ impl<'doc> Executor<'doc> {
             index += 1;
         }
         Ok(Ok(result))
+    }
+
+    /// Complete an unaliased built-in scalar property, when the field is one.
+    ///
+    /// Returns `None` for every construct that could observe more than the value itself (a
+    /// resolver, arguments, an authorizer, a custom scalar, a missing property or a value of the
+    /// wrong shape), so the caller's general path keeps its exact behaviour.
+    fn scalar_property(
+        &self,
+        field: &crate::types::Field,
+        parent: &Value,
+    ) -> Option<(Arc<str>, Value)> {
+        if field.resolve.is_some() || !field.args.is_empty() || self.context.authorizer.is_some() {
+            return None;
+        }
+        let definition = self.context.schema.type_at(field.type_index?)?;
+        let Type::Scalar(scalar) = definition else {
+            return None;
+        };
+        let Value::Object(parent_object) = parent else {
+            return None;
+        };
+        let value = parent_object.get(field.name.as_ref())?;
+        let serialized = builtin_scalar_passthrough(scalar, value)?;
+        Some((field.name.clone(), serialized))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2080,6 +2118,17 @@ impl<'doc> Executor<'doc> {
             );
         }
         match (definition, current) {
+            // The built-in scalars are the overwhelming majority of leaves, and their value needs
+            // no work beyond the clone, so the common answer is returned without entering the
+            // general leaf path (which re-checks for null before deciding).
+            (Type::Scalar(scalar), TypeRef::Named(_)) if scalar.builtin => {
+                match builtin_scalar_passthrough(scalar, value) {
+                    Some(serialized) => Some(Ok(serialized)),
+                    None => self.complete_leaf_definition(
+                        value, definition, non_null, label, location, path, true,
+                    ),
+                }
+            }
             (Type::Scalar(_) | Type::Enum(_), TypeRef::Named(_)) => self
                 .complete_leaf_definition(value, definition, non_null, label, location, path, true),
             (Type::Object(object), TypeRef::Named(_)) => self.complete_object_sync(
@@ -2890,11 +2939,24 @@ fn builtin_scalar_passthrough(scalar: &ScalarType, value: &Value) -> Option<Valu
     if !scalar.builtin {
         return None;
     }
-    let matches = match (scalar.name.as_ref(), value) {
-        ("String" | "ID", Value::String(_)) => true,
-        ("Int", Value::Int(_)) => true,
-        ("Boolean", Value::Boolean(_)) => true,
-        ("Float", Value::Float(number)) => number.is_finite(),
+    // The scalar is identified by its name's length and first byte before the bytes are compared:
+    // string equality against a literal compiles to a `memcmp` call, and this runs for every
+    // scalar leaf in a response.
+    let name = scalar.name.as_ref();
+    let matches = match (name.len(), name.as_bytes().first()) {
+        (6, Some(b'S')) if crate::types::names_eq(name, "String") => {
+            matches!(value, Value::String(_))
+        }
+        (2, Some(b'I')) if crate::types::names_eq(name, "ID") => {
+            matches!(value, Value::String(_))
+        }
+        (3, Some(b'I')) if crate::types::names_eq(name, "Int") => matches!(value, Value::Int(_)),
+        (7, Some(b'B')) if crate::types::names_eq(name, "Boolean") => {
+            matches!(value, Value::Boolean(_))
+        }
+        (5, Some(b'F')) if crate::types::names_eq(name, "Float") => {
+            matches!(value, Value::Float(number) if number.is_finite())
+        }
         _ => false,
     };
     matches.then(|| value.clone())
