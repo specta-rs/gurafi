@@ -28,9 +28,6 @@ fn rejects_duplicate_type_names() {
 
 #[test]
 fn rejects_duplicate_fields() {
-    let mut object = ObjectType::new("Query");
-    object = object.field(string_field("a"));
-    object = object.field(string_field("a"));
     // Build an object with the duplicate fields directly, then add it.
     let mut object = ObjectType::new("Query");
     object = object.field(string_field("a"));

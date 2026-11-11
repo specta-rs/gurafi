@@ -13,7 +13,6 @@ documentation.
 | [`gurafi`](crates/gurafi) | An intuitive, type-safe, code-first GraphQL schema builder built on `gql`. Rust types drive the GraphQL type system; `gurafi` only adds developer experience. |
 | [`gurafi-macros`](crates/gurafi-macros) | Procedural macros for `gurafi` (`Object`, `Input`, `Args`, `Enum`, `Scalar`, `Union`, `ErrorUnion`). |
 | [`suku`](crates/suku) | A production GraphQL-over-HTTP server for a `gql::Schema`, with batching, SSE subscriptions, error masking and pluggable authentication. |
-| [`shiri`](crates/shiri) | Serde-compatible serialization experiments. Not part of the GraphQL stack. |
 
 The layers are deliberately decoupled:
 
@@ -156,7 +155,7 @@ is refused:
 | Environment | `release` |
 
 The workflow publishes the whole workspace, so each of these crates needs its
-own trusted publisher: `gurafi`, `gql`, `gurafi-macros`, `gurafi-relay`, `suku` and `shiri`.
+own trusted publisher: `gurafi`, `gql`, `gurafi-macros`, `gurafi-relay` and `suku`.
 The trusted publisher and "Require trusted publishing" setting are already configured for this
 repository; repeat the setup only when adding a new crate.
 Examples are `publish = false` and are skipped.

@@ -82,17 +82,6 @@ pub(crate) fn types() -> Vec<Type> {
     ]
 }
 
-/// Whether a value is an introspection descriptor.
-///
-/// The executor resolves abstract types from [`TYPENAME_KEY`] directly; this helper is kept for
-/// callers that need a cheap descriptor check.
-#[allow(dead_code)]
-pub(crate) fn is_descriptor(value: &Value) -> bool {
-    value
-        .as_object()
-        .is_some_and(|object| object.contains_key(TYPENAME_KEY))
-}
-
 /// Resolve one of the meta-fields which are not part of the schema's type map:
 /// `__schema` and `__type` on the query root, and `__typename` anywhere.
 ///
