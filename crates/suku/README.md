@@ -28,10 +28,10 @@ Turn off a default feature with `default-features = false`:
 
 ```toml
 # Axum with SSE subscriptions and uploads, but no WebSocket endpoint.
-suku = { version = "0.1.1", default-features = false, features = ["axum", "multipart"] }
+suku = { version = "0.1.2", default-features = false, features = ["axum", "multipart"] }
 
 # Axum and WebSockets, but no multipart parser.
-suku = { version = "0.1.1", default-features = false, features = ["axum", "ws"] }
+suku = { version = "0.1.2", default-features = false, features = ["axum", "ws"] }
 ```
 
 At runtime, `GraphQL::websocket(false)` disables upgrades on one mount without rebuilding. With
@@ -434,7 +434,7 @@ content security policy should not allow a CDN:
 
 ```toml
 [dependencies]
-suku = { version = "0.1.1", features = ["vendored-graphiql"] }
+suku = { version = "0.1.2", features = ["vendored-graphiql"] }
 ```
 
 With the feature enabled, `suku` builds a self-contained GraphiQL page at compile time from the
@@ -491,7 +491,7 @@ followed by the parser/executor tree:
 
 ```toml
 [dependencies]
-suku = { version = "0.1.1", features = ["tracing"] }
+suku = { version = "0.1.2", features = ["tracing"] }
 ```
 
 `suku.request` is INFO and records method, path, body size, operation, request id, batch size and

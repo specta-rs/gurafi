@@ -11,10 +11,10 @@ repository = "https://github.com/specta-rs/gurafi"
 
 [workspace.dependencies]
 # First-party crates, these always resolve to the local implementation.
-gql = { path = "crates/gql", version = "0.3.1" }
-gurafi = { path = "crates/gurafi", version = "0.1.1" }
-gurafi-macros = { path = "crates/gurafi-macros", version = "0.1.1" }
-suku = { path = "crates/suku", version = "0.1.1" }
+gql = { path = "crates/gql", version = "0.3.2" }
+gurafi = { path = "crates/gurafi", version = "0.1.2" }
+gurafi-macros = { path = "crates/gurafi-macros", version = "0.1.2" }
+suku = { path = "crates/suku", version = "0.1.2" }
 
 # External dependencies
 axum = "0.8.4"

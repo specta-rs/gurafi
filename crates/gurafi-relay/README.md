@@ -317,7 +317,7 @@ MutationConfig::new().client_mutation_id(ClientMutationId::Required);
 
 ```toml
 [dependencies]
-gurafi-relay = { version = "0.1.1", features = ["tracing"] }
+gurafi-relay = { version = "0.1.2", features = ["tracing"] }
 ```
 
 It adds DEBUG spans for `relay.node`, `relay.nodes`, `relay.connection.page` and

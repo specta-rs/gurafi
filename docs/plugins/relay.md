@@ -11,8 +11,8 @@ It is a thin layer over public `gurafi` APIs and has no async-runtime dependency
 
 ```toml
 [dependencies]
-gurafi = "0.1.1"
-gurafi-relay = "0.1.1"
+gurafi = "0.1.2"
+gurafi-relay = "0.1.2"
 ```
 
 ## Global IDs

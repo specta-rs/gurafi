@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "gql"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "futures",
  "indexmap",
@@ -316,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "gurafi"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "futures",
  "gql",
@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "gurafi-macros"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -337,7 +337,7 @@ dependencies = [
 
 [[package]]
 name = "gurafi-relay"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "futures",
  "gurafi",
@@ -761,7 +761,7 @@ checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 
 [[package]]
 name = "suku"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "bytes",
