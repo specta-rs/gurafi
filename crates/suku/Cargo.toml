@@ -9,8 +9,13 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["axum"]
-axum = ["dep:axum", "dep:tokio"]
+default = ["axum", "ws", "multipart"]
+axum = ["dep:axum", "dep:tokio", "tokio/sync", "tokio/time"]
+# WebSocket subscriptions use the `graphql-transport-ws` protocol. Enabled by default through the
+# feature list above; build with `default-features = false` and without `ws` to omit it.
+ws = ["axum", "axum/ws"]
+# GraphQL multipart requests (file uploads). Enabled by default; disable it to remove `multer`.
+multipart = ["dep:multer"]
 tracing = ["dep:tracing", "gql/tracing"]
 
 [dependencies]
@@ -23,6 +28,7 @@ tracing = { workspace = true, optional = true }
 http.workspace = true
 bytes = "1.6"
 serde_urlencoded = "0.7"
+multer = { version = "3.1", optional = true }
 
 axum = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
@@ -30,4 +36,5 @@ tokio = { workspace = true, optional = true }
 [dev-dependencies]
 tracing-core = "0.1.36"
 tokio.workspace = true
+tokio-tungstenite = "0.29"
 tower = { version = "0.5", features = ["util"] }

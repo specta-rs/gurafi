@@ -20,6 +20,7 @@ fn request_serializes_operation_name_as_camel_case() {
                 .expect("object"),
         ),
         extensions: None,
+        uploads: Vec::new(),
     };
 
     let json = serde_json::to_value(&request).expect("serialize");

@@ -57,6 +57,7 @@ mod sdl;
 mod sdl_schema;
 mod telemetry;
 mod types;
+mod upload;
 pub mod validation;
 mod value;
 
@@ -82,6 +83,7 @@ pub use types::{
     ResolveInfo, ResolveTypeFn, ResolverContext, ScalarType, SubscribeFn, SubscriptionStream, Type,
     TypeKind, TypeRef, UnionType,
 };
+pub use upload::Upload;
 pub use validation::{ValidationOptions, validate};
 pub use value::{External, Object, Value};
 
