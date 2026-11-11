@@ -97,6 +97,9 @@
 //! resolved, null and error counts, cache hits, loader calls, page-info flags and edge counts;
 //! local-ID and cursor values are never recorded. See the repository's `docs/plugins/tracing.md`.
 
+#![doc(
+    html_favicon_url = "https://raw.githubusercontent.com/specta-rs/gurafi/main/docs/favicon.svg"
+)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 

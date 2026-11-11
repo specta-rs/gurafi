@@ -63,6 +63,9 @@
 //! spans are DEBUG and collection spans are TRACE. See the repository's
 //! `docs/plugins/tracing.md` for the span tree.
 
+#![doc(
+    html_favicon_url = "https://raw.githubusercontent.com/specta-rs/gurafi/main/docs/favicon.svg"
+)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
 #![forbid(unsafe_code)]
