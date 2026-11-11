@@ -72,32 +72,17 @@ the [`axum` example](examples/axum).
 
 ## Documentation
 
-The README is an overview. The full documentation lives in [`docs/`](docs/README.md), covering
-installation, the type system, plugins, schema evolution and serving.
-
-- [Getting started](docs/guide/getting-started.md)
-- [Architecture](docs/architecture.md)
-- [Objects](docs/guide/objects.md), [fields](docs/guide/fields.md), [arguments](docs/guide/args.md) and [context](docs/guide/context.md)
-- [Plugins](docs/plugins) — Relay, dataloaders, tracing, typed errors, validation, complexity and mocks
-- [Serving over HTTP with `suku`](docs/server/suku.md)
-- [Examples](examples)
-
-API reference is on [docs.rs](https://docs.rs/gurafi).
-
-## Credits
-
-<div align="center">
-
-Inspired by [Pothos GraphQL](https://pothos-graphql.dev)'s
-[backing model approach](https://pothos-graphql.dev/docs/guide/schema-builder#backing-models).
-
-Created with the help of [Brendonovich](https://github.com/Brendonovich).
-
-</div>
+The README is an overview. The full documentation lives on the
+[Specta website](https://specta.dev/docs/gurafi), covering installation, the type system, plugins,
+schema evolution and serving. API reference is on [docs.rs](https://docs.rs/gurafi), and runnable
+code is in [`examples`](examples).
 
 ## Contributing
 
 Development and release instructions are in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Thanks to [Brendonovich](https://github.com/Brendonovich) for shaping some of the original ideas
+for the syntax.
 
 ## License
 
