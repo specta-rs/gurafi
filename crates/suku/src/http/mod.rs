@@ -387,20 +387,117 @@ where
     let accept = accept::parse(&parts.headers);
     let result = match parts.method {
         Method::GET => handle_get(server, config, parts, &accept, extract_context).await,
-        Method::POST => handle_post(server, config, parts, body, &accept, extract_context).await,
+        Method::POST => {
+            handle_post(
+                server,
+                config,
+                parts,
+                HttpBody::Borrowed(body),
+                &accept,
+                extract_context,
+            )
+            .await
+        }
         _ => HttpResult::Response(method_not_allowed(server)),
     };
-    #[cfg(feature = "tracing")]
-    {
-        let span = tracing::Span::current();
-        if !span.is_disabled() {
-            let status = match &result {
-                HttpResult::Response(response) => response.status,
-                HttpResult::Stream(_) => StatusCode::OK,
-            };
-            span.record("status", status.as_u16());
+    record_status(&result);
+    result
+}
+
+/// A request body that is either borrowed from the caller or already owned as [`Bytes`].
+///
+/// The public [`handle`] receives a slice and never copies it; the Axum adapter already owns the
+/// body as `Bytes`. A multipart request needs an owned buffer, so only that path copies (and only
+/// when it was borrowed).
+pub(crate) enum HttpBody<'a> {
+    Borrowed(&'a [u8]),
+    #[cfg(feature = "axum")]
+    Owned(Bytes),
+}
+
+impl HttpBody<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(body) => body,
+            #[cfg(feature = "axum")]
+            Self::Owned(body) => body,
         }
     }
+
+    #[cfg(feature = "multipart")]
+    fn into_bytes(self) -> Bytes {
+        match self {
+            Self::Borrowed(body) => Bytes::copy_from_slice(body),
+            #[cfg(feature = "axum")]
+            Self::Owned(body) => body,
+        }
+    }
+}
+
+#[cfg(feature = "tracing")]
+fn record_status(result: &HttpResult) {
+    let span = tracing::Span::current();
+    if !span.is_disabled() {
+        let status = match result {
+            HttpResult::Response(response) => response.status,
+            HttpResult::Stream(_) => StatusCode::OK,
+        };
+        span.record("status", status.as_u16());
+    }
+}
+
+#[cfg(not(feature = "tracing"))]
+fn record_status(_result: &HttpResult) {}
+
+/// [`handle`] for a caller that already owns the body as [`Bytes`].
+///
+/// The Axum adapter reads the body into `Bytes`, so taking it here instead of a slice lets a
+/// multipart request hand the same buffer to the parser; a slice would have to be copied first.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        skip_all,
+        level = "info",
+        name = "suku.request",
+        fields(
+            method = %parts.method,
+            path = parts.uri.path(),
+            body_bytes = body.len(),
+            request_id = tracing::field::Empty,
+            batch_size = tracing::field::Empty,
+            status = tracing::field::Empty,
+        )
+    )
+)]
+#[cfg(feature = "axum")]
+pub(crate) async fn handle_bytes<F, Fut>(
+    server: &Server,
+    config: &HttpConfig,
+    parts: &::http::request::Parts,
+    body: Bytes,
+    extract_context: F,
+) -> HttpResult
+where
+    F: FnOnce(ContextRequest) -> Fut + Send,
+    Fut: Future<Output = Result<Context, HttpError>> + Send,
+{
+    let accept = accept::parse(&parts.headers);
+    let result = match parts.method {
+        Method::GET => handle_get(server, config, parts, &accept, extract_context).await,
+        Method::POST => {
+            handle_post(
+                server,
+                config,
+                parts,
+                HttpBody::Owned(body),
+                &accept,
+                extract_context,
+            )
+            .await
+        }
+        _ => HttpResult::Response(method_not_allowed(server)),
+    };
+    record_status(&result);
     result
 }
 
@@ -511,7 +608,7 @@ async fn handle_post<F, Fut>(
     server: &Server,
     config: &HttpConfig,
     parts: &::http::request::Parts,
-    body: &[u8],
+    body: HttpBody<'_>,
     accept: &Accept,
     extract_context: F,
 ) -> HttpResult
@@ -539,7 +636,7 @@ where
     let max_body_bytes = config
         .max_body_bytes
         .unwrap_or_else(|| server.max_body_bytes_limit());
-    if max_body_bytes != 0 && body.len() > max_body_bytes {
+    if max_body_bytes != 0 && body.as_slice().len() > max_body_bytes {
         return request_error(
             server,
             accept,
@@ -565,12 +662,13 @@ where
         let content_type = content_type
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
-        crate::multipart::parse(content_type, body, max_parts, max_batch_size).await
+        crate::multipart::parse_bytes(content_type, body.into_bytes(), max_parts, max_batch_size)
+            .await
     } else {
-        RequestPayload::from_json_slice(body, max_batch_size)
+        RequestPayload::from_json_slice(body.as_slice(), max_batch_size)
     };
     #[cfg(not(feature = "multipart"))]
-    let payload = RequestPayload::from_json_slice(body, max_batch_size);
+    let payload = RequestPayload::from_json_slice(body.as_slice(), max_batch_size);
 
     let mut payload = match payload {
         Ok(payload) => payload,
@@ -787,13 +885,11 @@ fn json_response(status: StatusCode, accept: &Accept, response: &Response) -> Ht
     )
 )]
 fn json_batch_response(accept: &Accept, responses: &[Response]) -> HttpResponse {
-    // Serialize each response independently so one malformed value cannot turn the whole batch
-    // into an opaque error.
-    let values: Vec<serde_json::Value> = responses
-        .iter()
-        .map(|response| response.to_json())
-        .collect();
-    let body = match serde_json::to_vec(&values) {
+    // Serialize the slice directly: building a `serde_json::Value` per response first would
+    // allocate a map, its keys and the whole value tree only to serialize it again. A response
+    // that cannot be serialized (an opaque model value reached the response) still replaces the
+    // body with the fallback error instead of producing a partial batch.
+    let body = match serde_json::to_vec(&responses) {
         Ok(body) => body,
         Err(error) => crate::response::error_json_bytes(format!(
             "Failed to serialize the GraphQL batch response: {error}"

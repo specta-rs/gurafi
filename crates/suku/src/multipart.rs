@@ -19,10 +19,7 @@
 //!
 //! [spec]: https://github.com/jaydenseric/graphql-multipart-request-spec
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use bytes::Bytes;
 use futures::stream;
@@ -52,10 +49,28 @@ pub async fn parse(
     max_parts: usize,
     max_batch_size: usize,
 ) -> Result<RequestPayload, RequestError> {
+    parse_bytes(
+        content_type,
+        Bytes::copy_from_slice(body),
+        max_parts,
+        max_batch_size,
+    )
+    .await
+}
+
+/// [`parse`] for an owned body.
+///
+/// The Axum adapter already holds the body as [`Bytes`]; taking it here avoids copying the whole
+/// request a second time just to hand it to the multipart parser.
+pub(crate) async fn parse_bytes(
+    content_type: &str,
+    body: Bytes,
+    max_parts: usize,
+    max_batch_size: usize,
+) -> Result<RequestPayload, RequestError> {
     let boundary = multer::parse_boundary(content_type)
         .map_err(|error| invalid(format!("invalid multipart content type: {error}")))?;
 
-    let body = Bytes::copy_from_slice(body);
     let stream = stream::once(async move { Ok::<Bytes, std::io::Error>(body) });
     let mut multipart = Multipart::new(stream, boundary);
 
@@ -76,13 +91,10 @@ pub async fn parse(
             )));
         }
 
-        let name = field
-            .name()
-            .map(str::to_owned)
-            .ok_or_else(|| invalid("every multipart part must have a field name"))?;
-
-        match name.as_str() {
-            "operations" => {
+        // Match the name as a borrow: only a file part needs to own it, and the two control
+        // fields (`operations`, `map`) are on every request.
+        match field.name() {
+            Some("operations") => {
                 if operations.is_some() {
                     return Err(invalid("the `operations` field appears more than once"));
                 }
@@ -117,7 +129,7 @@ pub async fn parse(
                 }
                 operations = Some(value);
             }
-            "map" => {
+            Some("map") => {
                 if map.is_some() {
                     return Err(invalid("the `map` field appears more than once"));
                 }
@@ -133,7 +145,9 @@ pub async fn parse(
                     .map_err(|error| invalid(format!("could not read `map`: {error}")))?;
                 map = Some(parse_map(&text, operations)?);
             }
-            _ => {
+            Some(name) => {
+                // `field` is moved by `bytes()`, so the name has to be owned before that.
+                let name = name.to_owned();
                 let Some(map) = map.as_ref() else {
                     return Err(invalid(
                         "file fields must follow the `operations` and `map` fields",
@@ -149,23 +163,26 @@ pub async fn parse(
                         "file field \"{name}\" appears more than once"
                     )));
                 }
+                // The shared metadata is built straight into an `Arc<str>`; going through
+                // `String` first would allocate and copy each of these twice.
                 let filename = field
                     .file_name()
-                    .map(str::to_owned)
+                    .map(Arc::<str>::from)
                     .ok_or_else(|| invalid(format!("field \"{name}\" must be a file")))?;
-                let content_type = field.content_type().map(ToString::to_string);
+                let content_type = field
+                    .content_type()
+                    .map(|mime| Arc::<str>::from(mime.as_ref()));
                 let bytes = field
                     .bytes()
                     .await
                     .map_err(|error| invalid(format!("could not read file \"{name}\": {error}")))?;
                 files.insert(
                     name,
-                    Upload::from_parts(
-                        Some(Arc::from(filename)),
-                        content_type.map(Arc::from),
-                        Arc::from(bytes.as_ref()),
-                    ),
+                    Upload::from_parts(Some(filename), content_type, Arc::from(bytes.as_ref())),
                 );
+            }
+            None => {
+                return Err(invalid("every multipart part must have a field name"));
             }
         }
     }
@@ -187,22 +204,20 @@ pub async fn parse(
     }
 
     let (mut requests, batch) = into_requests(operations)?;
-    for (name, paths) in map {
+    for (name, mut paths) in map {
         let upload = files
             .remove(&name)
             .ok_or_else(|| invalid(format!("no file was provided for map entry \"{name}\"")))?;
+        // `parse_map` rejects an entry with no paths, so this is always `Some`.
+        let Some(last) = paths.pop() else {
+            continue;
+        };
+        // Clone the shared upload only while another binding still needs it; the final path
+        // takes ownership.
         for path in paths {
-            let request_count = requests.len();
-            let request = requests.get_mut(path.request_index).ok_or_else(|| {
-                invalid(format!(
-                    "map entry \"{name}\" refers to batch index {}, but the batch has {request_count} requests",
-                    path.request_index
-                ))
-            })?;
-            request
-                .uploads
-                .push(UploadBinding::new(path.relative, upload.clone()));
+            bind(&mut requests, path, upload.clone(), &name)?;
         }
+        bind(&mut requests, last, upload, &name)?;
     }
 
     Ok(if batch {
@@ -214,6 +229,26 @@ pub async fn parse(
                 .ok_or_else(|| invalid("missing the `operations` field"))?,
         )
     })
+}
+
+/// Attach one upload to the request's variables path, or report an out-of-range batch index.
+fn bind(
+    requests: &mut [GraphQLRequest],
+    path: MappedPath,
+    upload: Upload,
+    name: &str,
+) -> Result<(), RequestError> {
+    let request_count = requests.len();
+    let request = requests.get_mut(path.request_index).ok_or_else(|| {
+        invalid(format!(
+            "map entry \"{name}\" refers to batch index {}, but the batch has {request_count} requests",
+            path.request_index
+        ))
+    })?;
+    request
+        .uploads
+        .push(UploadBinding::new(path.relative, upload));
+    Ok(())
 }
 
 /// A file's destination inside one request's variables.
@@ -235,7 +270,9 @@ fn parse_map(
         .ok_or_else(|| invalid("`map` must be a JSON object"))?;
 
     let batch_len = operations.as_array().map(Vec::len);
-    let mut seen = BTreeSet::new();
+    // A multipart request normally maps one file to one path, so a linear scan is cheaper than
+    // a tree or a hash set; duplicates are rare and still rejected.
+    let mut seen: Vec<(usize, String)> = Vec::new();
     let mut map = BTreeMap::new();
 
     for (name, paths) in raw {
@@ -250,11 +287,14 @@ fn parse_map(
                 ))
             })?;
             let mapped_path = parse_path(path, operations, batch_len)?;
-            if !seen.insert((mapped_path.request_index, mapped_path.relative.clone())) {
+            if seen.iter().any(|(index, relative)| {
+                *index == mapped_path.request_index && relative == &mapped_path.relative
+            }) {
                 return Err(invalid(format!(
                     "map paths contain \"{path}\" more than once"
                 )));
             }
+            seen.push((mapped_path.request_index, mapped_path.relative.clone()));
             mapped.push(mapped_path);
         }
         map.insert(name.clone(), mapped);
@@ -269,8 +309,9 @@ fn parse_path(
     operations: &JsonValue,
     batch_len: Option<usize>,
 ) -> Result<MappedPath, RequestError> {
-    let segments: Vec<&str> = path.split('.').collect();
-    if segments.iter().any(|segment| segment.is_empty()) {
+    // Splitting repeatedly rather than collecting keeps this allocation-free; the only string
+    // this function allocates is the relative path it stores.
+    if path.is_empty() || path.starts_with('.') || path.ends_with('.') || path.contains("..") {
         return Err(invalid(format!(
             "map path \"{path}\" contains an empty segment"
         )));
@@ -278,7 +319,8 @@ fn parse_path(
 
     let (request_index, relative) = match batch_len {
         Some(len) => {
-            let index = segments[0].parse::<usize>().map_err(|_| {
+            let (index, relative) = path.split_once('.').unwrap_or((path, ""));
+            let index = index.parse::<usize>().map_err(|_| {
                 invalid(format!(
                     "map path \"{path}\" must start with a batch index because `operations` is an array"
                 ))
@@ -288,17 +330,18 @@ fn parse_path(
                     "map path \"{path}\" refers to batch index {index}, but the batch has {len} requests"
                 )));
             }
-            (index, &segments[1..])
+            (index, relative)
         }
-        None => (0, &segments[..]),
+        None => (0, path),
     };
 
-    if relative.first() != Some(&"variables") {
+    let mut segments = relative.split('.');
+    if segments.next() != Some("variables") {
         return Err(invalid(format!(
             "map path \"{path}\" must address `variables`; files may only be placed in request variables"
         )));
     }
-    if relative.len() < 2 {
+    if segments.next().is_none() {
         return Err(invalid(format!(
             "map path \"{path}\" does not name a variable"
         )));
@@ -308,9 +351,9 @@ fn parse_path(
         Some(_) => &operations[request_index],
         None => operations,
     };
-    for segment in relative {
+    for segment in relative.split('.') {
         value = match value {
-            JsonValue::Object(object) => object.get(*segment),
+            JsonValue::Object(object) => object.get(segment),
             JsonValue::Array(list) => segment
                 .parse::<usize>()
                 .ok()
@@ -332,7 +375,7 @@ fn parse_path(
     Ok(MappedPath {
         request_index,
         // Drop the batch index, keep `variables` so the executor can validate the root again.
-        relative: relative.join("."),
+        relative: relative.to_owned(),
     })
 }
 

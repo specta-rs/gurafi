@@ -72,7 +72,7 @@ pub fn error_json_bytes(message: impl Into<String>) -> Vec<u8> {
     error_response(message).to_json_bytes()
 }
 
-fn serialization_error(error: serde_json::Error) -> Value {
+pub(crate) fn serialization_error(error: serde_json::Error) -> Value {
     json!({
         "errors": [{
             "message": format!("Failed to serialize the GraphQL response: {error}")

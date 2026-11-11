@@ -228,7 +228,7 @@ impl GraphQLRequest {
         let mut object = self
             .variables
             .as_ref()
-            .map(|variables| variables_to_object(variables, ""))
+            .map(variables_to_object)
             .transpose()?;
         if self.uploads.is_empty() {
             return Ok(object);
@@ -376,16 +376,52 @@ impl From<GraphQLError> for RequestError {
     }
 }
 
-fn variables_to_object(
-    variables: &Map<String, JsonValue>,
-    path: &str,
+/// One step of the path to the value being converted.
+///
+/// The path is only ever rendered when a value cannot be converted, so the conversion keeps a
+/// stack of segments instead of allocating a formatted `String` for every variable and list
+/// element. A request with many variables otherwise pays one allocation per variable whether or
+/// not anything fails.
+enum Trail<'a> {
+    Key(&'a str),
+    Index(usize),
+}
+
+fn render_trail(prefix: &str, trail: &[Trail<'_>]) -> String {
+    use core::fmt::Write as _;
+
+    let mut path = String::with_capacity(prefix.len() + trail.len() * 4);
+    path.push_str(prefix);
+    for segment in trail {
+        match segment {
+            Trail::Key(key) => {
+                path.push('.');
+                path.push_str(key);
+            }
+            Trail::Index(index) => {
+                let _ = write!(path, "[{index}]");
+            }
+        }
+    }
+    path
+}
+
+fn variables_to_object(variables: &Map<String, JsonValue>) -> Result<Object, RequestError> {
+    let mut trail = Vec::new();
+    variables_to_object_at(variables, "", &mut trail)
+}
+
+fn variables_to_object_at<'a>(
+    variables: &'a Map<String, JsonValue>,
+    prefix: &str,
+    trail: &mut Vec<Trail<'a>>,
 ) -> Result<Object, RequestError> {
     let mut object = Object::with_capacity(variables.len());
     for (key, value) in variables {
-        object.push_unchecked(
-            key.as_str(),
-            json_to_graphql(value, &format!("{path}.{key}"))?,
-        );
+        trail.push(Trail::Key(key));
+        let converted = json_to_graphql_at(value, prefix, trail);
+        trail.pop();
+        object.push_unchecked(key.as_str(), converted?);
     }
     Ok(object)
 }
@@ -396,30 +432,32 @@ fn apply_upload(
     path: &str,
     upload: &gql::Upload,
 ) -> Result<(), RequestError> {
-    let segments: Vec<&str> = path.split('.').collect();
-    let Some((&"variables", rest)) = segments.split_first() else {
+    let mut segments = path.split('.');
+    let Some("variables") = segments.next() else {
         return Err(RequestError::new(format!(
             "Upload path \"{path}\" must start with `variables`."
         )));
     };
-    if rest.is_empty() {
+    let Some(name) = segments.next() else {
         return Err(RequestError::new(format!(
             "Upload path \"{path}\" does not name a variable."
         )));
-    }
+    };
     let value = variables
-        .get_mut(rest[0])
+        .get_mut(name)
         .ok_or_else(|| missing_upload_target(path))?;
-    replace_upload_target(value, &rest[1..], path, upload)
+    replace_upload_target(value, segments, path, upload)
 }
 
-fn replace_upload_target(
+/// Walk the remaining path segments, which are always a short prefix of a client-supplied
+/// string, without collecting them into a `Vec`.
+fn replace_upload_target<'a>(
     value: &mut Value,
-    segments: &[&str],
+    mut segments: impl Iterator<Item = &'a str>,
     path: &str,
     upload: &gql::Upload,
 ) -> Result<(), RequestError> {
-    if segments.is_empty() {
+    let Some(segment) = segments.next() else {
         if !value.is_null() {
             return Err(RequestError::new(format!(
                 "Upload path \"{path}\" points at a value that is not `null`; the multipart specification requires files to be replaced with `null`."
@@ -427,8 +465,7 @@ fn replace_upload_target(
         }
         *value = Value::from(upload.clone());
         return Ok(());
-    }
-    let segment = segments[0];
+    };
     if segment.is_empty() {
         return Err(RequestError::new(format!(
             "Upload path \"{path}\" contains an empty segment."
@@ -438,7 +475,7 @@ fn replace_upload_target(
         Value::Object(object) => {
             let child = Object::get_mut(std::sync::Arc::make_mut(object), segment)
                 .ok_or_else(|| missing_upload_target(path))?;
-            replace_upload_target(child, &segments[1..], path, upload)
+            replace_upload_target(child, segments, path, upload)
         }
         Value::List(list) => {
             let index: usize = segment.parse().map_err(|_| {
@@ -452,7 +489,7 @@ fn replace_upload_target(
                     "Upload path \"{path}\" refers to list index {index}, but the list has {len} elements."
                 ))
             })?;
-            replace_upload_target(child, &segments[1..], path, upload)
+            replace_upload_target(child, segments, path, upload)
         }
         _ => Err(missing_upload_target(path)),
     }
@@ -477,6 +514,15 @@ fn missing_upload_target(path: &str) -> RequestError {
 /// Returns an error for a number JSON cannot represent at all (which `serde_json` does not
 /// produce, but another `JsonValue` implementation could).
 pub fn json_to_graphql(value: &JsonValue, path: &str) -> Result<Value, RequestError> {
+    let mut trail = Vec::new();
+    json_to_graphql_at(value, path, &mut trail)
+}
+
+fn json_to_graphql_at<'a>(
+    value: &'a JsonValue,
+    prefix: &str,
+    trail: &mut Vec<Trail<'a>>,
+) -> Result<Value, RequestError> {
     Ok(match value {
         JsonValue::Null => Value::Null,
         JsonValue::Bool(value) => Value::Boolean(*value),
@@ -503,7 +549,8 @@ pub fn json_to_graphql(value: &JsonValue, path: &str) -> Result<Value, RequestEr
                 }
             } else {
                 return Err(RequestError::new(format!(
-                    "Unsupported number at `{path}`."
+                    "Unsupported number at `{}`.",
+                    render_trail(prefix, trail)
                 )));
             }
         }
@@ -511,13 +558,16 @@ pub fn json_to_graphql(value: &JsonValue, path: &str) -> Result<Value, RequestEr
         JsonValue::Array(values) => {
             let mut list = Vec::with_capacity(values.len());
             for (index, value) in values.iter().enumerate() {
-                list.push(json_to_graphql(value, &format!("{path}[{index}]"))?);
+                trail.push(Trail::Index(index));
+                let converted = json_to_graphql_at(value, prefix, trail);
+                trail.pop();
+                list.push(converted?);
             }
             Value::List(list)
         }
-        JsonValue::Object(values) => {
-            Value::Object(std::sync::Arc::new(variables_to_object(values, path)?))
-        }
+        JsonValue::Object(values) => Value::Object(std::sync::Arc::new(variables_to_object_at(
+            values, prefix, trail,
+        )?)),
     })
 }
 

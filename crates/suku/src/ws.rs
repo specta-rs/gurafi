@@ -55,13 +55,12 @@ use std::{
 use futures::{Stream, StreamExt as _};
 use gql::{Response, ast::OperationKind};
 use serde::Deserialize;
-use serde_json::{Value as JsonValue, json};
+use serde_json::Value as JsonValue;
 use tokio::{sync::mpsc, task::AbortHandle};
 
 use crate::{
     Context, GraphQLRequest, Server,
     error::{ErrorKind, ResponseMeta},
-    response::ResponseExt as _,
 };
 
 /// The WebSocket subprotocol implemented by this module.
@@ -224,7 +223,7 @@ pub async fn serve<S>(
         Ok(false) | Err(()) => return,
     }
 
-    if !send_json(&outgoing, json!({ "type": "connection_ack" })).await {
+    if !send_text(&outgoing, CONNECTION_ACK.to_owned()).await {
         return;
     }
     run_connection(
@@ -616,24 +615,70 @@ fn too_large(text: &str, max_message_bytes: usize) -> bool {
     max_message_bytes != 0 && text.len() > max_message_bytes
 }
 
+/// A protocol message with an `id` and an arbitrary payload.
+///
+/// Serializing a struct writes straight into the output string. Building a
+/// [`serde_json::Value`] first would allocate a map, a string per key and a whole value tree for
+/// every response, which for a subscription event is by far the largest cost of sending it.
+#[derive(serde::Serialize)]
+struct Message<'a, T> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    payload: T,
+}
+
+/// A protocol message that only carries an `id`.
+#[derive(serde::Serialize)]
+struct IdMessage<'a> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+/// A `pong` echo of the client's payload.
+#[derive(serde::Serialize)]
+struct Pong<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    payload: &'a JsonValue,
+}
+
+const CONNECTION_ACK: &str = r#"{"type":"connection_ack"}"#;
+const PONG: &str = r#"{"type":"pong"}"#;
+
 fn next_message(id: &str, response: &Response) -> String {
-    json!({
-        "id": id,
-        "type": "next",
-        "payload": response.to_json(),
-    })
-    .to_string()
+    match serde_json::to_string(&Message {
+        id,
+        kind: "next",
+        payload: response,
+    }) {
+        Ok(message) => message,
+        // Only an opaque model value can fail to serialize, and the HTTP transport answers it
+        // with a specification-shaped error. Keep the same fallback payload here.
+        Err(error) => serde_json::to_string(&Message {
+            id,
+            kind: "next",
+            payload: crate::response::serialization_error(error),
+        })
+        .unwrap_or_default(),
+    }
 }
 
 fn error_message(id: &str, response: &Response) -> String {
-    let errors =
-        serde_json::to_value(&response.errors).unwrap_or_else(|_| JsonValue::Array(Vec::new()));
-    json!({
-        "id": id,
-        "type": "error",
-        "payload": errors,
-    })
-    .to_string()
+    match serde_json::to_string(&Message {
+        id,
+        kind: "error",
+        payload: &response.errors,
+    }) {
+        Ok(message) => message,
+        Err(_) => serde_json::to_string(&Message {
+            id,
+            kind: "error",
+            payload: &[] as &[gql::GraphQLError],
+        })
+        .unwrap_or_default(),
+    }
 }
 
 async fn send_error(outgoing: &mpsc::Sender<WsOutput>, id: &str, response: &Response) {
@@ -643,22 +688,27 @@ async fn send_error(outgoing: &mpsc::Sender<WsOutput>, id: &str, response: &Resp
 }
 
 fn complete_message(id: &str) -> String {
-    json!({ "id": id, "type": "complete" }).to_string()
+    serde_json::to_string(&IdMessage {
+        id,
+        kind: "complete",
+    })
+    .unwrap_or_default()
 }
 
 async fn send_pong(outgoing: &mpsc::Sender<WsOutput>, payload: Option<JsonValue>) {
     let message = match payload.filter(|payload| !payload.is_null()) {
-        Some(payload) => json!({ "type": "pong", "payload": payload }),
-        None => json!({ "type": "pong" }),
+        Some(payload) => serde_json::to_string(&Pong {
+            kind: "pong",
+            payload: &payload,
+        })
+        .unwrap_or_default(),
+        None => PONG.to_owned(),
     };
-    let _ = outgoing.send(WsOutput::Text(message.to_string())).await;
+    let _ = outgoing.send(WsOutput::Text(message)).await;
 }
 
-async fn send_json(outgoing: &mpsc::Sender<WsOutput>, value: JsonValue) -> bool {
-    outgoing
-        .send(WsOutput::Text(value.to_string()))
-        .await
-        .is_ok()
+async fn send_text(outgoing: &mpsc::Sender<WsOutput>, message: String) -> bool {
+    outgoing.send(WsOutput::Text(message)).await.is_ok()
 }
 
 async fn close(outgoing: &mpsc::Sender<WsOutput>, code: u16, reason: &str) {
