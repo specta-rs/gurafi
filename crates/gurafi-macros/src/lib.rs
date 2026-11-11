@@ -18,7 +18,8 @@
 //! produce a `compile_error!` with an explanation instead of a confusing trait bound failure.
 
 #![doc(
-    html_favicon_url = "https://raw.githubusercontent.com/specta-rs/gurafi/main/docs/favicon.svg"
+    html_favicon_url = "https://raw.githubusercontent.com/specta-rs/gurafi/main/docs/favicon.svg",
+    html_logo_url = "https://raw.githubusercontent.com/specta-rs/gurafi/main/assets/app-icon.svg"
 )]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

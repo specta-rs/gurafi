@@ -274,7 +274,8 @@
 //! per-resolver and cache events are TRACE. See the repository's `docs/plugins/tracing.md`.
 
 #![doc(
-    html_favicon_url = "https://raw.githubusercontent.com/specta-rs/gurafi/main/docs/favicon.svg"
+    html_favicon_url = "https://raw.githubusercontent.com/specta-rs/gurafi/main/docs/favicon.svg",
+    html_logo_url = "https://raw.githubusercontent.com/specta-rs/gurafi/main/assets/app-icon.svg"
 )]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
