@@ -2,7 +2,7 @@ name: release
 
 # crates.io *trusted publishing*: crates.io mints a short-lived token from this
 # workflow's OIDC identity, so no long-lived `CARGO_REGISTRY_TOKEN` is stored in
-# this repository or in Actions secrets. See `README.md` → "Releasing" for the
+# this repository or in Actions secrets. See `CONTRIBUTING.md` → "Releasing" for the
 # one-time crates.io configuration.
 #
 # These values must match the trusted publisher configured on crates.io for
