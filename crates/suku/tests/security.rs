@@ -94,10 +94,6 @@ fn buffered(result: HttpResult) -> suku::HttpResponse {
     }
 }
 
-fn json_body(response: &suku::HttpResponse) -> serde_json::Value {
-    serde_json::from_slice(&response.body).expect("JSON body")
-}
-
 /// An extractor that counts how often it ran and always authenticates.
 fn counting_extractor(
     calls: Arc<AtomicUsize>,

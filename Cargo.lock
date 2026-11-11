@@ -572,14 +572,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "shiri"
-version = "0.0.1"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -618,7 +610,6 @@ dependencies = [
  "serde_urlencoded",
  "tokio",
  "tower",
- "tower-http",
  "tracing",
  "tracing-core",
 ]

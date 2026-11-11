@@ -14,8 +14,6 @@ repository = "https://github.com/specta-rs/gurafi"
 gql = { path = "crates/gql", version = "0.2.0" }
 gurafi = { path = "crates/gurafi", version = "0.0.1" }
 gurafi-macros = { path = "crates/gurafi-macros", version = "0.0.1" }
-gurafi-relay = { path = "crates/gurafi-relay", version = "0.0.1" }
-shiri = { path = "crates/shiri", version = "0.0.0" }
 suku = { path = "crates/suku", version = "0.0.1" }
 
 # External dependencies
