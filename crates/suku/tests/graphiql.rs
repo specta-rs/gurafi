@@ -10,10 +10,10 @@ use suku::http::graphiql_html;
 fn default_page_loads_graphiql_from_the_cdn() {
     let html = graphiql_html();
 
-    assert!(html.contains("https://unpkg.com/react@18/umd/react.production.min.js"));
-    assert!(html.contains("https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"));
-    assert!(html.contains("https://unpkg.com/graphiql/graphiql.min.js"));
-    assert!(html.contains("https://unpkg.com/graphiql/graphiql.min.css"));
+    assert!(html.contains("https://unpkg.com/react@18.3.1/umd/react.production.min.js"));
+    assert!(html.contains("https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"));
+    assert!(html.contains("https://unpkg.com/graphiql@4.1.2/graphiql.min.js"));
+    assert!(html.contains("https://unpkg.com/graphiql@4.1.2/graphiql.min.css"));
 }
 
 #[cfg(feature = "vendored-graphiql")]

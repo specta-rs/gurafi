@@ -97,7 +97,7 @@ subscriptions and schema construction:
 
 ```toml
 [dependencies]
-gql = { version = "0.2", features = ["tracing"] }
+gql = { version = "0.3", features = ["tracing"] }
 ```
 
 Spans are hierarchical (`gql.execute` → `gql.execute_operation` → `gql.field`) and record shapes,

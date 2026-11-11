@@ -70,8 +70,8 @@ default, so a normal build does not compile `tracing`; enable just the layers yo
 
 ```toml
 [dependencies]
-gurafi = { version = "0.0.1", features = ["tracing"] }
-suku = { version = "0.0.1", features = ["tracing"] }
+gurafi = { version = "0.1.0", features = ["tracing"] }
+suku = { version = "0.1.0", features = ["tracing"] }
 ```
 
 Wire any `tracing` subscriber in the application. With `tracing-subscriber`:

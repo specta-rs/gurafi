@@ -28,7 +28,7 @@
 //! To build without WebSocket support while keeping Axum:
 //!
 //! ```toml
-//! suku = { version = "0.0.1", default-features = false, features = ["axum", "multipart"] }
+//! suku = { version = "0.1.0", default-features = false, features = ["axum", "multipart"] }
 //! ```
 //!
 //! A WebSocket upgrade then receives no special handling and falls through to the normal GET
@@ -84,7 +84,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! suku = { version = "0.0.1", features = ["vendored-graphiql"] }
+//! suku = { version = "0.1.0", features = ["vendored-graphiql"] }
 //! ```
 //!
 //! The inline page works with both [`http::handle`] and the Axum adapter because it needs no asset
