@@ -42,8 +42,12 @@ explicit and stable:
   share across threads and requests.
 - **Values are explicit.** Execution produces `Value`, not JSON. Transports
   decide how to serialize; tests can assert structure without a JSON round trip.
-- **No hidden panics.** Malformed input, invalid schemas and resolver failures
-  become `GraphQLError`s. Public APIs do not use `unsafe`.
+- **No hidden panics.** Malformed input, invalid schemas and failed coercion
+  become `GraphQLError`s; the engine itself does not panic on them. A panic in
+  user resolver code (a field resolver, a subscription setup resolver,
+  `resolve_type` or `is_type_of`) is caught at that boundary and reported as a
+  field error with `extensions.code` `INTERNAL_SERVER_ERROR`, so it cannot unwind
+  a request or end a subscription stream. Public APIs do not use `unsafe`.
 - **Errors are data.** `GraphQLError` carries source locations, response paths
   and extensions, and implements `serde::Serialize` when the `serde` feature is
   enabled.

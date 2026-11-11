@@ -22,7 +22,7 @@ use crate::{
 
 use super::{
     AuthorizationContext, ExecutionContext, ExecutionOptions, Request, coerce, collect, executor,
-    prepared::PreparedExecution,
+    panic, prepared::PreparedExecution,
 };
 
 /// A subscription's event stream.
@@ -301,12 +301,15 @@ where
         }
     }
 
-    let source = subscribe(ResolverContext {
-        parent: &options.root_value,
-        args: &args,
-        context: &context,
-        info: &info,
-    })
+    let source = panic::subscription(
+        &subscribe,
+        ResolverContext {
+            parent: &options.root_value,
+            args: &args,
+            context: &context,
+            info: &info,
+        },
+    )
     .await
     .map_err(Response::error)?;
 

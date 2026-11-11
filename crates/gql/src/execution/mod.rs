@@ -3,11 +3,14 @@
 //! Execution is split into the stages required by the specification: parse, validate, select an
 //! operation, coerce variables, enforce request limits, then resolve fields. Each stage produces
 //! specification-shaped errors instead of panicking, and a request that fails validation never
-//! reaches a resolver.
+//! reaches a resolver. Resolver callbacks are the one place caller code runs, so each invocation
+//! is isolated: a resolver panic becomes a coded `INTERNAL_SERVER_ERROR` field error rather than
+//! an unwind (see the panic-isolation helper).
 
 pub(crate) mod coerce;
 mod collect;
 mod executor;
+mod panic;
 mod plan;
 mod prepared;
 mod selection;

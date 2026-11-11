@@ -148,9 +148,9 @@ impl<'a> ErrorContext<'a> {
 /// context must always produce the same result. The trait does not provide interior mutability,
 /// so a formatter that records state has to do so explicitly with a thread-safe container.
 ///
-/// A panic inside a formatter is not caught. It unwinds through the executing future, exactly like
-/// a panic in a resolver; for a subscription event it fails the stream. A formatter should
-/// therefore avoid `unwrap` and other panic paths.
+/// A panic inside a formatter is not caught. Unlike a panic in a resolver, which `gql` converts
+/// into a coded field error, it unwinds through the executing future; for a subscription event it
+/// ends the stream. A formatter should therefore avoid `unwrap` and other panic paths.
 ///
 /// [`Server::format_error`]: crate::Server::format_error
 /// [`Server::format_error_with`]: crate::Server::format_error_with

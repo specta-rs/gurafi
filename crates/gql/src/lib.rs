@@ -30,6 +30,29 @@
 //! assert_eq!(response.data.unwrap().as_object().unwrap().get("hello").unwrap().as_str(), Some("world"));
 //! ```
 //!
+//! # Resolver panics
+//!
+//! Resolvers are caller code, so every call into one is isolated. If a `resolve` resolver, a
+//! subscription's `subscribe` resolver, an interface or union `resolve_type` hook or an object
+//! `is_type_of` check panics, the panic is caught at that boundary and reported as an ordinary
+//! error instead of unwinding the request:
+//!
+//! * a field resolver panic becomes a field error with the message `"Internal server error"` and
+//!   `extensions.code` of `"INTERNAL_SERVER_ERROR"`, with the usual response path and source
+//!   location attached by field completion. Sibling fields still complete, and null propagation
+//!   applies as for any other field error;
+//! * a subscription setup panic makes [`subscribe`] return an error response, while a panic in a
+//!   per-event resolver yields an error response for that event and leaves the stream running;
+//! * the panic payload and backtrace are never copied into the error, and the error is built
+//!   without formatting any caught value.
+//!
+//! Isolation does not change the panic hook: the process-wide hook still runs, so existing
+//! logging or crash reporting sees the panic. Only the unwind is caught.
+//!
+//! This relies on [`std::panic::catch_unwind`], which cannot intercept a panic in a build
+//! configured with `panic = "abort"`; such a profile aborts the process on the first panic before
+//! any isolation can run.
+//!
 //! # Observability
 //!
 //! The optional `tracing` feature instruments parsing, validation, variable coercion, operation
