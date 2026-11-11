@@ -268,14 +268,11 @@ async fn handler(State(state): State<Arc<HandlerState>>, request: Request) -> Ax
     };
 
     let extractor = state.extractor.clone();
-    let result = crate::http::handle(
-        &state.server,
-        &state.config,
-        &parts,
-        &body,
-        move |request| extractor.extract(request),
-    )
-    .await;
+    let result =
+        crate::http::handle_bytes(&state.server, &state.config, &parts, body, move |request| {
+            extractor.extract(request)
+        })
+        .await;
 
     match result {
         HttpResult::Response(response) => buffered_response(response),
