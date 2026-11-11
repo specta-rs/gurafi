@@ -19,7 +19,7 @@ operation.
 
 ## Offline and air-gapped deployments
 
-By default the page loads React, ReactDOM and GraphiQL from unpkg. In an air-gapped environment, or
+By default the page loads pinned React, ReactDOM and GraphiQL bundles from unpkg. In an air-gapped environment, or
 when a content security policy must not allow a CDN, enable the `vendored-graphiql` feature:
 
 ```toml

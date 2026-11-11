@@ -965,17 +965,19 @@ impl<'doc> Executor<'doc> {
             if self.expired() {
                 return Err(timeout_error(path));
             }
-            let (response_key, outcome) = self
-                .try_execute_leaf_dynamic(
-                    object_type,
-                    parent,
-                    response_key,
-                    &nodes,
-                    field,
-                    path,
-                    errors,
-                )
-                .expect("the inline predicate and the fast path agree");
+            let Some((response_key, outcome)) = self.try_execute_leaf_dynamic(
+                object_type,
+                parent,
+                response_key,
+                &nodes,
+                field,
+                path,
+                errors,
+            ) else {
+                return Err(GraphQLError::new(
+                    "Internal error: the leaf fast path rejected a field it selected.",
+                ));
+            };
             result.push_unchecked(response_key, outcome?);
         }
         Ok(true)
@@ -1983,9 +1985,13 @@ impl<'doc> Executor<'doc> {
             if check_deadline && self.expired() {
                 return Err(timeout_error(path));
             }
-            let (response_key, outcome) = self
-                .try_execute_leaf_planned(object_type, parent, &group, path, errors)
-                .expect("the inline predicate and the fast path agree");
+            let Some((response_key, outcome)) =
+                self.try_execute_leaf_planned(object_type, parent, &group, path, errors)
+            else {
+                return Err(GraphQLError::new(
+                    "Internal error: the leaf fast path rejected a field it selected.",
+                ));
+            };
             result.push_unchecked(response_key, outcome?);
         }
         Ok(true)
@@ -2028,7 +2034,17 @@ impl<'doc> Executor<'doc> {
         if field.resolve.is_some() || !field.args.is_empty() || self.context.authorizer.is_some() {
             return None;
         }
-        match self.context.schema.get_type(field.ty.named_type())? {
+        // Completion only accepts a named scalar or enum after stripping a single `NonNull`
+        // wrapper. A list is completed by the general path even when its item type is a scalar;
+        // accepting it here would let the fast path and its predicate disagree.
+        let mut ty = &field.ty;
+        while let TypeRef::NonNull(inner) = ty {
+            ty = inner;
+        }
+        let TypeRef::Named(name) = ty else {
+            return None;
+        };
+        match self.context.schema.get_type(name)? {
             Type::Scalar(_) | Type::Enum(_) => Some(field),
             _ => None,
         }
@@ -3055,6 +3071,12 @@ impl<'doc> Executor<'doc> {
             Ok(collected) => collected,
             Err(error) => return Some(Err(error)),
         };
+        // A speculative subtree may run synchronous property accessors and then discover a
+        // descendant that needs the async path. Restrict this path to all-leaf selections so an
+        // accessor is never executed twice (or its panic caught twice).
+        if !self.collected_is_sync_leaf(object_type, &collected) {
+            return None;
+        }
 
         let mut records = Vec::new();
         let outcome = match &collected {
@@ -3762,7 +3784,9 @@ impl<'doc> Executor<'doc> {
     ) -> Option<Result<Value, GraphQLError>> {
         if !selections.is_empty() && depth < SYNC_DEPTH_LIMIT {
             if let Some(plan) = self.planned_object_fields(object, selections) {
-                if !plan.has_resolvers {
+                if !plan.has_resolvers
+                    && self.collected_is_sync_leaf(object, &CollectedFields::Planned(plan))
+                {
                     return self.complete_planned_object_list_sync(
                         plan,
                         object,
@@ -3969,6 +3993,36 @@ impl<'doc> Executor<'doc> {
     /// A synchronous property resolver does not force it: the synchronous path calls it inline.
     /// A planned source already recorded the answer at preparation, so the common case avoids
     /// scanning the object type's field map for every completed object.
+    /// Whether every selected field completes as a leaf without running another object's
+    /// selection.
+    ///
+    /// The synchronous subtree path is speculative: it may abandon a partially completed subtree
+    /// when a later field needs the async path. Keeping it to all-leaf selections means a
+    /// synchronous property accessor is never executed, and a panic never caught, twice.
+    fn collected_is_sync_leaf(
+        &self,
+        object_type: &'doc ObjectType,
+        collected: &collect::CollectedFields<'doc>,
+    ) -> bool {
+        for index in 0..collected.len() {
+            let Some(group) = collected.view(index, &self.context.variables, object_type) else {
+                continue;
+            };
+            let Some(field) = group.field else {
+                return false;
+            };
+            let Some(ty) = self.context.schema.get_type(field.ty.named_type().as_ref()) else {
+                return false;
+            };
+            match ty {
+                crate::types::Type::Scalar(scalar) if scalar.builtin => {}
+                crate::types::Type::Enum(_) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
     fn type_has_resolvers(&self, source: Option<u32>, object_type: &ObjectType) -> bool {
         if let (Some(plan), Some(source)) = (self.plans, source) {
             if let Some(field_plan) = plan.field_plan(source, object_type) {
@@ -4044,6 +4098,9 @@ impl<'doc> Executor<'doc> {
             return Some(Err(object_mismatch_error(
                 label, object, value, path, location,
             )));
+        }
+        if !self.collected_is_sync_leaf(object, collected) {
+            return None;
         }
         let outcome = match collected {
             CollectedFields::Planned(plan) => {

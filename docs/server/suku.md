@@ -30,6 +30,7 @@ directly, the protocol tests drive `ws::serve` over channels, and the Axum tests
 | `axum` | yes | Axum router and authentication helper. |
 | `ws` | yes | WebSocket subscriptions via `graphql-transport-ws`; implies `axum`. |
 | `multipart` | yes | Multipart file uploads; uses `multer`. |
+| `vendored-graphiql` | no | Self-contained GraphiQL page with pinned browser assets. |
 | `tracing` | no | Request spans, and `gql/tracing`. |
 
 ```toml
@@ -282,7 +283,7 @@ the request, so a protected endpoint does not expose its API surface anonymously
 request path as its endpoint, so it works at any mount point. Disable it with `.graphiql(false)`
 (Axum builder) or `HttpConfig::graphiql(false)`.
 
-The default page loads React 18, ReactDOM 18 and GraphiQL from unpkg. Enable the
+The default page loads pinned React 18.3.1, ReactDOM 18.3.1 and GraphiQL 4.1.2 bundles from unpkg. Enable the
 `vendored-graphiql` feature to serve a self-contained page instead:
 
 ```toml
@@ -300,8 +301,8 @@ origins. Because scripts and styles are inline, a CSP for the page must allow in
 
 To update the vendored versions, edit the version constants in
 `crates/suku/src/http/vendor/update.sh`, run it, refresh `versions.txt`, and run
-`cargo test -p suku --features vendored-graphiql`. The default build stays CDN-backed; unversioned
-unpkg URLs are used by default because they follow upstream GraphiQL releases.
+`cargo test -p suku --features vendored-graphiql`. The default build stays CDN-backed and pins exact versions; check the
+versions in `crates/suku/src/http/graphiql.html` when updating them.
 
 `GET` may only execute **queries**. Mutations and subscriptions over GET are rejected with
 `405 Method Not Allowed`, which prevents cross-site request forgery against cookie-authenticated

@@ -49,7 +49,7 @@ impl ScalarValue for Upload {
 
 impl InputType for Upload {
     fn input_type() -> TypeRef {
-        TypeRef::named(<Self as ScalarValue>::NAME)
+        TypeRef::named(<Self as ScalarValue>::NAME).non_null()
     }
 
     fn register_input(registry: &mut TypeRegistry) {

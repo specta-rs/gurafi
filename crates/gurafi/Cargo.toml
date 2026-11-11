@@ -17,3 +17,6 @@ gurafi-macros.workspace = true
 futures.workspace = true
 indexmap.workspace = true
 tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+suku = { path = "../suku", default-features = false, features = ["multipart"] }

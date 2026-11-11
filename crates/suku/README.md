@@ -427,7 +427,7 @@ query error.
 
 ## GraphiQL assets
 
-By default the GraphiQL page loads React 18, ReactDOM 18 and GraphiQL from unpkg, so no assets are
+By default the GraphiQL page loads pinned React 18.3.1, ReactDOM 18.3.1 and GraphiQL 4.1.2 from unpkg, so no assets are
 shipped in the binary and the page always follows the upstream releases. Use the
 `vendored-graphiql` feature when the server must run without outbound network access or when a
 content security policy should not allow a CDN:

@@ -322,6 +322,7 @@ dependencies = [
  "gql",
  "gurafi-macros",
  "indexmap",
+ "suku",
  "tracing",
 ]
 

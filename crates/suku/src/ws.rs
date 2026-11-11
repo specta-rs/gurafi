@@ -291,15 +291,10 @@ where
                 .await;
                 return Err(());
             }
-            ClientMessage::Complete { .. } => {
-                close(
-                    outgoing,
-                    CLOSE_BAD_REQUEST,
-                    "Complete received before connection acknowledgement",
-                )
-                .await;
-                return Err(());
-            }
+            // The protocol tells both sides to ignore a `complete` for an operation they
+            // consider completed. Before `connection_ack` there is no operation to complete, so
+            // ignore it rather than treating a well-formed message as malformed.
+            ClientMessage::Complete { .. } => {}
         }
     }
 }
