@@ -459,36 +459,28 @@ let upload = context
 # }
 ```
 
-With `gurafi`, define a newtype scalar and use it in derived input structs:
+With `gurafi`, `Upload` is a ready-made input scalar. Use it directly in a derived args or input
+struct; the scalar is registered when the field or input is declared:
 
 ```rust
-use gurafi::gql::{GraphQLError, Upload, Value};
-use gurafi::{ScalarValue, impl_scalar_traits};
+use gurafi::{Input, NoArgs, Upload};
 
-#[derive(Clone)]
-pub struct UploadFile(pub Upload);
-
-impl ScalarValue for UploadFile {
-    const NAME: &'static str = "Upload";
-
-    fn to_value(&self) -> Result<Value, GraphQLError> {
-        Err(GraphQLError::new("Upload is input-only"))
-    }
-
-    fn from_value(value: &Value) -> Result<Self, GraphQLError> {
-        value
-            .as_external::<Upload>()
-            .cloned()
-            .map(Self)
-            .ok_or_else(|| GraphQLError::new("Expected a multipart file upload"))
-    }
+#[derive(Input)]
+struct UploadArgs {
+    file: Upload,
 }
 
-impl_scalar_traits!(UploadFile);
+schema.mutation(|m| {
+    m.field_result("uploadAvatar", |args: UploadArgs, ctx: &Ctx| {
+        store_avatar(&args.file, ctx)
+    });
+});
 ```
 
-Register it with `schema.scalar::<UploadFile>()` when it does not appear directly in a field
-signature. The resolver then receives `UploadFile` and can move the bytes into storage.
+The resolver receives the uploaded `Upload` value with `filename`, `content_type` and `bytes`
+accessors. `Upload` is input-only: using it as an output type is a build error, because a file has
+no GraphQL response representation. `schema.scalar::<gurafi::Upload>()` is available when the
+scalar should appear in the public schema without a field signature.
 
 Authentication and body-size checks run before multipart parsing. `max_multipart_parts` (default
 32, including `operations` and `map`) limits the number of fields, and `max_body_bytes` limits the

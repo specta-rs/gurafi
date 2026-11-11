@@ -289,6 +289,7 @@ mod registry;
 mod schema;
 mod telemetry;
 mod traits;
+mod upload;
 mod value;
 
 pub use gql;
@@ -315,6 +316,7 @@ pub use traits::{
     AbstractType, EnumModel, FromValue, InputObject, InputType, IntoValue, NoArgs, ObjectModel,
     OutputType, ScalarValue, UnionModel,
 };
+pub use upload::Upload;
 
 /// The result type used by fallible resolvers.
 ///

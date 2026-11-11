@@ -1,5 +1,10 @@
 # Gurafi
 
+> Gurafi is inspired by [Pothos](https://pothos-graphql.dev), the type-safe, code-first
+> GraphQL schema builder for TypeScript. We share its belief that the schema should grow out of
+> application code rather than a separate generated description, and we carry its plugin, Relay,
+> typed-error and dataloader ideas into Rust.
+
 Rust crates for building GraphQL servers.
 
 This repository is a monorepo containing all first-party Gurafi crates and their
@@ -12,7 +17,7 @@ documentation.
 | [`gql`](crates/gql) | A GraphQL reference implementation for Rust. Implements the October 2021 specification: parser, type system, validation, execution, introspection, subscriptions, complexity analysis and schema compatibility checking. It is transport- and framework-agnostic. |
 | [`gurafi`](crates/gurafi) | An intuitive, type-safe, code-first GraphQL schema builder built on `gql`. Rust types drive the GraphQL type system; `gurafi` only adds developer experience. |
 | [`gurafi-macros`](crates/gurafi-macros) | Procedural macros for `gurafi` (`Object`, `Input`, `Args`, `Enum`, `Scalar`, `Union`, `ErrorUnion`). |
-| [`suku`](crates/suku) | A production GraphQL-over-HTTP server for a `gql::Schema`, with batching, SSE subscriptions, error masking and pluggable authentication. |
+| [`suku`](crates/suku) | A production GraphQL server for a `gql::Schema`, with HTTP, SSE and `graphql-transport-ws` WebSocket transports, multipart uploads, batching, GraphiQL, error masking and pluggable authentication. |
 
 The layers are deliberately decoupled:
 
@@ -113,6 +118,11 @@ production/development guidance.
   GraphQL errors. See the [typed errors guide](docs/plugins/errors.md) for names, limitations and how this relates to error masking.
 - **Validation, one-of inputs and resolver info.** `#[graphql(validate)]`,
   `#[graphql(one_of)]`, and `*_with_info` resolver variants.
+- **Panic isolation.** A panicking resolver becomes a coded `INTERNAL_SERVER_ERROR` field error;
+  sibling fields and subscription streams keep running.
+- **Complete transport set.** `suku` serves HTTP, SSE and `graphql-transport-ws` WebSocket
+  subscriptions, plus multipart file uploads through `gurafi::Upload`. A `vendored-graphiql`
+  feature serves GraphiQL without any CDN dependency.
 - **Reusable builders.** `Schema` is `Clone`; `build_with(BuildOptions)` and
   `build_clone` build without throwing the declaration away.
 - **Plugins.** `Schema::plugin` runs build-time hooks over every object, interface
