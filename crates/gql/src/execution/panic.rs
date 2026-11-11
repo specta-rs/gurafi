@@ -24,6 +24,7 @@ use std::{
 };
 
 use futures::FutureExt;
+use std::future::Future;
 
 use crate::{
     error::{GraphQLError, Result},
@@ -64,26 +65,21 @@ pub(crate) fn sync<T>(f: impl FnOnce() -> T) -> Result<T, GraphQLError> {
 ///
 /// The async block covers both construction and polling of the resolver's future, so a resolver
 /// that panics before its first suspension point is caught too.
-pub(crate) async fn resolver(resolve: &ResolveFn, context: ResolverContext<'_>) -> FieldResult {
-    match AssertUnwindSafe(async { resolve(context).await })
+pub(crate) fn resolver<'a>(
+    resolve: &'a ResolveFn,
+    context: ResolverContext<'a>,
+) -> impl Future<Output = FieldResult> + 'a {
+    AssertUnwindSafe(async move { resolve(context).await })
         .catch_unwind()
-        .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(internal_error()),
-    }
+        .map(|result| result.unwrap_or_else(|_| Err(internal_error())))
 }
 
 /// Await a subscription setup resolver, turning a panic into an error response.
-pub(crate) async fn subscription(
-    subscribe: &SubscribeFn,
-    context: ResolverContext<'_>,
-) -> Result<SubscriptionStream, GraphQLError> {
-    match AssertUnwindSafe(async { subscribe(context).await })
+pub(crate) fn subscription<'a>(
+    subscribe: &'a SubscribeFn,
+    context: ResolverContext<'a>,
+) -> impl Future<Output = Result<SubscriptionStream, GraphQLError>> + 'a {
+    AssertUnwindSafe(async move { subscribe(context).await })
         .catch_unwind()
-        .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(internal_error()),
-    }
+        .map(|result| result.unwrap_or_else(|_| Err(internal_error())))
 }

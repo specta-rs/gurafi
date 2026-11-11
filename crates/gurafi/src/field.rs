@@ -309,6 +309,11 @@ pub struct FieldConfig<'a, Ctx: 'static> {
     args_type: TypeId,
     /// Validator installed by [`FieldConfig::validate`], read inside the resolver.
     validation: ValidationSlot<Ctx>,
+    /// Output type to register when the config is dropped, unless a later option replaces the
+    /// named type. `expose!` uses this so `as_object_ref`/`as_dynamic` do not leave a stale
+    /// reference to the model's derived name.
+    deferred_output: Option<fn(&mut TypeRegistry)>,
+    suppress_deferred_output: bool,
     marker: std::marker::PhantomData<fn() -> Ctx>,
 }
 
@@ -401,6 +406,12 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
         args_type: TypeId,
         validation: ValidationSlot<Ctx>,
     ) -> Self {
+        if !crate::schema::is_valid_graphql_name(&name) {
+            registry.push_error(GraphQLError::new(format!(
+                "Field name \"{name}\" is not a valid GraphQL name. A name must match \
+                 [_A-Za-z][_0-9A-Za-z]*."
+            )));
+        }
         Self {
             registry,
             sink,
@@ -419,8 +430,21 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
             rust_type_name,
             args_type,
             validation,
+            deferred_output: None,
+            suppress_deferred_output: false,
             marker: std::marker::PhantomData,
         }
+    }
+
+    /// Register `T`'s output type when this config is dropped, unless a later option replaces
+    /// the field's named type.
+    pub(crate) fn defer_output<T: crate::OutputType>(&mut self) {
+        self.deferred_output = Some(|registry| T::register_output(registry));
+    }
+
+    /// Stop the deferred output registration. Called by options that replace the named type.
+    fn suppress_output_registration(&mut self) {
+        self.suppress_deferred_output = true;
     }
 
     /// The field's declared type when this config was created.
@@ -630,6 +654,7 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
     /// [`FieldConfig::as_object_ref`]: declare a runtime-named object first, then widen it to an
     /// interface or union that lists that object as a possible type.
     pub fn as_abstract(&mut self, reference: impl AbstractType) -> &mut Self {
+        self.suppress_output_registration();
         let abstract_name: Name = Arc::from(reference.abstract_name());
         let original = self
             .sink
@@ -659,6 +684,7 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
     /// such as [`crate::Raw<M>`] that delegates its output type to `M`). A mismatch is a build
     /// error.
     pub fn as_object_ref<M: ObjectModel>(&mut self, reference: &ObjectRef<M>) -> &mut Self {
+        self.suppress_output_registration();
         self.registry.reference_object(reference.name());
         if self.checks.is_some() {
             let original = self.original().clone();
@@ -687,6 +713,7 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
     /// loosened and never tightened, and the list shape must match. The named type must exist in
     /// the schema by build time.
     pub fn as_dynamic(&mut self, ty: TypeRef) -> &mut Self {
+        self.suppress_output_registration();
         let current = self
             .sink
             .get(&self.name)
@@ -737,6 +764,7 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
     }
 
     fn override_type<T: OutputType>(&mut self) -> &mut Self {
+        self.suppress_output_registration();
         T::register_output(self.registry);
         let replacement = T::output_type();
         if self.checks.is_some() {
@@ -766,6 +794,18 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
             if let TypeRef::NonNull(inner) = &field.ty {
                 field.ty = (**inner).clone();
             }
+        }
+        // A preceding `non_null()` may have queued a check against the resolver's Rust type.
+        // That check is no longer relevant once the final wrapper is nullable, and options are
+        // documented to compose in any order.
+        if let Some(checks) = &mut self.checks {
+            checks.retain(|check| {
+                !matches!(
+                    check,
+                    FieldCheck::NonNullOnOption { owner, field, .. }
+                        if owner == &self.owner && field == &self.name
+                )
+            });
         }
         self
     }
@@ -847,6 +887,11 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
 
 impl<Ctx: 'static> Drop for FieldConfig<'_, Ctx> {
     fn drop(&mut self) {
+        if !self.suppress_deferred_output {
+            if let Some(register) = self.deferred_output.take() {
+                register(self.registry);
+            }
+        }
         let Some(field) = self.sink.get_mut(&self.name) else {
             return;
         };

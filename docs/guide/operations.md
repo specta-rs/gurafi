@@ -152,35 +152,27 @@ fn receive(context: &ResolverContext<'_>) -> Result<Value, GraphQLError> {
 }
 ```
 
-In `gurafi`, wrap `gql::Upload` in a `ScalarValue` newtype so it can appear in derived input
-objects. The newtype's `from_value` downcasts the external value, and the resolver receives the
-typed wrapper:
+In `gurafi`, use `Upload` directly in a derived args or input struct. It is an input-only
+scalar and is registered automatically:
 
 ```rust
-use gurafi::gql::{GraphQLError, Upload, Value};
-use gurafi::{ScalarValue, impl_scalar_traits};
+use gurafi::{Input, NoArgs, Upload};
 
-#[derive(Clone)]
-pub struct UploadFile(pub Upload);
-
-impl ScalarValue for UploadFile {
-    const NAME: &'static str = "Upload";
-
-    fn to_value(&self) -> Result<Value, GraphQLError> {
-        Err(GraphQLError::new("Upload is input-only"))
-    }
-
-    fn from_value(value: &Value) -> Result<Self, GraphQLError> {
-        value
-            .as_external::<Upload>()
-            .cloned()
-            .map(Self)
-            .ok_or_else(|| GraphQLError::new("Expected a multipart file upload"))
-    }
+#[derive(Input)]
+struct UploadArgs {
+    file: Upload,
 }
 
-impl_scalar_traits!(UploadFile);
+schema.mutation(|m| {
+    m.field_result("uploadAvatar", |args: UploadArgs, ctx: &Ctx| {
+        store_avatar(&args.file, ctx)
+    });
+});
 ```
+
+The resolver receives the file with `filename()`, `content_type()` and `bytes()`. A plain
+non-`Option` field is declared `Upload!`; use `Option<Upload>` when the file is optional.
+Direct output use is a compile error because a file has no GraphQL response representation.
 
 A client sends:
 

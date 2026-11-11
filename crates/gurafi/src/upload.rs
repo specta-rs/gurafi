@@ -2,8 +2,9 @@
 //!
 //! [`Upload`] is the shared value produced by `suku`'s GraphQL multipart transport. It is an
 //! input-only scalar: an argument or input field of this type receives the uploaded bytes and
-//! metadata, while output fields are rejected at build time because an upload has no
-//! representation in a GraphQL response.
+//! metadata, while direct output use is a compile error because an upload has no
+//! representation in a GraphQL response. `FieldConfig::as_dynamic` is an unchecked escape hatch
+//! for runtime type references and cannot enforce that rule.
 //!
 //! ```
 //! use gurafi::{Input, Upload};

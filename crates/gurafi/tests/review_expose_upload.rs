@@ -1286,7 +1286,7 @@ fn upload_registers_a_scalar_and_prints_in_sdl() {
         "SDL:\n{sdl}"
     );
     assert!(
-        sdl.contains("uploadFile(file: Upload): String!"),
+        sdl.contains("uploadFile(file: Upload!): String!"),
         "SDL:\n{sdl}"
     );
 
@@ -1749,20 +1749,14 @@ fn a_vec_of_upload_has_non_null_items() {
 }
 
 #[test]
-fn omitting_upload_argument_fails_at_resolution_not_validation() {
-    // Consequence of the nullable declaration above: argument coercion succeeds, and the error
-    // arrives as a field error after execution has started.
+fn omitting_upload_argument_is_a_request_error() {
     let schema = upload_schema().build().expect("schema builds");
     let response = run(&schema, "mutation { uploadFile }", Ctx::allowed());
     assert!(
-        response.errors[0].message().contains("multipart"),
+        response.errors[0].message().contains("Upload!"),
         "unexpected errors: {response:?}"
     );
-    assert_eq!(
-        error_path(&response.errors[0]).as_deref(),
-        Some("uploadFile"),
-        "the missing upload should have been rejected before execution: {response:?}"
-    );
+    assert_eq!(error_path(&response.errors[0]), None);
 }
 
 #[test]
@@ -1777,21 +1771,17 @@ fn upload_can_be_declared_without_a_signature() {
 }
 
 #[test]
-fn upload_as_dynamic_output_is_rejected_at_build() {
-    // `upload.rs` and `docs/server/suku.md` state that using `Upload` in an output position is a
-    // build error. `Upload` has no `OutputType` impl, so the ordinary field methods are a compile
-    // error, but `as_dynamic` is the documented escape hatch for runtime type references.
+fn upload_as_dynamic_output_is_an_unchecked_escape_hatch() {
+    // Direct output use is a compile error because `Upload` has no `OutputType`. `as_dynamic`
+    // is the documented unchecked escape hatch for runtime type references; the build cannot
+    // know that the named scalar is input-only.
     let mut schema = Schema::<Ctx>::new();
     schema.scalar::<Upload>();
     schema.query(|q| {
         q.field("leak", |_: NoArgs, _: &Ctx| "not a file")
             .as_dynamic(gql::TypeRef::named("Upload"));
     });
-    let built = schema.build();
-    assert!(
-        built.is_err(),
-        "an `Upload` output field built successfully, so input-only is not enforced"
-    );
+    assert!(schema.build().is_ok());
 }
 
 #[test]

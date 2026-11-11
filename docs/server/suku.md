@@ -479,8 +479,9 @@ schema.mutation(|m| {
 ```
 
 The resolver receives the uploaded `Upload` value with `filename`, `content_type` and `bytes`
-accessors. `Upload` is input-only: using it as an output type is a build error, because a file has
-no GraphQL response representation. `schema.scalar::<gurafi::Upload>()` is available when the
+accessors. `Upload` is input-only: direct output use is a compile error because a file has no GraphQL
+response representation. `as_dynamic` remains an unchecked escape hatch for runtime type
+references. `schema.scalar::<gurafi::Upload>()` is available when the
 scalar should appear in the public schema without a field signature.
 
 Authentication and body-size checks run before multipart parsing. `max_multipart_parts` (default

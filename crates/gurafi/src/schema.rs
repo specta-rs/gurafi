@@ -1909,18 +1909,19 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
         T: OutputType + IntoValue + Send + 'static,
     {
         let (name, get) = expose.into_parts();
-        T::register_output(self.registry);
         let field = gql::Field::new(name, T::output_type()).sync_resolve(move |context| {
             let model = model_ref::<M>(context.parent, context.parent_type, context.field_name)?;
             (get)(model).into_value()
         });
-        self.push(
+        let mut config = self.push(
             field,
             T::is_optional(),
             std::any::type_name::<T>(),
             TypeId::of::<()>(),
             ValidationSlot::new(),
-        )
+        );
+        config.defer_output::<T>();
+        config
     }
 
     /// Declare a field that is read from a raw object map instead of a resolver.
@@ -4847,7 +4848,7 @@ pub fn type_ref<T: OutputType>() -> TypeRef {
 }
 
 /// Whether `name` matches the GraphQL `Name` grammar: `[_A-Za-z][_0-9A-Za-z]*`.
-fn is_valid_graphql_name(name: &str) -> bool {
+pub(crate) fn is_valid_graphql_name(name: &str) -> bool {
     let mut characters = name.chars();
     match characters.next() {
         Some(first) if first == '_' || first.is_ascii_alphabetic() => {}

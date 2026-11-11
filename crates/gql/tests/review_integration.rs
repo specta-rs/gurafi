@@ -958,7 +958,7 @@ fn path_segments_used_by_the_probes_match_the_public_type() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_sync_hook_on_a_custom_scalar_field_runs_twice() {
+fn a_sync_hook_on_a_custom_scalar_field_runs_once() {
     let calls = Arc::new(AtomicUsize::new(0));
     let hook_calls = Arc::clone(&calls);
     let scalar = gql::ScalarType::new("Odd").serialize(|value| Ok(value.clone()));
@@ -986,13 +986,13 @@ fn a_sync_hook_on_a_custom_scalar_field_runs_twice() {
     );
     assert_eq!(
         calls.load(Ordering::Relaxed),
-        2,
-        "a custom scalar cannot finish the synchronous attempt, so the hook is retried"
+        1,
+        "a custom scalar is completed by the async path without retrying the hook"
     );
 }
 
 #[test]
-fn a_sync_hook_on_an_abstract_field_runs_twice() {
+fn a_sync_hook_on_an_abstract_field_runs_once() {
     let calls = Arc::new(AtomicUsize::new(0));
     let hook_calls = Arc::clone(&calls);
     let node = InterfaceType::new("Node").field(Field::new("id", TypeRef::id()));
@@ -1024,8 +1024,8 @@ fn a_sync_hook_on_an_abstract_field_runs_twice() {
     );
     assert_eq!(
         calls.load(Ordering::Relaxed),
-        2,
-        "an abstract type cannot finish the synchronous attempt, so the hook is retried"
+        1,
+        "an abstract type is completed by the async path without retrying the hook"
     );
 }
 

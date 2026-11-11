@@ -94,13 +94,7 @@ pub(crate) async fn parse_bytes(
         // Match the name as a borrow: only a file part needs to own it, and the two control
         // fields (`operations`, `map`) are on every request.
         match field.name() {
-            Some("operations") => {
-                if operations.is_some() {
-                    return Err(invalid("the `operations` field appears more than once"));
-                }
-                if map.is_some() || !files.is_empty() {
-                    return Err(invalid("`operations` must be the first multipart field"));
-                }
+            Some("operations") if operations.is_none() && map.is_none() && files.is_empty() => {
                 let text = field
                     .text()
                     .await
@@ -129,16 +123,10 @@ pub(crate) async fn parse_bytes(
                 }
                 operations = Some(value);
             }
-            Some("map") => {
-                if map.is_some() {
-                    return Err(invalid("the `map` field appears more than once"));
-                }
+            Some("map") if map.is_none() && operations.is_some() && files.is_empty() => {
                 let Some(operations) = operations.as_ref() else {
-                    return Err(invalid("`operations` must appear before `map`"));
+                    unreachable!("the match guard requires operations");
                 };
-                if !files.is_empty() {
-                    return Err(invalid("`map` must appear before file fields"));
-                }
                 let text = field
                     .text()
                     .await
@@ -146,6 +134,18 @@ pub(crate) async fn parse_bytes(
                 map = Some(parse_map(&text, operations)?);
             }
             Some(name) => {
+                if name == "operations" && operations.is_some() && map.is_none() {
+                    return Err(invalid("the `operations` field appears more than once"));
+                }
+                if name == "map" && operations.is_none() {
+                    return Err(invalid("`operations` must appear before `map`"));
+                }
+                if name == "map"
+                    && map.as_ref().is_some_and(|map| !map.contains_key("map"))
+                    && files.is_empty()
+                {
+                    return Err(invalid("the `map` field appears more than once"));
+                }
                 // `field` is moved by `bytes()`, so the name has to be owned before that.
                 let name = name.to_owned();
                 let Some(map) = map.as_ref() else {

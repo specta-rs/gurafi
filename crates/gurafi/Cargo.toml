@@ -19,4 +19,4 @@ indexmap.workspace = true
 tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
-suku = { path = "../suku", default-features = false, features = ["multipart"] }
+suku = { workspace = true, default-features = false, features = ["multipart"] }
