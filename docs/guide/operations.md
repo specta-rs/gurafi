@@ -91,6 +91,114 @@ s.field("giraffeBorn", |_: NoArgs, ctx: &Ctx| {
 });
 ```
 
+### Transporting subscriptions
+
+A subscription is transport-independent; `suku` offers two ways to deliver it:
+
+- **SSE** — `POST` the operation with `Accept: text/event-stream`. Each event is `event: next`
+  with a `data:` JSON payload, followed by `event: complete`. This works through ordinary HTTP
+  proxies and CDNs and needs no upgrade.
+- **WebSocket** — connect with the `graphql-transport-ws` subprotocol at the GraphQL path. Send
+  `connection_init`, wait for `connection_ack`, then `subscribe` with an `id`; the server sends
+  `next` per event and `complete` at the end. A client `complete` cancels the stream.
+
+Use SSE when the client only needs a one-way stream and the deployment blocks upgrades. Use
+WebSocket when many operations should share one connection, the client needs to cancel, or the
+application already speaks the protocol. Both transports execute through the same `Server`, so
+limits, prepared queries and error formatting are identical. Authentication for a WebSocket runs
+once on the upgrade request; the connection then reuses that context.
+
+```graphql
+subscription GiraffeBorn {
+  giraffeBorn { id name }
+}
+```
+
+Over HTTP this is `POST` with `{ "query": "...", "variables": {} }` and
+`Accept: text/event-stream`; over WebSocket it is the `payload` of a `subscribe` message. See
+[Serving over HTTP](../server/suku.md#websocket-graphql-transport-ws).
+
+## File uploads
+
+GraphQL has no binary literal, so file inputs use the
+[multipart request specification](https://github.com/jaydenseric/graphql-multipart-request-spec):
+the operation's variables contain `null` where a file belongs, and the file travels in a separate
+multipart part. The server substitutes the file back into the variables before execution.
+
+Model the file as a custom `Upload` scalar. In raw `gql`, a scalar `parse_value` accepts the
+external value and the resolver downcasts it:
+
+```rust
+use gql::{GraphQLError, ResolverContext, Upload, Value};
+
+fn upload_scalar() -> gql::ScalarType {
+    gql::ScalarType::new("Upload").parse_value(|value| {
+        if value.as_external::<Upload>().is_some() {
+            Ok(value.clone())
+        } else {
+            Err("Expected a multipart file upload".to_owned())
+        }
+    })
+}
+
+fn receive(context: &ResolverContext<'_>) -> Result<Value, GraphQLError> {
+    let file = context
+        .args
+        .get("file")
+        .and_then(Value::as_external::<Upload>)
+        .ok_or_else(|| GraphQLError::new("Expected an upload"))?;
+    // file.filename(), file.content_type(), file.bytes()
+    Ok(Value::from(file.len() as i64))
+}
+```
+
+In `gurafi`, wrap `gql::Upload` in a `ScalarValue` newtype so it can appear in derived input
+objects. The newtype's `from_value` downcasts the external value, and the resolver receives the
+typed wrapper:
+
+```rust
+use gurafi::gql::{GraphQLError, Upload, Value};
+use gurafi::{ScalarValue, impl_scalar_traits};
+
+#[derive(Clone)]
+pub struct UploadFile(pub Upload);
+
+impl ScalarValue for UploadFile {
+    const NAME: &'static str = "Upload";
+
+    fn to_value(&self) -> Result<Value, GraphQLError> {
+        Err(GraphQLError::new("Upload is input-only"))
+    }
+
+    fn from_value(value: &Value) -> Result<Self, GraphQLError> {
+        value
+            .as_external::<Upload>()
+            .cloned()
+            .map(Self)
+            .ok_or_else(|| GraphQLError::new("Expected a multipart file upload"))
+    }
+}
+
+impl_scalar_traits!(UploadFile);
+```
+
+A client sends:
+
+```sh
+curl http://localhost:3000/graphql \
+  -F operations='{ "query": "mutation ($file: Upload!) { uploadAvatar(file: $file) }", "variables": { "file": null } }' \
+  -F map='{ "0": ["variables.file"] }' \
+  -F 0=@avatar.png
+```
+
+Files may be nested in input objects (`variables.input.avatar`) or lists
+(`variables.files.0`), and a batch prefixes paths with the request index. Paths must point at an
+existing `null` inside `variables`; a file cannot be injected anywhere else. See
+[Serving over HTTP](../server/suku.md#multipart-uploads) for limits and error handling.
+
+The transport buffers each request up to `max_body_bytes` (1 MiB by default). Raise it for real
+uploads and set the reverse proxy to the same limit.
+
 ## Root type names
 
 ```rust

@@ -13,6 +13,34 @@ use gql::{GraphQLError, Object, Value};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as JsonValue};
 
+/// A file attached to a path inside a request's variables.
+///
+/// This is produced by the multipart transport (see the `multipart` module) and stored on a
+/// [`GraphQLRequest`]. A path is an operations path such as `variables.file` or
+/// `variables.files.0`; the batch index, if the multipart request was an array, has already been
+/// removed.
+///
+/// The path is *not* a filesystem path. It addresses an existing `null` inside the request's
+/// variables; nothing else is written.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UploadBinding {
+    /// An operations path rooted at `variables`.
+    pub path: String,
+    /// The file to place at that path.
+    pub upload: gql::Upload,
+}
+
+impl UploadBinding {
+    /// Attach an upload to a variables path.
+    #[must_use]
+    pub fn new(path: impl Into<String>, upload: gql::Upload) -> Self {
+        Self {
+            path: path.into(),
+            upload,
+        }
+    }
+}
+
 /// A GraphQL-over-HTTP request body.
 ///
 /// ```json
@@ -55,6 +83,14 @@ pub struct GraphQLRequest {
     /// Free-form request extensions, reserved for things like persisted queries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extensions: Option<Map<String, JsonValue>>,
+    /// Files parsed from a multipart request, in the order they were mapped.
+    ///
+    /// Ordinary JSON requests leave this empty. Multipart requests populate it from the
+    /// specification's `map` field, and [`GraphQLRequest::variables_object`] substitutes each
+    /// [`gql::Upload`] for the `null` at its path. The field is transport state, not part of the
+    /// GraphQL-over-HTTP JSON body, so it is skipped during serialization.
+    #[serde(skip)]
+    pub uploads: Vec<UploadBinding>,
 }
 
 impl GraphQLRequest {
@@ -67,6 +103,7 @@ impl GraphQLRequest {
             operation_name: None,
             variables: None,
             extensions: None,
+            uploads: Vec::new(),
         }
     }
 
@@ -82,6 +119,7 @@ impl GraphQLRequest {
             operation_name: None,
             variables: None,
             extensions: None,
+            uploads: Vec::new(),
         }
     }
 
@@ -162,18 +200,48 @@ impl GraphQLRequest {
         self
     }
 
+    /// Attach a file to a path inside the variables.
+    ///
+    /// `path` is an operations path rooted at `variables`, for example `variables.avatar`. The
+    /// corresponding value in [`GraphQLRequest::variables`] must be `null`; it is replaced with
+    /// the [`gql::Upload`] when the variables are converted for execution. Transports populate
+    /// this from a multipart request; application code can use it to execute an upload without
+    /// HTTP.
+    #[must_use]
+    pub fn with_upload(mut self, path: impl Into<String>, upload: gql::Upload) -> Self {
+        self.uploads.push(UploadBinding::new(path, upload));
+        self
+    }
+
     /// Convert the JSON variables into the GraphQL value model.
+    ///
+    /// Multipart uploads attached with [`GraphQLRequest::with_upload`] (or by the multipart
+    /// transport) are substituted into the converted tree.
     ///
     /// # Errors
     ///
     /// Returns a request error when a number cannot be represented by the GraphQL input value
-    /// model. JSON integers outside GraphQL's 32-bit `Int` become [`gql::Value::BigInt`]; the
-    /// input type that consumes them decides whether that is valid.
+    /// model, or when an upload path does not address an existing `null` inside `variables`.
+    /// JSON integers outside GraphQL's 32-bit `Int` become [`gql::Value::BigInt`]; the input type
+    /// that consumes them decides whether that is valid.
     pub fn variables_object(&self) -> Result<Option<Object>, RequestError> {
-        self.variables
+        let mut object = self
+            .variables
             .as_ref()
             .map(|variables| variables_to_object(variables, ""))
-            .transpose()
+            .transpose()?;
+        if self.uploads.is_empty() {
+            return Ok(object);
+        }
+        let Some(variables) = object.as_mut() else {
+            return Err(RequestError::new(
+                "A multipart upload was mapped into `variables`, but the request has no variables.",
+            ));
+        };
+        for binding in &self.uploads {
+            apply_upload(variables, &binding.path, &binding.upload)?;
+        }
+        Ok(object)
     }
 
     /// Build the borrowed request type used by [`gql::execute`].
@@ -320,6 +388,80 @@ fn variables_to_object(
         );
     }
     Ok(object)
+}
+
+/// Replace the `null` at an operations path with an upload.
+fn apply_upload(
+    variables: &mut Object,
+    path: &str,
+    upload: &gql::Upload,
+) -> Result<(), RequestError> {
+    let segments: Vec<&str> = path.split('.').collect();
+    let Some((&"variables", rest)) = segments.split_first() else {
+        return Err(RequestError::new(format!(
+            "Upload path \"{path}\" must start with `variables`."
+        )));
+    };
+    if rest.is_empty() {
+        return Err(RequestError::new(format!(
+            "Upload path \"{path}\" does not name a variable."
+        )));
+    }
+    let value = variables
+        .get_mut(rest[0])
+        .ok_or_else(|| missing_upload_target(path))?;
+    replace_upload_target(value, &rest[1..], path, upload)
+}
+
+fn replace_upload_target(
+    value: &mut Value,
+    segments: &[&str],
+    path: &str,
+    upload: &gql::Upload,
+) -> Result<(), RequestError> {
+    if segments.is_empty() {
+        if !value.is_null() {
+            return Err(RequestError::new(format!(
+                "Upload path \"{path}\" points at a value that is not `null`; the multipart specification requires files to be replaced with `null`."
+            )));
+        }
+        *value = Value::from(upload.clone());
+        return Ok(());
+    }
+    let segment = segments[0];
+    if segment.is_empty() {
+        return Err(RequestError::new(format!(
+            "Upload path \"{path}\" contains an empty segment."
+        )));
+    }
+    match value {
+        Value::Object(object) => {
+            let child = Object::get_mut(std::sync::Arc::make_mut(object), segment)
+                .ok_or_else(|| missing_upload_target(path))?;
+            replace_upload_target(child, &segments[1..], path, upload)
+        }
+        Value::List(list) => {
+            let index: usize = segment.parse().map_err(|_| {
+                RequestError::new(format!(
+                    "Upload path \"{path}\" uses \"{segment}\" where a list index was expected."
+                ))
+            })?;
+            let len = list.len();
+            let child = list.get_mut(index).ok_or_else(|| {
+                RequestError::new(format!(
+                    "Upload path \"{path}\" refers to list index {index}, but the list has {len} elements."
+                ))
+            })?;
+            replace_upload_target(child, &segments[1..], path, upload)
+        }
+        _ => Err(missing_upload_target(path)),
+    }
+}
+
+fn missing_upload_target(path: &str) -> RequestError {
+    RequestError::new(format!(
+        "Upload path \"{path}\" does not identify a `null` inside the request variables."
+    ))
 }
 
 /// Convert a JSON value into the GraphQL value model.

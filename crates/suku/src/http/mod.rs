@@ -2,12 +2,13 @@
 //!
 //! [`handle`] implements the [GraphQL over HTTP](https://graphql.github.io/graphql-over-http/)
 //! draft for one request: content negotiation, GET and POST parameters, request body limits,
-//! status codes, GraphiQL and server-sent event subscriptions. It never touches a socket, so the
-//! same logic backs the Axum integration and can be embedded in any HTTP framework.
+//! status codes, GraphiQL, server-sent event subscriptions and GraphQL multipart requests for
+//! file uploads (with the default `multipart` feature). It never touches a socket, so the same
+//! logic backs the Axum integration and can be embedded in any HTTP framework.
 //!
 //! The `Authorization` header (and every other request header) is never interpreted here. Pass an
 //! [`ExtractContext`] callback to authenticate a request and build the per-request
-//! [`Context`].
+//! [`Context`]. Multipart requests are authenticated before their parts are parsed.
 
 mod accept;
 
@@ -197,6 +198,11 @@ pub struct HttpConfig {
     pub max_body_bytes: Option<usize>,
     /// Override the server's batch size limit.
     pub max_batch_size: Option<usize>,
+    /// Override the maximum number of multipart fields, including `operations` and `map`.
+    ///
+    /// Defaults to `DEFAULT_MAX_MULTIPART_PARTS` (32) when the `multipart` feature is enabled.
+    /// `0` disables the limit.
+    pub max_multipart_parts: Option<usize>,
 }
 
 impl Default for HttpConfig {
@@ -206,6 +212,7 @@ impl Default for HttpConfig {
             graphiql: true,
             max_body_bytes: None,
             max_batch_size: None,
+            max_multipart_parts: None,
         }
     }
 }
@@ -243,6 +250,13 @@ impl HttpConfig {
     #[must_use]
     pub const fn max_batch_size(mut self, size: usize) -> Self {
         self.max_batch_size = Some(size);
+        self
+    }
+
+    /// Override the multipart part limit. `0` disables the limit.
+    #[must_use]
+    pub const fn max_multipart_parts(mut self, parts: usize) -> Self {
+        self.max_multipart_parts = Some(parts);
         self
     }
 }
@@ -495,12 +509,19 @@ where
     F: FnOnce(ContextRequest) -> Fut + Send,
     Fut: Future<Output = Result<Context, HttpError>> + Send,
 {
-    if !is_json_content_type(parts.headers.get(header::CONTENT_TYPE)) {
+    let content_type = parts.headers.get(header::CONTENT_TYPE);
+    let multipart = is_multipart_content_type(content_type);
+    if !is_json_content_type(content_type) && !multipart {
+        #[cfg(feature = "multipart")]
+        let message =
+            "POST requests must use `Content-Type: application/json` or `multipart/form-data`.";
+        #[cfg(not(feature = "multipart"))]
+        let message = "POST requests must use `Content-Type: application/json`.";
         return request_error(
             server,
             accept,
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "POST requests must use `Content-Type: application/json`.",
+            message,
             None,
         );
     }
@@ -526,7 +547,22 @@ where
     let max_batch_size = config
         .max_batch_size
         .unwrap_or_else(|| server.max_batch_size_limit());
-    let payload = match RequestPayload::from_json_slice(body, max_batch_size) {
+    #[cfg(feature = "multipart")]
+    let payload = if multipart {
+        let max_parts = config
+            .max_multipart_parts
+            .unwrap_or(crate::multipart::DEFAULT_MAX_MULTIPART_PARTS);
+        let content_type = content_type
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        crate::multipart::parse(content_type, body, max_parts, max_batch_size).await
+    } else {
+        RequestPayload::from_json_slice(body, max_batch_size)
+    };
+    #[cfg(not(feature = "multipart"))]
+    let payload = RequestPayload::from_json_slice(body, max_batch_size);
+
+    let mut payload = match payload {
         Ok(payload) => payload,
         Err(error) => {
             return request_error(
@@ -538,7 +574,6 @@ where
             );
         }
     };
-    let mut payload = payload;
     apply_header_id_to_payload(&mut payload, &parts.headers);
 
     process_payload(server, accept, payload, context).await
@@ -880,6 +915,29 @@ fn is_json_content_type(value: Option<&HeaderValue>) -> bool {
         || media.eq_ignore_ascii_case("application/graphql-response+json")
 }
 
+fn is_multipart_content_type(value: Option<&HeaderValue>) -> bool {
+    #[cfg(not(feature = "multipart"))]
+    {
+        let _ = value;
+        false
+    }
+    #[cfg(feature = "multipart")]
+    {
+        let Some(value) = value else {
+            return false;
+        };
+        let Ok(value) = value.to_str() else {
+            return false;
+        };
+        value
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .eq_ignore_ascii_case("multipart/form-data")
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct GetParameters {
     query: Option<String>,
@@ -904,6 +962,7 @@ fn get_request(
         operation_name,
         variables: parse_json_object(variables, "variables")?,
         extensions: parse_json_object(extensions, "extensions")?,
+        uploads: Vec::new(),
     })
 }
 
