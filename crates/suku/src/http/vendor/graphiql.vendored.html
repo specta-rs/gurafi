@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GraphiQL</title>
+    <!--
+      GraphiQL, React and ReactDOM are inlined by suku's build script. Versions and
+      checksums are recorded in src/http/vendor/versions.txt.
+    -->
+    <style>
+      body {
+        height: 100%;
+        margin: 0;
+        width: 100%;
+        overflow: hidden;
+      }
+
+      #graphiql {
+        height: 100vh;
+      }
+
+      #loading {
+        align-items: center;
+        display: flex;
+        font-family: system-ui, sans-serif;
+        height: 100vh;
+        justify-content: center;
+      }
+    </style>
+    <style>
+/*{{GRAPHIQL_CSS}}*/
+    </style>
+  </head>
+  <body>
+    <div id="graphiql"><div id="loading">Loading GraphiQL…</div></div>
+
+    <script>
+/*{{REACT_JS}}*/
+    </script>
+    <script>
+/*{{REACT_DOM_JS}}*/
+    </script>
+    <script>
+/*{{GRAPHIQL_JS}}*/
+    </script>
+    <script>
+      (function () {
+        var container = document.getElementById("graphiql");
+        var fetcher = GraphiQL.createFetcher({ url: window.location.pathname });
+
+        ReactDOM.createRoot(container).render(
+          React.createElement(GraphiQL, {
+            fetcher: fetcher,
+            defaultEditorToolsVisibility: true,
+          })
+        );
+      })();
+    </script>
+  </body>
+</html>

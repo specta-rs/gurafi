@@ -35,9 +35,19 @@ use crate::{
 
 use self::accept::{Accept, JsonMedia};
 
+// The default page loads React and GraphiQL from unpkg. With `vendored-graphiql`, `build.rs`
+// assembles a self-contained page from the checked-in browser bundles so an offline or
+// air-gapped deployment never contacts a CDN.
+#[cfg(feature = "vendored-graphiql")]
+const GRAPHIQL_HTML: &str = include_str!(concat!(env!("OUT_DIR"), "/graphiql.html"));
+#[cfg(not(feature = "vendored-graphiql"))]
 const GRAPHIQL_HTML: &str = include_str!("graphiql.html");
 
 /// The static GraphiQL page served for `GET` requests that accept HTML.
+///
+/// By default the page loads React, ReactDOM and GraphiQL from unpkg. Enable the
+/// `vendored-graphiql` feature to serve a self-contained page with every asset inlined and no
+/// network requests to a CDN.
 #[must_use]
 pub fn graphiql_html() -> &'static str {
     GRAPHIQL_HTML

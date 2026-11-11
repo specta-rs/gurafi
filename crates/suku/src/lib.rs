@@ -22,6 +22,7 @@
 //! | `axum` | yes | The [`axum`] router and `ExtractContext` integration. |
 //! | `ws` | yes | `graphql-transport-ws` WebSocket subscriptions. Enables `axum`. |
 //! | `multipart` | yes | GraphQL multipart requests; uses `multer`. |
+//! | `vendored-graphiql` | no | Self-contained GraphiQL page with pinned browser assets. |
 //! | `tracing` | no | Request spans, and `gql/tracing`. |
 //!
 //! To build without WebSocket support while keeping Axum:
@@ -74,6 +75,22 @@
 //!
 //! See the module documentation of `ws` and `multipart` for the protocol details, and the
 //! crate README for deployment notes.
+//!
+//! # GraphiQL assets
+//!
+//! The GraphiQL page served for `GET` requests that accept HTML loads React, ReactDOM and
+//! GraphiQL from unpkg by default. Enable the `vendored-graphiql` feature to compile the pinned
+//! browser assets into the crate and serve one self-contained page with no CDN requests:
+//!
+//! ```toml
+//! [dependencies]
+//! suku = { version = "0.0.1", features = ["vendored-graphiql"] }
+//! ```
+//!
+//! The inline page works with both [`http::handle`] and the Axum adapter because it needs no asset
+//! routes. Scripts and styles are inline, so an accompanying CSP should allow inline script/style
+//! while restricting `connect-src` to the application itself. Versions, checksums, licenses and
+//! the update procedure live in `crates/suku/src/http/vendor/`.
 //!
 //! # Observability
 //!

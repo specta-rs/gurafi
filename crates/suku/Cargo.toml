@@ -17,6 +17,8 @@ ws = ["axum", "axum/ws"]
 # GraphQL multipart requests (file uploads). Enabled by default; disable it to remove `multer`.
 multipart = ["dep:multer"]
 tracing = ["dep:tracing", "gql/tracing"]
+# Serve GraphiQL from React/GraphiQL assets built into the crate instead of the unpkg CDN.
+vendored-graphiql = []
 
 [dependencies]
 gql.workspace = true
