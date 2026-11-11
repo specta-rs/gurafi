@@ -273,6 +273,9 @@
 //! It is off by default. Loader spans record the key *type* and cache hit/miss, never key values;
 //! per-resolver and cache events are TRACE. See the repository's `docs/plugins/tracing.md`.
 
+#![doc(
+    html_favicon_url = "https://raw.githubusercontent.com/specta-rs/gurafi/main/docs/favicon.svg"
+)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 

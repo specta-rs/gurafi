@@ -100,6 +100,9 @@
 //! events with a status and code. Request bodies, headers, tokens and variable values are never
 //! recorded. See the repository's `docs/plugins/tracing.md`.
 
+#![doc(
+    html_favicon_url = "https://raw.githubusercontent.com/specta-rs/gurafi/main/docs/favicon.svg"
+)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
 
