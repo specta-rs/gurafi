@@ -61,7 +61,8 @@ use crate::{
 /// Asynchronous resolvers accept a closure returning this type, so a resolver is written as
 /// `Box::pin(async move { ... })`. The box is allocated once per field resolution; `gql`
 /// already boxes every resolver future, so this is the same allocation the executor needs
-/// anyway.
+/// anyway. Fields declared with [`ObjectBuilder::expose`] do not use this type: they install a
+/// synchronous property resolver and allocate no future.
 pub type BoxFuture<'a, T> = futures::future::BoxFuture<'a, T>;
 
 /// A reference to an object type whose GraphQL name may be computed at runtime.
@@ -1898,22 +1899,20 @@ impl<'a, Ctx: 'static, M: ObjectModel> ObjectBuilder<'a, Ctx, M> {
     /// Expose a model property as a field.
     ///
     /// The field name and type are inferred by `gurafi::expose!`.
+    ///
+    /// The accessor is installed as a synchronous property resolver: execution calls it inline,
+    /// without boxing a future, on both the leaf fast path and the general completion path. Field
+    /// options that need a future (`auth`, `auth_async`, `validate` or a plugin that wraps
+    /// `resolve`) convert the field to the boxed path once, when the option is applied.
     pub fn expose<T>(&mut self, expose: Expose<M, T>) -> FieldConfig<'_, Ctx>
     where
         T: OutputType + IntoValue + Send + 'static,
     {
         let (name, get) = expose.into_parts();
         T::register_output(self.registry);
-        let field = gql::Field::new(name, T::output_type()).resolve(move |context| {
-            let get = Arc::clone(&get);
-            Box::pin(async move {
-                let model = model_ref::<M>(
-                    context.parent,
-                    context.info.parent_type,
-                    context.info.field_name,
-                )?;
-                (get)(model).into_value()
-            })
+        let field = gql::Field::new(name, T::output_type()).sync_resolve(move |context| {
+            let model = model_ref::<M>(context.parent, context.parent_type, context.field_name)?;
+            (get)(model).into_value()
         });
         self.push(
             field,

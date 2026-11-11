@@ -78,9 +78,9 @@ pub use schema::{
 pub use sdl_schema::schema_from_sdl;
 pub use types::{
     AppliedDirective, ComplexityFn, DirectiveDefinition, EnumType, EnumValue, Field, FieldResult,
-    InputObjectType, InputValue, InterfaceType, Name, ObjectType, ResolveFn, ResolveFuture,
-    ResolveInfo, ResolveTypeFn, ResolverContext, ScalarType, SubscribeFn, SubscriptionStream, Type,
-    TypeKind, TypeRef, UnionType,
+    InputObjectType, InputValue, InterfaceType, Name, ObjectType, PropertyContext,
+    PropertyResolveFn, ResolveFn, ResolveFuture, ResolveInfo, ResolveTypeFn, ResolverContext,
+    ScalarType, SubscribeFn, SubscriptionStream, Type, TypeKind, TypeRef, UnionType,
 };
 pub use validation::{ValidationOptions, validate};
 pub use value::{External, Object, Value};

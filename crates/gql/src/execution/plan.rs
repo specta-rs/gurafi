@@ -91,11 +91,13 @@ pub(crate) struct FieldPlan<'a> {
     type_name: Name,
     /// Response keys in first-seen order.
     groups: Vec<FieldGroup<'a>>,
-    /// Whether any field this plan selects defines a resolver.
+    /// Whether any field this plan selects defines an asynchronous resolver.
     ///
     /// The plan records this for the fields it selects, which is what the synchronous completion
-    /// path needs: it only ever completes selected fields, and refuses any field that defines a
-    /// resolver. A source without a plan for the type keeps the conservative type-wide check.
+    /// path needs: it only ever completes selected fields, and refuses any field that defines an
+    /// asynchronous resolver. A synchronous property resolver does not count, because the
+    /// synchronous path runs it inline. A source without a plan for the type keeps the
+    /// conservative type-wide check.
     pub(crate) has_resolvers: bool,
     /// Whether the response object is exactly a projection of the parent object.
     ///
@@ -807,7 +809,8 @@ impl<'a> Builder<'a, '_, '_> {
         // Only the fields this plan selects can ever be completed through it, so the resolver check
         // covers those fields rather than the whole type. A type-wide scan would refuse the
         // synchronous completion path for every selection of a type that happens to define a
-        // resolver the document never asks for.
+        // resolver the document never asks for. A synchronous property resolver does not count:
+        // the synchronous path runs it inline.
         let has_resolvers = groups.iter().any(|group| {
             group
                 .field_index
@@ -1071,10 +1074,10 @@ fn condition<'a>(directives: &[ast::Directive<'a>]) -> Condition<'a> {
 
 /// Describe an unaliased, resolver-free built-in scalar property.
 ///
-/// Anything that could observe the field (a resolver, arguments, a custom scalar, a composite or
-/// list type) returns `None` and keeps the general completion path.
+/// Anything that could observe the field (an asynchronous or synchronous resolver, arguments, a
+/// custom scalar, a composite or list type) returns `None` and keeps the general completion path.
 fn property(schema: &Schema, field: &Field) -> Option<Property> {
-    if field.resolve.is_some() || !field.args.is_empty() {
+    if field.resolve.is_some() || field.sync_resolve.is_some() || !field.args.is_empty() {
         return None;
     }
     let mut ty = &field.ty;

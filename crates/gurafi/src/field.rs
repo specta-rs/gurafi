@@ -12,7 +12,7 @@ use indexmap::IndexMap;
 use crate::{
     registry::TypeRegistry,
     schema::ObjectRef,
-    traits::{AbstractType, InputObject, ObjectModel, OutputType},
+    traits::{AbstractType, InputObject, ObjectModel, OutputType, coerce_args},
 };
 
 /// A deferred check that a field's declared type is compatible with its Rust type.
@@ -586,6 +586,36 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
             return self;
         }
         self.validation.install::<A>(validator);
+        // A synchronous property resolver reads the model directly and never coerces arguments,
+        // so a validator would have nowhere to run. Convert to the boxed path once, at the point
+        // the option is applied, and run the hook before the property read — the same place a
+        // resolver-backed field runs it.
+        let materialize = self
+            .sink
+            .get(&self.name)
+            .is_some_and(|field| field.sync_resolve.is_some());
+        if materialize {
+            if let Some(field) = self.sink.get_mut(&self.name) {
+                materialize_resolve(field);
+                if let Some(resolve) = field.resolve.take() {
+                    let validation = self.validation.clone();
+                    field.resolve = Some(Arc::new(move |context| {
+                        let resolve = Arc::clone(&resolve);
+                        let validation = validation.clone();
+                        Box::pin(async move {
+                            let args = coerce_args::<A>(
+                                context.args,
+                                context.info.parent_type,
+                                context.info.field_name,
+                            )?;
+                            let ctx = context.context.require_data::<Ctx>()?;
+                            validation.run(&args, ctx)?;
+                            resolve(context).await
+                        })
+                    }));
+                }
+            }
+        }
         self
     }
 
@@ -959,10 +989,22 @@ pub(crate) fn read_raw_field(
 /// field's resolver. When an authorization rule reaches such a field, install an equivalent
 /// property resolver first so the guard cannot be silently skipped.
 pub(crate) fn install_property_resolver(field: &mut Field) {
-    if field.resolve.is_some() || field.subscribe.is_some() {
+    if field.resolve.is_some() || field.sync_resolve.is_some() || field.subscribe.is_some() {
         return;
     }
     field.resolve = Some(property_resolver(field.name.clone()));
+}
+
+/// Replace a synchronous property resolver with the equivalent boxed resolver.
+///
+/// A builder option that needs a future — a validation hook, field authorization, or a plugin
+/// wrapper — cannot call the synchronous hook from inside its own future unless the hook is
+/// boxed. Converting here, when the option is applied, keeps the allocation-free path for every
+/// field that never receives such an option.
+pub(crate) fn materialize_resolve(field: &mut Field) {
+    if field.sync_resolve.is_some() {
+        field.resolve = field.take_resolve();
+    }
 }
 
 /// The resolver a raw field would use if the executor ran its default property lookup.
@@ -983,6 +1025,7 @@ pub(crate) fn property_resolver(name: Name) -> gql::ResolveFn {
 /// the feature available even when a server does not install one.
 pub(crate) fn apply_auth_guard<Ctx: 'static>(field: &mut Field, guard: Arc<AuthGuard<Ctx>>) {
     install_property_resolver(field);
+    materialize_resolve(field);
     let resolve_guard = Arc::clone(&guard);
     if let Some(resolve) = field.resolve.take() {
         field.resolve = Some(Arc::new(move |context| {
