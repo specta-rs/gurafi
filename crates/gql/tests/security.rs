@@ -4,7 +4,8 @@
 //! untrusted clients and currently passes (i.e. the problem is present). The remaining tests
 //! pin protections that the engine does provide, so a regression shows up here.
 //!
-//! The stack-bound tests run on a dedicated 2 MiB thread, the default for a Tokio worker.
+//! The stack-bound tests run on the budget in `support/stack.rs`: a Tokio worker's 2 MiB in a
+//! release build, and a larger budget in an unoptimised one, whose frames do not fit 2 MiB.
 
 use std::sync::{Arc, Mutex};
 
@@ -13,6 +14,11 @@ use gql::{
     AuthorizationContext, Authorizer, ExecutionOptions, Field, GraphQLError, InterfaceType,
     ObjectType, Request, Response, Schema, TypeRef, ValidationOptions, Value, validate,
 };
+
+#[path = "support/stack.rs"]
+mod stack;
+
+use crate::stack::stack_size;
 
 // -------------------------------------------------------------------------------------------
 // Fixtures
@@ -555,10 +561,10 @@ fn deep_query_is_rejected_before_execution_on_a_small_stack() {
 ///
 /// Preparation is iterative, but executing a plan recurses through larger async frames than the
 /// dynamic collection path. Execution therefore drops a plan deeper than a safe threshold and
-/// collects dynamically, so a prepared document at the parser's depth limit still runs on a 2 MiB
-/// stack (the default for a Tokio worker).
+/// collects dynamically, so a prepared document at the parser's depth limit still runs within a
+/// worker's stack budget.
 #[test]
-fn prepared_execute_on_a_2_mib_stack() {
+fn prepared_execute_within_the_stack_budget() {
     let depth = gql::parser::MAX_DEPTH - 2;
     let schema = recursive_schema();
     let mut query = String::new();
@@ -573,7 +579,7 @@ fn prepared_execute_on_a_2_mib_stack() {
         .expect("valid prepared query");
 
     std::thread::Builder::new()
-        .stack_size(2 * 1024 * 1024)
+        .stack_size(stack_size())
         .spawn(move || {
             let response = block_on(prepared.execute(
                 None,
@@ -591,7 +597,7 @@ fn prepared_execute_on_a_2_mib_stack() {
 /// The shallow side of the planned-path threshold still executes on a 2 MiB stack.
 ///
 /// This walks the last depth that keeps the precompiled plan; the next level falls back to
-/// dynamic collection (covered by `prepared_execute_on_a_2_mib_stack`). Both sides of the
+/// dynamic collection (covered by `prepared_execute_within_the_stack_budget`). Both sides of the
 /// threshold must stay within a worker's stack.
 #[test]
 fn prepared_planned_nesting_near_the_threshold_runs_on_a_small_stack() {
@@ -640,7 +646,7 @@ fn query_at_the_parser_depth_limit_executes() {
     }
 
     std::thread::Builder::new()
-        .stack_size(2 * 1024 * 1024)
+        .stack_size(stack_size())
         .spawn(move || {
             let response = run(&schema, &query, &ExecutionOptions::default());
             assert!(response.errors.is_empty(), "{:?}", response.errors);

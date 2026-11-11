@@ -1,5 +1,8 @@
 //! Regression tests for prepared-query security and frontend review findings.
 
+#[path = "support/stack.rs"]
+mod stack;
+
 use std::time::Duration;
 
 use futures::executor::block_on;
@@ -7,6 +10,8 @@ use gql::{
     ExecutionOptions, Field, InputValue, Object, ObjectType, Request, Schema, TypeRef, Value,
     prepared::PreparedQuery,
 };
+
+use crate::stack::stack_size;
 
 fn run(
     schema: &Schema,
@@ -196,17 +201,11 @@ fn deep_source_and_root(depth: usize) -> (String, Value) {
 }
 
 #[test]
-fn prepared_prepare_only_on_a_2_mib_stack() {
+fn prepared_prepare_only_within_the_stack_budget() {
     let depth = gql::parser::MAX_DEPTH - 2;
     let (source, _) = deep_source_and_root(depth);
     std::thread::Builder::new()
-        .stack_size(
-            std::env::var("STACK_KB")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2048)
-                * 1024,
-        )
+        .stack_size(stack_size())
         .spawn(move || {
             let schema = recursive_schema();
             let prepared = PreparedQuery::new(&schema, "deep", &source, None).expect("prepared");
@@ -218,19 +217,13 @@ fn prepared_prepare_only_on_a_2_mib_stack() {
 }
 
 #[test]
-fn prepared_execute_on_a_2_mib_stack() {
+fn prepared_execute_within_the_stack_budget() {
     let depth = gql::parser::MAX_DEPTH - 2;
     let (source, root) = deep_source_and_root(depth);
     let schema = recursive_schema();
     let prepared = PreparedQuery::new(&schema, "deep", &source, None).expect("prepared");
     std::thread::Builder::new()
-        .stack_size(
-            std::env::var("STACK_KB")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2048)
-                * 1024,
-        )
+        .stack_size(stack_size())
         .spawn(move || {
             let options = ExecutionOptions::default().root_value(root);
             let response = block_on(prepared.execute(None, &options));
@@ -244,18 +237,12 @@ fn prepared_execute_on_a_2_mib_stack() {
 }
 
 #[test]
-fn normal_execute_on_a_2_mib_stack() {
+fn normal_execute_within_the_stack_budget() {
     let depth = gql::parser::MAX_DEPTH - 2;
     let (source, root) = deep_source_and_root(depth);
     let schema = recursive_schema();
     std::thread::Builder::new()
-        .stack_size(
-            std::env::var("STACK_KB")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2048)
-                * 1024,
-        )
+        .stack_size(stack_size())
         .spawn(move || {
             let options = ExecutionOptions::default().root_value(root);
             let response = block_on(gql::execute(

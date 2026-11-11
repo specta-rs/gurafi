@@ -24,3 +24,9 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace
+
+      # `cargo test --workspace` runs an unoptimised build, and its larger frames need more than
+      # a 2 MiB worker stack at the parser's depth limit (see `crates/gql/tests/support/stack.rs`).
+      # The depth-limit tests only assert the 2 MiB budget in a release build, so check it here.
+      - name: Verify the depth-limit stack budget
+        run: cargo test --release -p gql --all-features --test review_prepared --test security
