@@ -1,0 +1,33 @@
+name: Sync docs to website
+
+# The website assembles its docs from this repository at build time. Trigger
+# that sync on every push to main so a docs change here redeploys specta.dev.
+# Requires a repository secret named WEBSITE_DISPATCH_TOKEN: a PAT with
+# permission to dispatch workflows in specta-rs/website.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-docs-to-website
+  cancel-in-progress: true
+
+jobs:
+  dispatch:
+    name: Dispatch website docs sync
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger specta-rs/website
+        env:
+          GH_TOKEN: ${{ secrets.WEBSITE_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg sha "$GITHUB_SHA" \
+            --arg ref "$GITHUB_REF_NAME" \
+            '{event_type: "gurafi-docs", client_payload: {sha: $sha, ref: $ref}}' \
+            | gh api repos/specta-rs/website/dispatches --input -
