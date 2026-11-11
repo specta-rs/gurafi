@@ -709,8 +709,8 @@ impl<'doc> Executor<'doc> {
                     )
                     .with_path(path.to_vec()));
                 }
-                // Leaf fields that need no resolver complete synchronously; `ready` keeps
-                // them in the same ordered batch as the asynchronous fields without boxing
+                // Leaf fields that need no asynchronous resolver complete synchronously; `ready`
+                // keeps them in the same ordered batch as the asynchronous fields without boxing
                 // a future or cloning the path for each one.
                 let mut field_errors = Vec::new();
                 let inline = self.try_execute_leaf_planned(
@@ -841,8 +841,8 @@ impl<'doc> Executor<'doc> {
                     )
                     .with_path(path.to_vec()));
                 }
-                // Leaf fields that need no resolver complete synchronously; `ready` keeps
-                // them in the same ordered batch as the asynchronous fields without boxing
+                // Leaf fields that need no asynchronous resolver complete synchronously; `ready`
+                // keeps them in the same ordered batch as the asynchronous fields without boxing
                 // a future or cloning the path for each one.
                 let mut field_errors = Vec::new();
                 let inline = self.try_execute_leaf_dynamic(
@@ -995,8 +995,9 @@ impl<'doc> Executor<'doc> {
 
     /// The schema field for a selection that the synchronous leaf path can complete.
     ///
-    /// The field must exist, have no resolver and no arguments (so argument coercion cannot
-    /// fail or be observed), and return a scalar or enum.
+    /// The field must exist, have no asynchronous resolver and no arguments (so argument coercion
+    /// cannot fail or be observed), and return a scalar or enum. A synchronous property resolver
+    /// is fine: the leaf path runs it inline.
     fn try_execute_leaf_dynamic<'s>(
         &'s self,
         object_type: &ObjectType,
@@ -1034,9 +1035,8 @@ impl<'doc> Executor<'doc> {
             parent: object_type.name.as_ref(),
             name: field.name.as_ref(),
         };
-        let outcome = match default_property(label, field.name.as_ref(), parent) {
+        let outcome = match read_property(field, parent, label) {
             Ok(value) => {
-                let value = property_value(value);
                 match self.complete_leaf(&value, &field.ty, label, location, path, false) {
                     Some(outcome) => outcome,
                     None => {
@@ -1218,8 +1218,8 @@ impl<'doc> Executor<'doc> {
                     .iter()
                     .filter(|node| node.selection_set.is_some())
                     .count(),
-                field.is_some_and(|field| field.resolve.is_some()),
-                field.is_some_and(|field| field.resolve.is_none() && field.args.is_empty())
+                field.is_some_and(|field| field.has_resolver()),
+                field.is_some_and(|field| !field.has_resolver() && field.args.is_empty())
             );
             let outcome = super::super::telemetry::instrument_span_if_enabled!(
                 span.clone(),
@@ -1429,9 +1429,7 @@ impl<'doc> Executor<'doc> {
                     Some(resolve) => panic::resolver(resolve, resolver_context)
                         .await
                         .map(Cow::Owned),
-                    None => {
-                        default_property(label, field.name.as_ref(), parent).map(property_value)
-                    }
+                    None => read_property(field, parent, label),
                 }
             }
         };
@@ -1591,8 +1589,8 @@ impl<'doc> Executor<'doc> {
                     .iter()
                     .filter(|node| node.selection_set.is_some())
                     .count(),
-                field.is_some_and(|field| field.resolve.is_some()),
-                field.is_some_and(|field| field.resolve.is_none() && field.args.is_empty())
+                field.is_some_and(|field| field.has_resolver()),
+                field.is_some_and(|field| !field.has_resolver() && field.args.is_empty())
             );
             let outcome = super::super::telemetry::instrument_span_if_enabled!(
                 span.clone(),
@@ -1783,9 +1781,7 @@ impl<'doc> Executor<'doc> {
                     Some(resolve) => panic::resolver(resolve, resolver_context)
                         .await
                         .map(Cow::Owned),
-                    None => {
-                        default_property(label, field.name.as_ref(), parent).map(property_value)
-                    }
+                    None => read_property(field, parent, label),
                 }
             }
         };
@@ -2009,8 +2005,9 @@ impl<'doc> Executor<'doc> {
 
     /// The schema field for a selection that the synchronous leaf path can complete.
     ///
-    /// The field must exist, have no resolver and no arguments (so argument coercion cannot
-    /// fail or be observed), and return a scalar or enum.
+    /// The field must exist, have no asynchronous resolver and no arguments (so argument coercion
+    /// cannot fail or be observed), and return a scalar or enum. A synchronous property resolver
+    /// is fine: the leaf path runs it inline.
     fn leaf_field<'f>(
         &self,
         object_type: &'f ObjectType,
@@ -2039,10 +2036,11 @@ impl<'doc> Executor<'doc> {
 
     /// Complete a leaf field that needs no asynchronous work in place.
     ///
-    /// A field with no resolver, no arguments and a scalar or enum type resolves through the
-    /// default property resolver and completes synchronously. Doing it here avoids boxing a
-    /// future and cloning the path for every such field, which is the common case for object
-    /// properties. Returning `None` hands the field to the general path unchanged.
+    /// A field with no asynchronous resolver, no arguments and a scalar or enum type resolves
+    /// through its synchronous property resolver (or the default property lookup) and completes
+    /// synchronously. Doing it here avoids boxing a future and cloning the path for every such
+    /// field, which is the common case for object properties. Returning `None` hands the field to
+    /// the general path unchanged.
     #[allow(clippy::too_many_arguments)]
     fn try_execute_leaf_planned<'s>(
         &'s self,
@@ -2076,9 +2074,8 @@ impl<'doc> Executor<'doc> {
             parent: object_type.name.as_ref(),
             name: field.name.as_ref(),
         };
-        let outcome = match default_property(label, field.name.as_ref(), parent) {
+        let outcome = match read_property(field, parent, label) {
             Ok(value) => {
-                let value = property_value(value);
                 match self.complete_leaf(&value, &field.ty, label, location, path, false) {
                     Some(outcome) => outcome,
                     None => {
@@ -2155,10 +2152,10 @@ impl<'doc> Executor<'doc> {
             path.as_slice(),
             crate::telemetry::field_type_label(group.field),
             group.nodes.selection_sets().len(),
-            group.field.is_some_and(|field| field.resolve.is_some()),
+            group.field.is_some_and(|field| field.has_resolver()),
             group
                 .field
-                .is_some_and(|field| field.resolve.is_none() && field.args.is_empty())
+                .is_some_and(|field| !field.has_resolver() && field.args.is_empty())
         );
         let outcome = crate::telemetry::instrument_span_if_enabled!(
             _span.clone(),
@@ -2330,7 +2327,7 @@ impl<'doc> Executor<'doc> {
             .as_ref()
             .filter(|_| !(self.skip_root_authorization && path.len() == 1));
         let resolved = if authorizer.is_none() && field.resolve.is_none() {
-            default_property(label, field.name.as_ref(), parent).map(property_value)
+            read_property(field, parent, label)
         } else {
             let field_nodes = group.nodes.field_node_refs();
             let info = self.resolve_info(
@@ -2368,9 +2365,7 @@ impl<'doc> Executor<'doc> {
                     Some(resolve) => panic::resolver(resolve, resolver_context)
                         .await
                         .map(Cow::Owned),
-                    None => {
-                        default_property(label, field.name.as_ref(), parent).map(property_value)
-                    }
+                    None => read_property(field, parent, label),
                 }
             }
         };
@@ -3025,8 +3020,10 @@ impl<'doc> Executor<'doc> {
     ///
     /// Returns `None` when the depth limit makes the fast path unsafe or when a field needs the
     /// asynchronous path. Either way the attempt left no trace: errors went into a dropped scratch
-    /// list, every path segment was popped, and no caller code ran (resolvers, authorizers, meta
-    /// fields, abstract types and non-built-in scalar serializers all bail out first).
+    /// list, every path segment was popped, and no asynchronous caller code ran (futures,
+    /// authorizers, meta fields, abstract types and non-built-in scalar serializers all bail out
+    /// first). Synchronous property resolvers do run here; they are required to be pure reads, so
+    /// a retry on the asynchronous path observes nothing extra.
     #[inline(never)]
     fn try_execute_fields_sync(
         &self,
@@ -3122,9 +3119,10 @@ impl<'doc> Executor<'doc> {
 
     /// Complete fields that are already collected, without awaiting.
     ///
-    /// Every construct that could touch caller code is refused rather than approximated:
-    /// resolvers, authorizers, meta fields, abstract types and custom scalar serializers all
-    /// hand the work back so the async path handles them with the exact same semantics.
+    /// Every construct that could await is refused rather than approximated: asynchronous
+    /// resolvers, authorizers, meta fields, abstract types and custom scalar serializers all hand
+    /// the work back so the async path handles them with the exact same semantics. Synchronous
+    /// property resolvers run inline.
     /// Fill a response object from a precompiled field plan.
     ///
     /// The plan already resolved every group's schema field, response key, argument template and
@@ -3360,8 +3358,7 @@ impl<'doc> Executor<'doc> {
         let definition = field
             .type_index
             .and_then(|index| self.context.schema.type_at(index));
-        let outcome = match default_property(label, field.name.as_ref(), parent).map(property_value)
-        {
+        let outcome = match read_property(field, parent, label) {
             Ok(value) => self.complete_field_value_typed_sync(
                 &value,
                 &field.ty,
@@ -3395,7 +3392,11 @@ impl<'doc> Executor<'doc> {
         field: &crate::types::Field,
         parent: &Value,
     ) -> Option<(Arc<str>, Value)> {
-        if field.resolve.is_some() || !field.args.is_empty() || self.context.authorizer.is_some() {
+        if field.resolve.is_some()
+            || field.sync_resolve.is_some()
+            || !field.args.is_empty()
+            || self.context.authorizer.is_some()
+        {
             return None;
         }
         let definition = self.context.schema.type_at(field.type_index?)?;
@@ -3474,8 +3475,9 @@ impl<'doc> Executor<'doc> {
             ));
         };
 
-        // A resolver or an authorizer is caller code: hand the whole subtree to the async path
-        // rather than run any of it here.
+        // An asynchronous resolver or an authorizer is caller code that must be awaited: hand
+        // the whole subtree to the async path rather than run any of it here. A synchronous
+        // property resolver runs inline through `read_property`.
         if field.resolve.is_some() || self.context.authorizer.is_some() {
             return None;
         }
@@ -3503,8 +3505,7 @@ impl<'doc> Executor<'doc> {
         let definition = field
             .type_index
             .and_then(|index| self.context.schema.type_at(index));
-        let outcome = match default_property(label, field.name.as_ref(), parent).map(property_value)
-        {
+        let outcome = match read_property(field, parent, label) {
             Ok(value) => self.complete_field_value_typed_sync(
                 &value,
                 &field.ty,
@@ -3962,8 +3963,10 @@ impl<'doc> Executor<'doc> {
         ))
     }
 
-    /// Whether a type defines any resolver, which forces the asynchronous completion path.
+    /// Whether a type defines any asynchronous resolver, which forces the asynchronous completion
+    /// path.
     ///
+    /// A synchronous property resolver does not force it: the synchronous path calls it inline.
     /// A planned source already recorded the answer at preparation, so the common case avoids
     /// scanning the object type's field map for every completed object.
     fn type_has_resolvers(&self, source: Option<u32>, object_type: &ObjectType) -> bool {
@@ -4483,6 +4486,30 @@ fn default_property<'v>(
             other.kind()
         ))),
     }
+}
+
+/// Read a field's value from its parent without awaiting.
+///
+/// A field with a synchronous property resolver runs it inline: there is no future, no box and,
+/// for `gurafi`'s `expose!`, no allocation for the read itself. Everything else falls back to the
+/// executor's default property lookup, which borrows the parent's value in place.
+fn read_property<'v>(
+    field: &crate::types::Field,
+    parent: &'v Value,
+    label: FieldLabel<'_>,
+) -> Result<Cow<'v, Value>, GraphQLError> {
+    if let Some(sync_resolve) = &field.sync_resolve {
+        let context = crate::types::PropertyContext {
+            parent,
+            parent_type: label.parent,
+            field_name: label.name,
+        };
+        return match panic::sync(|| sync_resolve(context)) {
+            Ok(result) => result.map(Cow::Owned),
+            Err(error) => Err(error),
+        };
+    }
+    default_property(label, field.name.as_ref(), parent).map(property_value)
 }
 
 /// Turn a borrowed property into a value the caller can complete.

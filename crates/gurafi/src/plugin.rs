@@ -278,16 +278,27 @@ fn apply_to_field<Ctx: 'static>(
     // A raw field may have no resolver. Give wrappers a property lookup to call, but only keep it
     // if some plugin actually wraps: a metadata-only plugin must not disable the executor's leaf
     // fast path.
-    let had_resolver = field.resolve.is_some();
+    //
+    // A synchronous property resolver cannot be handed to `wrap_resolve` without boxing it, so it
+    // is materialized as the chain's base. When no plugin wraps, the synchronous hook is restored:
+    // metadata-only plugins keep the allocation-free path.
+    let sync = field.sync_resolve.clone();
+    let had_async = field.resolve.is_some();
+    let had_resolver = had_async || sync.is_some();
     let base = field
-        .resolve
-        .take()
+        .take_resolve()
         .unwrap_or_else(|| property_resolver(field.name.clone()));
     let mut resolve = Arc::clone(&base);
     for plugin in plugins.iter().rev() {
         resolve = plugin.wrap_resolve(&meta, resolve);
     }
-    if had_resolver || !Arc::ptr_eq(&resolve, &base) {
+    if Arc::ptr_eq(&resolve, &base) {
+        match sync {
+            Some(sync) if !had_async => field.sync_resolve = Some(sync),
+            _ if had_resolver => field.resolve = Some(resolve),
+            _ => {}
+        }
+    } else {
         field.resolve = Some(resolve);
     }
     if let Some(mut subscribe) = field.subscribe.take() {

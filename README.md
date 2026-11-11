@@ -100,6 +100,11 @@ production/development guidance.
 - **Checked type control.** `nullable`, `non_null`, `nullable_items` and
   `as_type`/`returns` are validated at build time, so an override cannot claim a
   non-null value from an `Option` resolver.
+- **Allocation-free property fields.** `expose!(Model::field)` installs a
+  synchronous property resolver, so a plain model read never allocates or polls
+  a future. Auth, async auth, validation and `wrap_resolve` plugins convert the
+  affected field to the boxed path once, at build time; descriptors, type
+  overrides and metadata stay synchronous.
 - **Authorization at every level.** Object and interface rules are inherited by
   their fields, with sync and async predicates.
 - **Typed error result unions.** `#[derive(ErrorUnion)]` and

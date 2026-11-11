@@ -6,10 +6,46 @@
 //! cargo test -p gurafi --release --test perf_probe -- --ignored --nocapture --test-threads=1
 //! ```
 
-use std::time::{Duration, Instant};
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    sync::atomic::{AtomicUsize, Ordering},
+    time::{Duration, Instant},
+};
 
 use futures::executor::block_on;
 use gurafi::{Loader, Object, RequestCache, Schema, expose};
+
+/// Counts allocations for [`probe_expose_property_resolution`].
+///
+/// This is test-only instrumentation, in the same shape as `gql`'s `review_alloc` probe. Run the
+/// probes with `--test-threads=1` so no other test allocates while the counter is being read.
+struct CountingAllocator;
+
+static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 fn report(label: &str, iterations: usize, elapsed: Duration, per: usize) {
     let nanos = elapsed.as_nanos() as f64 / iterations as f64;
@@ -253,4 +289,88 @@ fn probe_register_dynamic_objects() {
             types,
         );
     }
+}
+
+#[derive(Clone, Object)]
+struct ProbeItem {
+    name: String,
+    size: i32,
+}
+
+fn expose_schema(items: usize) -> gql::Schema {
+    let mut schema = Schema::<()>::new();
+    schema.object::<ProbeItem>(|object| {
+        object.expose(expose!(ProbeItem::name));
+        object.expose(expose!(ProbeItem::size));
+    });
+    schema.query(move |query| {
+        query.field("items", move |_: gurafi::NoArgs, _: &()| {
+            (0..items)
+                .map(|index| ProbeItem {
+                    name: format!("item{index}"),
+                    size: index as i32,
+                })
+                .collect::<Vec<_>>()
+        });
+    });
+    schema.build().expect("probe schema builds")
+}
+
+/// Time and allocation cost of resolving exposed properties.
+///
+/// Every selected property is a plain model read. Before synchronous property resolvers existed,
+/// each one allocated a `Box::pin` future; the allocation count per iteration therefore drops by
+/// at least one for every exposed field in the response. The `size`-only query selects `i32`
+/// properties, whose conversion allocates nothing, so its allocation count is the executor's own
+/// floor and shows that the property resolver itself allocates nothing.
+#[test]
+#[ignore = "allocation/timing probe"]
+fn probe_expose_property_resolution() {
+    const ITEMS: usize = 1_000;
+    const ITERATIONS: usize = 200;
+
+    let schema = expose_schema(ITEMS);
+    for (label, query, fields_per_item) in [
+        (
+            "expose 1000 items x 2 properties",
+            "{ items { name size } }",
+            2,
+        ),
+        ("expose 1000 items x 1 scalar", "{ items { size } }", 1),
+    ] {
+        measure_expose(&schema, label, query, ITEMS, fields_per_item, ITERATIONS);
+    }
+}
+
+fn measure_expose(
+    schema: &gql::Schema,
+    label: &str,
+    query: &str,
+    items: usize,
+    fields_per_item: usize,
+    iterations: usize,
+) {
+    let options = gql::ExecutionOptions::default();
+    let run = || {
+        let response = block_on(gql::execute(schema, gql::Request::new(query), &options));
+        assert!(response.errors.is_empty(), "{response:?}");
+        std::hint::black_box(response);
+    };
+
+    for _ in 0..20 {
+        run();
+    }
+
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let elapsed = time(iterations, run);
+    let allocations = ALLOCATIONS.load(Ordering::Relaxed) - before;
+
+    let per_item = items * fields_per_item;
+    report(label, iterations, elapsed, per_item);
+    println!(
+        "{label}: {allocations} allocations over {iterations} iterations => \
+         {:.0} allocs/iter, {:.3} allocs/property",
+        allocations as f64 / iterations as f64,
+        allocations as f64 / (iterations * per_item) as f64,
+    );
 }

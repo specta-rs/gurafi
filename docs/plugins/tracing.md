@@ -183,8 +183,10 @@ body, or `Authorization` header.
   otherwise have no field spans on those paths. With no subscriber the original fast paths run
   unchanged.
 - `fast_path` on `gql.field` means the field is *eligible* for the executor's leaf shortcut (no
-  resolver and no arguments). While field tracing is active the shortcut itself is bypassed, so
-  the span is the record of the field rather than of the shortcut.
+  asynchronous resolver, no synchronous property resolver and no arguments). While field tracing
+  is active the shortcut itself is bypassed, so the span is the record of the field rather than of
+  the shortcut. `resolver` is true when the field has either kind of resolver; a field with only a
+  synchronous property resolver still runs it inline, but it is not a leaf-shortcut property.
 - `gql.execute_operation` is not a separate span; operation kind and name are fields on the
   `gql.execute`/`gql.execute_prepared` root. Selection counts are available as `subfields` on each
   field span.

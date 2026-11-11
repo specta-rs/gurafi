@@ -873,11 +873,14 @@ fn merge_field_slots(
     source: &Field,
 ) -> Result<bool, String> {
     let resolve = scalar_slot_needed(&target.resolve, &source.resolve);
+    let sync_resolve = scalar_slot_needed(&target.sync_resolve, &source.sync_resolve);
     let subscribe = scalar_slot_needed(&target.subscribe, &source.subscribe);
     let complexity = scalar_slot_needed(&target.complexity, &source.complexity);
-    if resolve.is_err() || subscribe.is_err() || complexity.is_err() {
+    if resolve.is_err() || sync_resolve.is_err() || subscribe.is_err() || complexity.is_err() {
         let slot = if resolve.is_err() {
             "resolve"
+        } else if sync_resolve.is_err() {
+            "sync_resolve"
         } else if subscribe.is_err() {
             "subscribe"
         } else {
@@ -885,7 +888,10 @@ fn merge_field_slots(
         };
         return Err(runtime_conflict(&format!("{owner}.{name}"), slot));
     }
-    Ok(resolve == Ok(true) || subscribe == Ok(true) || complexity == Ok(true))
+    Ok(sync_resolve == Ok(true)
+        || resolve == Ok(true)
+        || subscribe == Ok(true)
+        || complexity == Ok(true))
 }
 
 fn merge_object(
@@ -1012,6 +1018,13 @@ fn merge_field_runtime(
     } else if source.resolve.is_some() && !same_slot(&target.resolve, &source.resolve) {
         return Err(runtime_conflict(&path, "resolve"));
     }
+    if target.sync_resolve.is_none() {
+        target.sync_resolve = source.sync_resolve.clone();
+    } else if source.sync_resolve.is_some()
+        && !same_slot(&target.sync_resolve, &source.sync_resolve)
+    {
+        return Err(runtime_conflict(&path, "sync_resolve"));
+    }
     if target.subscribe.is_none() {
         target.subscribe = source.subscribe.clone();
     } else if source.subscribe.is_some() && !same_slot(&target.subscribe, &source.subscribe) {
@@ -1094,6 +1107,9 @@ fn overlay_resolvers(source: &Schema, target: &mut Schema) {
 fn fill_field_runtime(target: &mut Field, source: &Field) {
     if target.resolve.is_none() {
         target.resolve = source.resolve.clone();
+    }
+    if target.sync_resolve.is_none() {
+        target.sync_resolve = source.sync_resolve.clone();
     }
     if target.subscribe.is_none() {
         target.subscribe = source.subscribe.clone();

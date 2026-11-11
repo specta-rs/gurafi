@@ -28,6 +28,11 @@
 //!
 //! Nested paths work as `expose!(Type::field.subfield)`, and every segment is cloned, so the
 //! model itself is never moved.
+//!
+//! The accessor is installed as a synchronous property resolver, so execution calls it inline
+//! instead of boxing a future per field. Options that need a future (authorization, validation or
+//! a `wrap_resolve` plugin) convert the field to the boxed path once, at build time; descriptors,
+//! type overrides and metadata keep the synchronous path.
 
 use std::sync::Arc;
 

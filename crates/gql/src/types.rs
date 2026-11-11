@@ -881,7 +881,22 @@ pub struct Field {
     /// Directives applied to the field, in application order.
     pub directives: Vec<AppliedDirective>,
     /// The field's resolver. `None` uses the default property resolver.
+    ///
+    /// An asynchronous resolver takes precedence over [`Field::sync_resolve`]. When both slots
+    /// are set, only `resolve` runs.
     pub resolve: Option<ResolveFn>,
+    /// A synchronous property resolver, run inline with no future and no box.
+    ///
+    /// This is for fields whose value is a plain read of the parent model, such as those
+    /// declared with `gurafi`'s `expose!`. Execution calls it directly on both the leaf fast
+    /// path and the general completion path, so it never pays for a boxed future. `None` falls
+    /// back to [`Field::resolve`] or the default property lookup.
+    ///
+    /// The hook receives [`PropertyContext`], which deliberately omits the selection-aware
+    /// [`ResolveInfo`]: that is what lets the executor call it from the leaf fast path, where
+    /// merged field nodes are never materialized. Implementations must therefore be pure reads
+    /// of the parent value and must not depend on arguments, the operation or the selection.
+    pub sync_resolve: Option<PropertyResolveFn>,
     /// The field's subscription resolver, used when the field is a subscription root field.
     pub subscribe: Option<SubscribeFn>,
     /// An optional complexity estimator for this field.
@@ -906,6 +921,7 @@ impl fmt::Debug for Field {
             .field("deprecation_reason", &self.deprecation_reason)
             .field("directives", &self.directives)
             .field("resolve", &self.resolve.is_some())
+            .field("sync_resolve", &self.sync_resolve.is_some())
             .field("subscribe", &self.subscribe.is_some())
             .finish()
     }
@@ -923,6 +939,7 @@ impl Field {
             deprecation_reason: None,
             directives: Vec::new(),
             resolve: None,
+            sync_resolve: None,
             subscribe: None,
             complexity: None,
             duplicate_args: Vec::new(),
@@ -971,6 +988,53 @@ impl Field {
         self
     }
 
+    /// Set a synchronous property resolver.
+    ///
+    /// The hook runs inline, without allocating a future, and reads the field's value from the
+    /// parent value. It takes precedence over the default property lookup but not over
+    /// [`Field::resolve`]: a field with both slots set uses the asynchronous resolver.
+    #[must_use]
+    pub fn sync_resolve(
+        mut self,
+        resolve: impl for<'a> Fn(PropertyContext<'a>) -> FieldResult + Send + Sync + 'static,
+    ) -> Self {
+        self.sync_resolve = Some(Arc::new(resolve));
+        self
+    }
+
+    /// Whether the field has a resolver of either kind.
+    #[must_use]
+    pub fn has_resolver(&self) -> bool {
+        self.resolve.is_some() || self.sync_resolve.is_some()
+    }
+
+    /// Take the field's effective resolver, materializing a synchronous one.
+    ///
+    /// A synchronous property resolver is wrapped in a boxed future and removed, so the returned
+    /// function is the only way left to produce the field's value. Build-time wrappers (field
+    /// authorization and plugins) use this: a wrapper needs a future to call, but a field that is
+    /// never wrapped keeps the allocation-free synchronous path. Returns `None` when the field has
+    /// no resolver, which leaves the default property lookup in charge.
+    pub fn take_resolve(&mut self) -> Option<ResolveFn> {
+        if let Some(resolve) = self.resolve.take() {
+            // An asynchronous resolver takes precedence; drop the synchronous hook so the
+            // returned function is the only way left to produce the value.
+            self.sync_resolve = None;
+            return Some(resolve);
+        }
+        let sync = self.sync_resolve.take()?;
+        Some(Arc::new(move |context| {
+            let sync = Arc::clone(&sync);
+            Box::pin(async move {
+                sync(PropertyContext {
+                    parent: context.parent,
+                    parent_type: context.info.parent_type,
+                    field_name: context.info.field_name,
+                })
+            })
+        }))
+    }
+
     /// Set the subscription resolver.
     #[must_use]
     pub fn subscribe(
@@ -1002,6 +1066,30 @@ impl Field {
 /// The signature of a field resolver.
 pub type ResolveFn =
     Arc<dyn for<'a> Fn(ResolverContext<'a>) -> ResolveFuture<'a> + Send + Sync + 'static>;
+
+/// What a synchronous property resolver reads.
+///
+/// This is deliberately narrower than [`ResolverContext`]: a property read needs the parent
+/// value and the names an error message is built from, and nothing else. Leaving out
+/// [`ResolveInfo`] is what lets the executor call the hook from the leaf fast path, where the
+/// merged field nodes are not materialized — materializing them would cost more than the future
+/// this hook exists to avoid.
+#[derive(Clone, Copy, Debug)]
+pub struct PropertyContext<'a> {
+    /// The value of the parent object, or an opaque model value wrapped in [`Value::External`].
+    pub parent: &'a Value,
+    /// The GraphQL name of the type that declares the field.
+    pub parent_type: &'a str,
+    /// The field's GraphQL name.
+    pub field_name: &'a str,
+}
+
+/// The signature of a synchronous property resolver.
+///
+/// A field with one of these runs it inline: no future is created, so a plain property read adds
+/// no allocation beyond the value's own conversion.
+pub type PropertyResolveFn =
+    Arc<dyn for<'a> Fn(PropertyContext<'a>) -> FieldResult + Send + Sync + 'static>;
 
 /// The signature of a subscription resolver.
 pub type SubscribeFn = Arc<
