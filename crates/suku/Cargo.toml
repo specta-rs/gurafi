@@ -12,6 +12,8 @@ repository.workspace = true
 default = ["axum"]
 axum = ["dep:axum", "dep:tokio"]
 tracing = ["dep:tracing", "gql/tracing"]
+# Serve GraphiQL from React/GraphiQL assets built into the crate instead of the unpkg CDN.
+vendored-graphiql = []
 
 [dependencies]
 gql.workspace = true

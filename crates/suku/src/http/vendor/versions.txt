@@ -1,0 +1,35 @@
+Vendored GraphiQL assets for suku's `vendored-graphiql` feature.
+
+These files are the unmodified production browser builds published on npm. The build script
+(`crates/suku/build.rs`) inlines them into one self-contained HTML page when the feature is
+enabled. Run `./update.sh` to re-download, verify and (when changing versions) refresh them.
+
+graphiql
+  version:   4.1.2
+  file:      graphiql.min.js   1066442 bytes
+             sha256 867226ba8af5ce7949903fc53932f78dac9f4bfc6cc8da0fd3869b8bc6c5256b
+  file:      graphiql.min.css   418449 bytes
+             sha256 30487e07635d312a63f647b140d37740a73c53332b0975bf4b1fe985ca6ec885
+  source:    https://unpkg.com/graphiql@4.1.2/graphiql.min.js
+             https://unpkg.com/graphiql@4.1.2/graphiql.min.css
+  license:   MIT, see LICENSE.graphiql.txt
+  note:      graphiql 4.x is the newest line that publishes a UMD browser bundle
+             (`graphiql.min.js`). 5.x and later ship ESM only, so they cannot be used
+             with the script-tag bootstrap without a bundler.
+
+react
+  version:   18.3.1
+  file:      react.production.min.js   10751 bytes
+             sha256 d949f1c3687aedadcedac85261865f29b17cd273997e7f6b2bfc53b2f9d4c4dd
+  source:    https://unpkg.com/react@18.3.1/umd/react.production.min.js
+  license:   MIT, see LICENSE.react.txt
+
+react-dom
+  version:   18.3.1
+  file:      react-dom.production.min.js   131835 bytes
+             sha256 35f4f974f4b2bcd44da73963347f8952e341f83909e4498227d4e26b98f66f0d
+  source:    https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js
+  license:   MIT, see LICENSE.react-dom.txt
+
+The default build does not use these files; it keeps loading the unversioned unpkg URLs from
+`src/http/graphiql.html`.

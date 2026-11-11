@@ -233,6 +233,37 @@ it too, so a persisted subscription does not re-parse per event.
 custom manifest loading. Invalid manifests fail at startup with the offending id, duplicate id or
 query error.
 
+## GraphiQL assets
+
+By default the GraphiQL page loads React 18, ReactDOM 18 and GraphiQL from unpkg, so no assets are
+shipped in the binary and the page always follows the upstream releases. Use the
+`vendored-graphiql` feature when the server must run without outbound network access or when a
+content security policy should not allow a CDN:
+
+```toml
+[dependencies]
+suku = { version = "0.0.1", features = ["vendored-graphiql"] }
+```
+
+With the feature enabled, `suku` builds a self-contained GraphiQL page at compile time from the
+pinned browser bundles in `crates/suku/src/http/vendor/` and serves it as one HTML response. There
+are no asset routes, so `http::handle` and the Axum adapter behave the same way; the only request
+the page makes is to the GraphQL endpoint it was served from. The default feature set is unchanged
+and keeps using the CDN.
+
+This is useful for air-gapped deployments, environments behind an egress proxy, and audits where
+every script served must come from the application's own build. Scripts and styles are inline, so a
+CSP for the page should permit inline script/style (for example `script-src 'unsafe-inline'` and
+`style-src 'unsafe-inline'`, or hashes of the served content) while keeping `connect-src 'self'`.
+The bundled GraphiQL stylesheet embeds its fonts as `data:` URIs, so `font-src data:` is the only
+other source required; no CDN host is needed.
+
+Versions are pinned and checksummed in `crates/suku/src/http/vendor/versions.txt`. To update them,
+change the version constants in `crates/suku/src/http/vendor/update.sh`, run it, update
+`versions.txt`, and run `cargo test -p suku --features vendored-graphiql`. The vendored files are
+the unmodified MIT-licensed upstream production builds; their licenses are next to them. GraphiQL
+4.x is used because it is the newest line that still publishes a UMD browser bundle.
+
 ## Transport behaviour
 
 | Request | Result |

@@ -253,6 +253,27 @@ the request, so a protected endpoint does not expose its API surface anonymously
 request path as its endpoint, so it works at any mount point. Disable it with `.graphiql(false)`
 (Axum builder) or `HttpConfig::graphiql(false)`.
 
+The default page loads React 18, ReactDOM 18 and GraphiQL from unpkg. Enable the
+`vendored-graphiql` feature to serve a self-contained page instead:
+
+```toml
+[dependencies]
+suku = { version = "0.0.1", features = ["vendored-graphiql"] }
+```
+
+The assets are pinned, MIT-licensed upstream browser builds committed under
+`crates/suku/src/http/vendor/` and inlined by `build.rs` into one HTML response. Inlining keeps the
+feature transport-agnostic: `http::handle` and the Axum adapter need no extra routes, and the page
+makes no network request other than the GraphQL call to its own path. This is the option for
+air-gapped and egress-restricted deployments, and for policies that forbid third-party script
+origins. Because scripts and styles are inline, a CSP for the page must allow inline script/style
+(or their hashes); `connect-src 'self'` is sufficient, and fonts are `data:` URIs.
+
+To update the vendored versions, edit the version constants in
+`crates/suku/src/http/vendor/update.sh`, run it, refresh `versions.txt`, and run
+`cargo test -p suku --features vendored-graphiql`. The default build stays CDN-backed; unversioned
+unpkg URLs are used by default because they follow upstream GraphiQL releases.
+
 `GET` may only execute **queries**. Mutations and subscriptions over GET are rejected with
 `405 Method Not Allowed`, which prevents cross-site request forgery against cookie-authenticated
 endpoints. Use `POST` for mutations and `POST` + `Accept: text/event-stream` for subscriptions.
