@@ -41,8 +41,8 @@ Examples are `publish = false` and are skipped.
 2. Tag the merge commit and push the tag:
 
    ```bash
-   git tag v0.1.0
-   git push origin v0.1.0
+   git tag v0.1.1
+   git push origin v0.1.1
    ```
 
 The `release` workflow then verifies that the tag matches `gurafi`'s version,

@@ -643,7 +643,7 @@ resolvers, the `Loader` and `RequestCache`:
 
 ```toml
 [dependencies]
-gurafi = { version = "0.1.0", features = ["tracing"] }
+gurafi = { version = "0.1.1", features = ["tracing"] }
 ```
 
 `gurafi.schema.build`, `gurafi.loader.load` and `gurafi.loader.batch` are the summary points;
