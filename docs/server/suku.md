@@ -136,8 +136,9 @@ attach codes to safe messages. When that policy is wrong for an application, sup
 formatter.
 
 The formatter is called synchronously, once per error, in response order. It must be
-`Send + Sync + 'static` and deterministic. Panics are not caught: they unwind through the
-execution future, or fail the subscription stream, exactly like a resolver panic.
+`Send + Sync + 'static` and deterministic. Panics in a formatter are not caught: they unwind
+through the execution future, or end the subscription stream. This is different from a resolver
+panic, which `gql` catches and turns into a coded `INTERNAL_SERVER_ERROR` field error.
 
 ## Persisted operations
 

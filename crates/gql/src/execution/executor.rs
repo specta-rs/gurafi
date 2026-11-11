@@ -36,6 +36,7 @@ use crate::{
 use super::{
     AuthorizationContext, ExecutionContext, ExecutionOptions, Request, coerce,
     collect::{self, CollectedFields, Selections},
+    panic,
     plan::{self, GroupView, PreparedPlan},
 };
 
@@ -1425,7 +1426,9 @@ impl<'doc> Executor<'doc> {
                     info: &info,
                 };
                 match &field.resolve {
-                    Some(resolve) => resolve(resolver_context).await.map(Cow::Owned),
+                    Some(resolve) => panic::resolver(resolve, resolver_context)
+                        .await
+                        .map(Cow::Owned),
                     None => {
                         default_property(label, field.name.as_ref(), parent).map(property_value)
                     }
@@ -1777,7 +1780,9 @@ impl<'doc> Executor<'doc> {
                     info: &info,
                 };
                 match &field.resolve {
-                    Some(resolve) => resolve(resolver_context).await.map(Cow::Owned),
+                    Some(resolve) => panic::resolver(resolve, resolver_context)
+                        .await
+                        .map(Cow::Owned),
                     None => {
                         default_property(label, field.name.as_ref(), parent).map(property_value)
                     }
@@ -2360,7 +2365,9 @@ impl<'doc> Executor<'doc> {
                     info: &info,
                 };
                 match &field.resolve {
-                    Some(resolve) => resolve(resolver_context).await.map(Cow::Owned),
+                    Some(resolve) => panic::resolver(resolve, resolver_context)
+                        .await
+                        .map(Cow::Owned),
                     None => {
                         default_property(label, field.name.as_ref(), parent).map(property_value)
                     }
@@ -4283,7 +4290,10 @@ impl<'doc> Executor<'doc> {
         };
 
         let resolved = if let Some(resolve) = resolve_type {
-            Some(resolve(value, self.context)?)
+            // `resolve_type` is caller code, so isolate it like a field resolver. The inner `?`
+            // preserves its ordinary error; the outer one reports a caught panic.
+            let name = panic::sync(|| resolve(value, self.context))??;
+            Some(name)
         } else if let Value::Object(object) = value {
             // An explicit `__typename` is the documented way for a raw object to choose its
             // concrete type, so it wins. `TYPENAME_KEY` is an internal introspection detail and
@@ -4307,7 +4317,7 @@ impl<'doc> Executor<'doc> {
                         continue;
                     };
                     if let Some(check) = &object.is_type_of {
-                        if check(value) {
+                        if panic::sync(|| check(value))? {
                             matches.push(object.name.clone());
                         }
                     }
