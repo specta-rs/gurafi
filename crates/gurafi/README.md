@@ -193,7 +193,11 @@ that names the missing type. Sync, async, root, object and subscription fields a
 See [`docs/plugins/errors.md`](../../docs/plugins/errors.md) for names, limitations and how this
 relates to error masking.
 
-## Objects
+## Objects and backing models
+
+An object type is the GraphQL type that clients select. Its **backing model** is the Rust type
+whose values its resolvers return. `#[derive(Object)]` associates the two under one GraphQL name
+and lets the executor recognise values of the model.
 
 ```rust
 #[derive(Object)]
@@ -207,7 +211,8 @@ struct Giraffe {
 The Rust type name is the GraphQL name unless overridden. A doc comment becomes the description.
 Fields are **not** derived: declaring them explicitly keeps the resolver, arguments and access
 rules next to each other. The derive implements `ObjectModel` (name and description),
-`OutputType`, and `IntoValue` (the model travels through the executor as `Value::External`).
+`OutputType`, and `IntoValue` (the backing model travels through the executor as
+`Value::External`).
 
 Fields can be added in four flavours (each with a `*_with_info` form), plus `expose`:
 
@@ -231,7 +236,7 @@ schema.object_fields::<Giraffe>(|o| {
 });
 ```
 
-`expose!` names a model property once and infers both the GraphQL field name and its type:
+`expose!` names a backing model property once and infers both the GraphQL field name and its type:
 
 ```rust
 o.expose(expose!(Giraffe::name));                      // field `name`
@@ -450,10 +455,10 @@ q.field("search", |_: NoArgs, _: &Ctx| SearchResult::User(User { name: "Oscar".i
     .as_abstract(&search);
 ```
 
-Runtime type resolution uses the `is_type_of` check that the object derive installs: every object
-model travels as `Value::External`, and the object type's check is a downcast to the model type.
-Override it per abstract type with `resolve_type` on the interface or union builder if you need
-custom resolution.
+Runtime type resolution uses the `is_type_of` check that the `Object` derive installs: every
+backing model travels as `Value::External`, and the object type's check is a downcast to the model
+type. Override it per abstract type with `resolve_type` on the interface or union builder if you
+need custom resolution.
 
 ## Runtime-named types
 

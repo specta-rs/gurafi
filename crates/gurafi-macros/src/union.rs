@@ -47,14 +47,14 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         let Fields::Unnamed(fields) = &variant.fields else {
             return Err(syn::Error::new_spanned(
                 &variant.fields,
-                "every `#[derive(Union)]` variant must hold exactly one object model, for \
+                "every `#[derive(Union)]` variant must hold exactly one backing model, for \
                  example `User(User)`",
             ));
         };
         if fields.unnamed.len() != 1 {
             return Err(syn::Error::new_spanned(
                 &variant.fields,
-                "every `#[derive(Union)]` variant must hold exactly one object model",
+                "every `#[derive(Union)]` variant must hold exactly one backing model",
             ));
         }
         let member = &fields.unnamed[0].ty;

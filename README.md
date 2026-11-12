@@ -16,10 +16,10 @@
 ## Why Gurafi
 
 GraphQL servers in Rust usually mean maintaining a schema definition alongside the types your
-resolvers actually use. Gurafi starts from the other side: a Rust type is the model, derives wire
-it into the GraphQL type system, and fields are exposed from that same type. Most schema mistakes
-become compile errors, and the result is an ordinary `gql::Schema` — not a generated resolver file
-or a second schema to keep in sync.
+resolvers actually use. Gurafi starts from the other side: a Rust type is the backing model for a
+GraphQL object type, derives wire it into the GraphQL type system, and fields are exposed from that
+same type. Most schema mistakes become compile errors, and the result is an ordinary
+`gql::Schema` — not a generated resolver file or a second schema to keep in sync.
 
 The approach is inspired by [Pothos GraphQL](https://pothos-graphql.dev)'s
 [backing model approach](https://pothos-graphql.dev/docs/guide/schema-builder#backing-models).

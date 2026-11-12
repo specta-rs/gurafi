@@ -176,7 +176,7 @@ pub fn derive_scalar(input: TokenStream) -> TokenStream {
         .into()
 }
 
-/// Derive a GraphQL union from an enum of object models.
+/// Derive a GraphQL union from an enum of backing models.
 ///
 /// Each variant must be a newtype variant whose inner type derives [`macro@Object`]. The union
 /// itself is still declared on the schema with `schema.union(...)`, so its members and members'
@@ -213,7 +213,7 @@ pub fn derive_union(input: TokenStream) -> TokenStream {
 ///
 /// The enum is not itself a GraphQL type. It describes how a `field_result_union` field turns
 /// each Rust error variant into a GraphQL object payload, and the generated result union uses
-/// those payloads as members. Every variant must hold exactly one object model:
+/// those payloads as members. Every variant must hold exactly one backing model:
 ///
 /// ```ignore
 /// use gurafi::{ErrorUnion, Object};

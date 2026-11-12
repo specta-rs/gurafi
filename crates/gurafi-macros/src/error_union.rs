@@ -11,7 +11,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         return Err(syn::Error::new_spanned(
             &input.generics,
             "`#[derive(ErrorUnion)]` does not support generic types. Use a concrete error enum \
-             and, if needed, make the generated error payload a concrete object model.",
+             and, if needed, make the generated error payload a concrete backing model.",
         ));
     }
     let Data::Enum(data) = &input.data else {

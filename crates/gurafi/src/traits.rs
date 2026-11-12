@@ -280,7 +280,7 @@ impl<T: AbstractType + ?Sized> AbstractType for &T {
     }
 }
 
-/// A safe downcast from the executor's parent value to an object model.
+/// A safe downcast from the executor's parent value to a backing model.
 pub(crate) fn model_ref<'a, M: ObjectModel>(
     parent: &'a Value,
     parent_type: &str,

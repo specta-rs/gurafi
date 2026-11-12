@@ -705,7 +705,7 @@ impl<'a, Ctx: 'static> FieldConfig<'a, Ctx> {
 
     /// Replace the field's GraphQL type with an explicitly built runtime type reference.
     ///
-    /// Use this when the output type's name is computed at runtime and there is no object model
+    /// Use this when the output type's name is computed at runtime and there is no backing model
     /// to pass to [`FieldConfig::as_object_ref`] — for example a runtime-named interface or
     /// union, or a list such as `TypeRef::named(name).list().non_null()`.
     ///

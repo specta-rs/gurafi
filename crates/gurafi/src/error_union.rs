@@ -6,7 +6,7 @@
 //! Rust half of that pattern — the same shape as Pothos's Errors plugin.
 //!
 //! [`ErrorUnionModel`] is implemented by `#[derive(ErrorUnion)]` on an enum whose variants each
-//! hold one object model. A field is declared with `field_result_union`, which generates:
+//! hold one backing model. A field is declared with `field_result_union`, which generates:
 //!
 //! ```graphql
 //! union CreateUserResult = CreateUserSuccess | NotFoundError | ConflictError
@@ -31,10 +31,10 @@ use crate::{
 
 /// A Rust enum whose variants are the typed failures of a result-union field.
 ///
-/// Implemented by `#[derive(ErrorUnion)]`. Each variant must hold exactly one object model and
+/// Implemented by `#[derive(ErrorUnion)]`. Each variant must hold exactly one backing model and
 /// the enum must not be generic; the derive reports anything else at compile time. The error
-/// payload objects are still registered by the schema author with `schema.object::<M>(...)`, so
-/// their fields, authorization and resolvers stay visible where the rest of the schema lives.
+/// payload object types are still registered by the schema author with `schema.object::<M>(...)`,
+/// so their fields, authorization and resolvers stay visible where the rest of the schema lives.
 ///
 /// ```
 /// use gurafi::{ErrorUnion, Object};
