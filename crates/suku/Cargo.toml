@@ -38,5 +38,5 @@ tokio = { workspace = true, optional = true }
 [dev-dependencies]
 tracing-core = "0.1.36"
 tokio.workspace = true
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 tower = { version = "0.5", features = ["util"] }
