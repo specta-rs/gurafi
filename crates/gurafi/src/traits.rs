@@ -247,6 +247,12 @@ pub trait InputObject: Sized + Send + 'static {
     fn register_args(registry: &mut TypeRegistry) {
         let _ = registry;
     }
+
+    /// Register the input types referenced by this input object's fields.
+    #[doc(hidden)]
+    fn register_input_fields(registry: &mut TypeRegistry) {
+        let _ = registry;
+    }
 }
 
 impl InputObject for () {

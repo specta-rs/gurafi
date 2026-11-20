@@ -358,7 +358,12 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                 fn register_args(registry: &mut ::gurafi::TypeRegistry) {
                     if <Self as ::gurafi::InputObject>::NAME.is_some() {
                         registry.register_input_object::<Self>();
+                    } else {
+                        <Self as ::gurafi::InputObject>::register_input_fields(registry);
                     }
+                }
+
+                fn register_input_fields(registry: &mut ::gurafi::TypeRegistry) {
                     #(#nested_registrations)*
                 }
             }
@@ -385,7 +390,6 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                     } else {
                         registry.unnamed_input::<Self>();
                     }
-                    #(#nested_registrations)*
                 }
             }
 

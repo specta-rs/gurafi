@@ -30,9 +30,6 @@ pub struct TypeRegistry {
     referenced_objects: HashSet<Arc<str>>,
     /// Union names referenced by an output type but registered by `schema.union`.
     referenced_unions: HashSet<Arc<str>>,
-    /// Input types currently being registered, used to stop recursion on self-referential
-    /// input objects.
-    in_progress: HashSet<String>,
     /// The Rust type that owns each GraphQL name, so two different Rust types cannot silently
     /// claim the same GraphQL name.
     type_ids: HashMap<String, TypeId>,
@@ -136,10 +133,9 @@ impl TypeRegistry {
         let Some(name) = T::NAME else {
             return;
         };
-        if self.already_registered(name, TypeId::of::<T>()) || self.in_progress.contains(name) {
+        if self.already_registered(name, TypeId::of::<T>()) {
             return;
         }
-        self.in_progress.insert(name.to_owned());
         let fields = match T::fields() {
             Ok(fields) => fields,
             Err(error) => {
@@ -147,7 +143,6 @@ impl TypeRegistry {
                     "Failed to register input object `{name}`: {}",
                     error.message()
                 )));
-                self.in_progress.remove(name);
                 return;
             }
         };
@@ -166,7 +161,8 @@ impl TypeRegistry {
             name.to_owned(),
             Type::InputObject(std::sync::Arc::new(input)),
         );
-        self.in_progress.remove(name);
+        // Record the type before visiting its fields so recursive references stop here.
+        T::register_input_fields(self);
     }
 
     /// Register a generated object type under a runtime name.

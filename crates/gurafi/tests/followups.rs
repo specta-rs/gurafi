@@ -127,6 +127,45 @@ fn a_named_input_can_be_used_as_an_input_field_default() {
 }
 
 #[test]
+fn recursive_derived_inputs_register_and_coerce() {
+    #[derive(Input)]
+    #[graphql(name = "BranchInput")]
+    struct Branch {
+        leaves: Vec<Leaf>,
+    }
+
+    #[derive(Input)]
+    #[graphql(name = "LeafInput")]
+    struct Leaf {
+        value: i32,
+        branch: Option<Box<Branch>>,
+    }
+
+    let mut schema = Schema::<Ctx>::new();
+    schema.query(|q| {
+        q.field("count", |args: Branch, _: &Ctx| {
+            let leaf = &args.leaves[0];
+            leaf.value + leaf.branch.as_ref().expect("nested branch").leaves[0].value
+        });
+    });
+    let schema = schema.build().expect("recursive inputs build");
+    let response = run(
+        &schema,
+        "{ count(leaves: [{value: 2, branch: {leaves: [{value: 3}]}}]) }",
+        Ctx::anonymous(),
+    );
+    assert!(!response.has_errors(), "{response:?}");
+    assert_eq!(
+        response
+            .data
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|data| data.get("count")),
+        Some(&Value::Int(5))
+    );
+}
+
+#[test]
 fn a_one_of_input_used_directly_as_arguments_is_rejected() {
     #[derive(Input)]
     #[graphql(name = "Choice", one_of)]
