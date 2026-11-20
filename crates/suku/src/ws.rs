@@ -47,7 +47,7 @@
 //! [spec]: https://github.com/enisdenjo/graphql-ws/blob/master/PROTOCOL.md
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::Duration,
 };
@@ -303,6 +303,8 @@ struct ActiveOperation {
     handle: AbortHandle,
 }
 
+type ActiveIds = Mutex<HashMap<String, u64>>;
+
 struct Done {
     id: String,
     sequence: u64,
@@ -318,7 +320,7 @@ async fn run_connection<S>(
 ) where
     S: Stream<Item = WsInput> + Unpin + Send + 'static,
 {
-    let active_ids: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let active_ids = Arc::new(ActiveIds::default());
     let mut tasks: HashMap<String, ActiveOperation> = HashMap::new();
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<Done>();
     let mut sequence = 0u64;
@@ -384,14 +386,15 @@ async fn run_connection<S>(
                         }
                         let admitted = {
                             let mut ids = lock_ids(&active_ids);
-                            if ids.contains(&id) {
+                            if ids.contains_key(&id) {
                                 None
                             } else if config.max_operations != 0
                                 && ids.len() >= config.max_operations
                             {
                                 Some(false)
                             } else {
-                                ids.insert(id.clone());
+                                sequence += 1;
+                                ids.insert(id.clone(), sequence);
                                 Some(true)
                             }
                         };
@@ -418,8 +421,6 @@ async fn run_connection<S>(
                                 send_error(&outgoing, &id, &response).await;
                             }
                             Some(true) => {
-                                sequence += 1;
-                                let sequence = sequence;
                                 let handle = tokio::spawn(run_operation(
                                     OperationTask {
                                         server: server.clone(),
@@ -466,16 +467,16 @@ struct OperationTask {
     sequence: u64,
     outgoing: mpsc::Sender<WsOutput>,
     done: mpsc::UnboundedSender<Done>,
-    active: Arc<Mutex<HashSet<String>>>,
+    active: Arc<ActiveIds>,
 }
 
-/// Removes the operation id and notifies the connection even if the task is aborted or panics.
+/// Releases the operation's ID if it still owns it, and notifies the connection even on abort or panic.
 struct FinishGuard {
     id: String,
     sequence: u64,
     outgoing: mpsc::Sender<WsOutput>,
     done: mpsc::UnboundedSender<Done>,
-    active: Arc<Mutex<HashSet<String>>>,
+    active: Arc<ActiveIds>,
     removed: bool,
     finished: bool,
 }
@@ -495,7 +496,11 @@ impl FinishGuard {
 
     fn remove_id(&mut self) {
         if !self.removed {
-            lock_ids(&self.active).remove(&self.id);
+            let mut ids = lock_ids(&self.active);
+            // The connection can reuse this ID before an aborted task's guard drops.
+            if ids.get(&self.id) == Some(&self.sequence) {
+                ids.remove(&self.id);
+            }
             self.removed = true;
         }
     }
@@ -715,7 +720,7 @@ async fn close(outgoing: &mpsc::Sender<WsOutput>, code: u16, reason: &str) {
         .await;
 }
 
-fn lock_ids(ids: &Mutex<HashSet<String>>) -> MutexGuard<'_, HashSet<String>> {
+fn lock_ids(ids: &ActiveIds) -> MutexGuard<'_, HashMap<String, u64>> {
     ids.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -774,6 +779,39 @@ pub(crate) async fn serve_axum(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_finish_guard_does_not_release_reused_id() {
+        let id = "reused".to_owned();
+        let active = Arc::new(Mutex::new(HashMap::from([(id.clone(), 1)])));
+        let (outgoing, _receiver) = mpsc::channel(1);
+        let (done, mut done_rx) = mpsc::unbounded_channel();
+        let guard = |sequence| FinishGuard {
+            id: id.clone(),
+            sequence,
+            outgoing: outgoing.clone(),
+            done: done.clone(),
+            active: Arc::clone(&active),
+            removed: false,
+            finished: false,
+        };
+
+        let old = guard(1);
+        lock_ids(&active).remove(&id);
+        lock_ids(&active).insert(id.clone(), 2);
+        let replacement = guard(2);
+
+        drop(old);
+        assert_eq!(lock_ids(&active).get(&id), Some(&2));
+        assert_eq!(done_rx.try_recv().expect("old task completion").sequence, 1);
+
+        drop(replacement);
+        assert!(!lock_ids(&active).contains_key(&id));
+        assert_eq!(
+            done_rx.try_recv().expect("replacement completion").sequence,
+            2
+        );
+    }
 
     #[test]
     fn rejects_unknown_message_types() {
