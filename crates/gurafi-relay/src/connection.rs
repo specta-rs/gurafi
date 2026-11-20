@@ -684,8 +684,8 @@ impl<Ctx: 'static + Sync> Relay<Ctx> {
             + Sync
             + 'static,
     {
-        let connection = self.connection::<T>(schema, name)?;
         validate_field_name(field)?;
+        let connection = self.connection::<T>(schema, name)?;
         Ok(schema.object::<M>(|object| {
             object.connection(&connection, field, resolver);
         }))
@@ -711,8 +711,8 @@ impl<Ctx: 'static + Sync> Relay<Ctx> {
             + Sync
             + 'static,
     {
-        let connection = self.connection::<T>(schema, name)?;
         validate_field_name(field)?;
+        let connection = self.connection::<T>(schema, name)?;
         Ok(schema.object::<M>(|object| {
             object.connection_async(&connection, field, resolver);
         }))
@@ -730,8 +730,8 @@ impl<Ctx: 'static + Sync> Relay<Ctx> {
         T: ObjectModel + OutputType + IntoValue + Send + 'static,
         F: Fn(ConnectionArgs, &Ctx) -> Result<Connection<T>, GraphQLError> + Send + Sync + 'static,
     {
-        let connection = self.connection::<T>(schema, name)?;
         validate_field_name(field)?;
+        let connection = self.connection::<T>(schema, name)?;
         schema.query(|query| {
             query.connection(&connection, field, resolver);
         });

@@ -448,6 +448,26 @@ fn duplicate_connection_registration_is_rejected() {
 }
 
 #[test]
+fn invalid_connection_field_does_not_reserve_type_names() {
+    let mut schema = Schema::<Ctx>::new();
+    let mut relay = Relay::<Ctx>::new();
+    schema.object::<Post>(|o| {
+        o.expose(expose!(Post::title));
+    });
+    let resolver = |_: ConnectionArgs, _: &Ctx| Ok(Connection::<Post>::empty());
+
+    let error = relay
+        .query_connection(&mut schema, "bad-field", "PostsConnection", resolver)
+        .unwrap_err();
+    assert!(error.message().contains("not a valid GraphQL field name"));
+
+    relay
+        .query_connection(&mut schema, "posts", "PostsConnection", resolver)
+        .expect("a rejected field must not reserve its connection type names");
+    schema.build().expect("valid schema after retry");
+}
+
+#[test]
 fn field_ref_type_accepts_a_connection_ref() {
     let mut schema = Schema::<Ctx>::new();
     let mut relay = Relay::<Ctx>::new();
