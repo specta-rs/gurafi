@@ -211,6 +211,47 @@ fn vars(fields: impl IntoIterator<Item = (&'static str, Value)>) -> Object {
 }
 
 #[test]
+fn prepared_mutation_orders_fields_by_first_included_occurrence() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = |name| {
+        let calls = Arc::clone(&calls);
+        Field::new(name, TypeRef::int()).resolve(move |_| {
+            let calls = Arc::clone(&calls);
+            Box::pin(async move {
+                calls.lock().unwrap().push(name);
+                Ok(Value::Int(1))
+            })
+        })
+    };
+    let schema = Schema::builder()
+        .object(ObjectType::new("Query").field(Field::new("unused", TypeRef::int())))
+        .object(
+            ObjectType::new("Mutation")
+                .field(record("a"))
+                .field(record("b")),
+        )
+        .query("Query")
+        .mutation("Mutation")
+        .build()
+        .expect("valid schema");
+    let source = "mutation M($show: Boolean!) { a @include(if: $show) b a }";
+    let prepared = PreparedQuery::new(&schema, "order", source, None).expect("prepared");
+    let options = ExecutionOptions::default();
+
+    for (show, expected) in [(false, ["b", "a"]), (true, ["a", "b"])] {
+        let variables = vars([("show", Value::Boolean(show))]);
+        let request = gql::Request::new(source).variables(&variables);
+        let normal = block_on(gql::execute(&schema, request, &options));
+        assert!(normal.errors.is_empty(), "{:?}", normal.errors);
+        assert_eq!(std::mem::take(&mut *calls.lock().unwrap()), expected);
+
+        let response = block_on(prepared.execute(Some(&variables), &options));
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert_eq!(std::mem::take(&mut *calls.lock().unwrap()), expected);
+    }
+}
+
+#[test]
 fn aliases_and_merged_selections() {
     assert_same(
         r#"
