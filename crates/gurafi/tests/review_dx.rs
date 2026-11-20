@@ -1624,8 +1624,15 @@ fn unnamed_input_nested_inside_a_named_input_reports_the_inner_type() {
 #[test]
 fn an_undefined_variable_in_a_nested_input_literal_drops_only_that_field() {
     #[derive(Input)]
+    #[graphql(name = "SearchFilter")]
+    struct SearchFilter {
+        id: Option<ID>,
+        name: Option<String>,
+    }
+
+    #[derive(Input)]
     struct Args {
-        by: Option<SearchBy>,
+        by: Option<SearchFilter>,
     }
 
     let mut schema = Schema::<Ctx>::new();

@@ -346,13 +346,11 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 #[cfg(feature = "ws")]
 fn offers_graphql_transport_ws(headers: &HeaderMap) -> bool {
     headers
-        .get(header::SEC_WEBSOCKET_PROTOCOL)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(',')
-                .any(|protocol| protocol.trim() == crate::ws::GRAPHQL_TRANSPORT_WS)
-        })
+        .get_all(header::SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|protocol| protocol.trim() == crate::ws::GRAPHQL_TRANSPORT_WS)
 }
 
 #[cfg(feature = "ws")]

@@ -1,7 +1,7 @@
 //! `graphql-transport-ws` protocol tests.
 //!
-//! Most tests drive [`suku::ws::serve`] over in-memory channels. Two tests at the end use a real
-//! Axum server and `tokio-tungstenite` to verify the upgrade, subprotocol negotiation and framing.
+//! Most tests drive [`suku::ws::serve`] over in-memory channels. The socket tests use a real Axum
+//! server to verify the upgrade, subprotocol negotiation and framing.
 
 #![cfg(feature = "ws")]
 
@@ -628,6 +628,58 @@ async fn axum_socket_requires_the_graphql_transport_ws_subprotocol() {
     }
 
     server.abort();
+}
+
+#[tokio::test]
+async fn axum_socket_accepts_subprotocol_on_a_second_header_line() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    let app = suku::GraphQL::new(support::server()).into_router();
+    let (address, server) = axum_server(app).await;
+    let response = tokio::time::timeout(Duration::from_secs(2), async {
+        // The Tungstenite client only verifies offers from the first header value.
+        let mut socket = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        let request = format!(
+            "GET /graphql HTTP/1.1\r\nHost: {address}\r\n\
+             Connection: Upgrade\r\nUpgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Protocol: graphql-ws\r\nSec-WebSocket-Protocol: {}\r\n\r\n",
+            ws::GRAPHQL_TRANSPORT_WS,
+        );
+        socket
+            .write_all(request.as_bytes())
+            .await
+            .expect("upgrade request");
+
+        let mut reader = BufReader::new(socket);
+        let mut headers = String::new();
+        while !headers.ends_with("\r\n\r\n") {
+            assert_ne!(
+                reader
+                    .read_line(&mut headers)
+                    .await
+                    .expect("response header"),
+                0
+            );
+        }
+        headers
+    })
+    .await
+    .expect("upgrade response timed out");
+    server.abort();
+
+    let mut lines = response.lines();
+    assert_eq!(lines.next(), Some("HTTP/1.1 101 Switching Protocols"));
+    assert!(
+        lines
+            .filter_map(|line| line.split_once(':'))
+            .any(|(name, value)| {
+                name.eq_ignore_ascii_case("sec-websocket-protocol")
+                    && value.trim() == ws::GRAPHQL_TRANSPORT_WS
+            })
+    );
 }
 
 #[tokio::test]

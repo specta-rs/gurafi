@@ -721,6 +721,16 @@ impl<'a> Builder<'a, '_, '_> {
             )?;
         }
 
+        // The first included occurrence sets a group's order. If its first node can be skipped
+        // but a later node can still include the group, the fixed order can be wrong. Collect
+        // this selection dynamically so serial mutation fields run in the right order.
+        if groups
+            .iter()
+            .any(|group| group.nodes.len() > 1 && !group.nodes[0].requirements.is_empty())
+        {
+            return Err(PlanError::Unsupported);
+        }
+
         for group in &mut groups {
             let field = group
                 .field_index

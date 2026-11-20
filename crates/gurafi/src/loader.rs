@@ -122,12 +122,12 @@
 //! Nothing in this module spawns a task or uses a timer, and there is no `tokio` dependency.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     fmt,
     future::Future,
     hash::Hash,
     pin::Pin,
-    sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak},
     task::{Context, Poll},
 };
 
@@ -226,7 +226,8 @@ impl Default for LoaderConfig {
     }
 }
 
-/// What is known about a key right now.
+/// The result or batch that a load joined, independent of the cache entry.
+#[derive(Clone)]
 enum Lookup<V, E> {
     /// The key has a resolved result, possibly cached from an earlier call.
     Ready(Arc<Result<V, E>>),
@@ -235,8 +236,14 @@ enum Lookup<V, E> {
         shared: SharedBatch<V, E>,
         index: usize,
     },
-    /// The key is in neither the result cache nor a batch.
-    Missing,
+}
+
+/// A slot shared by every load of a key while it is still queued.
+type Queued<V, E> = Arc<OnceLock<Lookup<V, E>>>;
+
+enum Enqueued<V, E> {
+    Assigned(Lookup<V, E>),
+    Queued(Queued<V, E>),
 }
 
 /// The cached state of a key.
@@ -251,8 +258,8 @@ struct State<K, V, E> {
     entries: HashMap<K, Entry<V, E>>,
     /// Keys waiting for a batch, in the order the loads were issued.
     queue: VecDeque<K>,
-    /// Fast membership test for `queue`.
-    queued: HashSet<K>,
+    /// Assignments for queued keys, also held by their waiters.
+    queued: HashMap<K, Queued<V, E>>,
     /// In-flight batches, keyed by id.
     batches: HashMap<u64, SharedBatch<V, E>>,
     next_batch: u64,
@@ -349,7 +356,7 @@ impl<K, V, E> Loader<K, V, E> {
             state: Mutex::new(State {
                 entries: HashMap::new(),
                 queue: VecDeque::new(),
-                queued: HashSet::new(),
+                queued: HashMap::new(),
                 batches: HashMap::new(),
                 next_batch: 0,
                 #[cfg(feature = "tracing")]
@@ -431,9 +438,12 @@ where
     /// primed value.
     pub fn prime(&self, key: K, value: V) {
         let mut state = self.inner.lock();
-        state.queue.retain(|queued| queued != &key);
-        state.queued.remove(&key);
-        state.entries.insert(key, Entry::Ready(Arc::new(Ok(value))));
+        let result = Arc::new(Ok(value));
+        if let Some(slot) = state.queued.remove(&key) {
+            state.queue.retain(|queued| queued != &key);
+            assert!(slot.set(Lookup::Ready(Arc::clone(&result))).is_ok());
+        }
+        state.entries.insert(key, Entry::Ready(result));
     }
 
     /// Forget every completed result.
@@ -488,51 +498,58 @@ where
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Queue a key unless it is already cached or in flight.
-    ///
-    /// Returns the cached result when the key is already resolved. Doing the cache check and the
-    /// queue insertion under one lock keeps the common load path at two lock acquisitions (queue,
-    /// then flush/lookup) instead of four.
-    fn enqueue(&self, key: &K) -> Option<Arc<Result<V, E>>> {
+    /// Join a cached result, an in-flight batch, or the next batch.
+    fn enqueue(&self, key: &K) -> Enqueued<V, E> {
         let mut state = self.lock();
-        match state.entries.get(key) {
-            Some(Entry::Ready(result)) => return Some(Arc::clone(result)),
-            // Queued or part of an in-flight batch: the existing entry already covers this load.
-            Some(_) => {
-                #[cfg(feature = "tracing")]
-                {
-                    state.deduplicated += 1;
+        loop {
+            match state.entries.get(key) {
+                Some(Entry::Ready(result)) => {
+                    return Enqueued::Assigned(Lookup::Ready(Arc::clone(result)));
                 }
-                return None;
-            }
-            None => {}
-        }
-        if state.queue.len() >= self.config.max_queue {
-            self.flush_locked(&mut state);
-            if state.entries.contains_key(key) {
-                #[cfg(feature = "tracing")]
-                {
-                    state.deduplicated += 1;
+                Some(Entry::Pending { batch, index }) => {
+                    let lookup = Lookup::Pending {
+                        shared: state.batches[batch].clone(),
+                        index: *index,
+                    };
+                    #[cfg(feature = "tracing")]
+                    {
+                        state.deduplicated += 1;
+                    }
+                    return Enqueued::Assigned(lookup);
                 }
-                return None;
+                None if state.queue.len() >= self.config.max_queue => {
+                    self.flush_locked(&mut state);
+                }
+                None => break,
             }
         }
-        if state.queued.insert(key.clone()) {
-            state.queue.push_back(key.clone());
-        } else {
+        if let Some(slot) = state.queued.get(key).cloned() {
             #[cfg(feature = "tracing")]
             {
                 state.deduplicated += 1;
             }
+            return Enqueued::Queued(slot);
         }
-        None
+        Enqueued::Queued(Self::queue_locked(&mut state, key.clone()))
     }
 
-    /// Flush the queue and report what is known about `key`, under one lock.
-    fn flush_and_lookup(&self, key: &K) -> Lookup<V, E> {
+    fn queue_locked(state: &mut State<K, V, E>, key: K) -> Queued<V, E> {
+        let slot = Arc::new(OnceLock::new());
+        state.queued.insert(key.clone(), Arc::clone(&slot));
+        state.queue.push_back(key);
+        slot
+    }
+
+    fn flush_and_lookup(&self, enqueued: Enqueued<V, E>) -> Lookup<V, E> {
         let mut state = self.lock();
         self.flush_locked(&mut state);
-        Self::lookup_locked(&state, key)
+        match enqueued {
+            Enqueued::Assigned(lookup) => lookup,
+            Enqueued::Queued(slot) => slot
+                .get()
+                .expect("every queued load was assigned a batch or primed")
+                .clone(),
+        }
     }
 
     /// Turn every queued key into a batch.
@@ -548,19 +565,27 @@ where
             let deduplicated = 0usize;
             let take = queued.min(self.config.max_batch_size);
             let keys: Vec<K> = state.queue.drain(..take).collect();
-            for key in &keys {
-                state.queued.remove(key);
-            }
-
             let batch = state.next_batch;
             state.next_batch = state.next_batch.wrapping_add(1);
+            let mut slots = Vec::with_capacity(take);
             for (index, key) in keys.iter().enumerate() {
+                slots.push(state.queued.remove(key).expect("key was queued"));
                 state
                     .entries
                     .insert(key.clone(), Entry::Pending { batch, index });
             }
 
             let shared = self.start_batch(batch, keys, queued, deduplicated);
+            // Assign the same future to the waiters before any of them can poll it.
+            for (index, slot) in slots.into_iter().enumerate() {
+                assert!(
+                    slot.set(Lookup::Pending {
+                        shared: shared.clone(),
+                        index,
+                    })
+                    .is_ok()
+                );
+            }
             state.batches.insert(batch, shared);
         }
     }
@@ -640,25 +665,9 @@ where
                 None => {
                     // The batch function omitted this key. Retry it in the next batch.
                     state.entries.remove(&key);
-                    if state.queued.insert(key.clone()) {
-                        state.queue.push_back(key);
-                    }
+                    Self::queue_locked(&mut state, key);
                 }
             }
-        }
-    }
-
-    fn lookup_locked(state: &State<K, V, E>, key: &K) -> Lookup<V, E> {
-        match state.entries.get(key) {
-            Some(Entry::Ready(result)) => Lookup::Ready(Arc::clone(result)),
-            Some(Entry::Pending { batch, index }) => match state.batches.get(batch) {
-                Some(shared) => Lookup::Pending {
-                    shared: shared.clone(),
-                    index: *index,
-                },
-                None => Lookup::Missing,
-            },
-            None => Lookup::Missing,
         }
     }
 
@@ -676,7 +685,8 @@ where
     )]
     async fn load(self: Arc<Self>, key: K) -> Result<V, E> {
         // One lock covers both "already resolved?" and "queue it for the next batch".
-        if let Some(result) = self.enqueue(&key) {
+        let mut enqueued = self.enqueue(&key);
+        if let Enqueued::Assigned(Lookup::Ready(result)) = enqueued {
             #[cfg(feature = "tracing")]
             {
                 let span = tracing::Span::current();
@@ -701,7 +711,7 @@ where
 
         let mut attempts: u8 = 0;
         loop {
-            match self.flush_and_lookup(&key) {
+            match self.flush_and_lookup(enqueued) {
                 Lookup::Ready(result) => return (*result).clone(),
                 Lookup::Pending { shared, index } => {
                     let results = shared.await;
@@ -725,17 +735,8 @@ where
                         );
                     }
                 }
-                Lookup::Missing => {
-                    attempts = attempts.saturating_add(1);
-                    if attempts >= self.config.max_attempts {
-                        panic!(
-                            "gurafi::Loader lost the result for a key and could not retry it; \
-                             this indicates a bug in the loader"
-                        );
-                    }
-                    self.enqueue(&key);
-                }
             }
+            enqueued = self.enqueue(&key);
         }
     }
 }

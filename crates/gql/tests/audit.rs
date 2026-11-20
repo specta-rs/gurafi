@@ -1520,7 +1520,10 @@ fn coverage_one_of_input_objects() {
         )
         .object(ObjectType::new("Query").field(echo_field(
             "f",
-            [InputValue::new("choice", TypeRef::named("Choice"))],
+            [
+                InputValue::new("choice", TypeRef::named("Choice")),
+                InputValue::new("choices", TypeRef::named("Choice").list()),
+            ],
         )))
         .query("Query")
         .build()
@@ -1533,17 +1536,41 @@ fn coverage_one_of_input_objects() {
         &Value::from("{choice:{a:i32:1}}")
     );
 
-    let none = run(&schema, "{ f(choice: {}) }");
-    assert_eq!(none.data, Some(Value::Null));
-    assert_eq!(none.errors.len(), 1);
+    for (query, message) in [
+        (
+            "query Q($b: String) { f(choice: {a: 1, b: $b}) }",
+            "exactly one field",
+        ),
+        ("{ f(choice: {}) }", "exactly one field"),
+        ("{ f(choice: {a: 1, b: \"x\"}) }", "exactly one field"),
+        ("{ f(choice: {a: null}) }", "must not have a null value"),
+        (
+            "query Q($a: Int = 1) { f(choice: {a: $a}) }",
+            "must be non-nullable",
+        ),
+        (
+            "query Q($a: Int) { f(choices: {a: $a}) }",
+            "must be non-nullable",
+        ),
+    ] {
+        let response = run(&schema, query);
+        assert_eq!(response.data, None, "{query}: {response:?}");
+        assert!(
+            response
+                .errors
+                .iter()
+                .any(|error| error.message().contains(message)),
+            "{response:?}"
+        );
+        assert!(gql::PreparedQuery::new(&schema, "one-of", query, None).is_err());
+    }
 
-    let both = run(&schema, "{ f(choice: {a: 1, b: \"x\"}) }");
-    assert_eq!(both.data, Some(Value::Null));
-    assert_eq!(both.errors.len(), 1);
-
-    let null_value = run(&schema, "{ f(choice: {a: null}) }");
-    assert_eq!(null_value.data, Some(Value::Null));
-    assert_eq!(null_value.errors.len(), 1);
+    let field_variable = run_vars(
+        &schema,
+        "query Q($a: Int!) { f(choice: {a: $a}) }",
+        Object::from_fields([("a", Value::Int(1))]),
+    );
+    expect_no_errors(&field_variable);
 
     let variable = run_vars(
         &schema,

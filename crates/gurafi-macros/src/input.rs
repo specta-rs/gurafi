@@ -358,7 +358,12 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                 fn register_args(registry: &mut ::gurafi::TypeRegistry) {
                     if <Self as ::gurafi::InputObject>::NAME.is_some() {
                         registry.register_input_object::<Self>();
+                    } else {
+                        <Self as ::gurafi::InputObject>::register_input_fields(registry);
                     }
+                }
+
+                fn register_input_fields(registry: &mut ::gurafi::TypeRegistry) {
                     #(#nested_registrations)*
                 }
             }
@@ -368,7 +373,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                 fn input_type() -> ::gurafi::gql::TypeRef {
                     match <Self as ::gurafi::InputObject>::NAME {
                         ::core::option::Option::Some(name) => {
-                            ::gurafi::gql::TypeRef::named(name)
+                            ::gurafi::gql::TypeRef::named(name).non_null()
                         }
                         // Reaching this in a schema is reported as a build error by
                         // `TypeRegistry::unnamed_input`; the placeholder only keeps the type
@@ -385,7 +390,6 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                     } else {
                         registry.unnamed_input::<Self>();
                     }
-                    #(#nested_registrations)*
                 }
             }
 

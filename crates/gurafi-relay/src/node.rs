@@ -284,10 +284,13 @@ impl<M: ObjectModel, Ctx: 'static + Sync> NodeBuilder<M, Ctx> {
 /// outer name is an [`Arc<str>]` shared with the registry, and the inner key borrows the decoded
 /// local ID. Only an actual load allocates a key for its cached result.
 type CachedNode = Result<Option<Value>, GraphQLError>;
+type BatchErrors = HashMap<Vec<String>, GraphQLError>;
 
 #[derive(Default)]
 struct NodeResultCache {
     entries: Mutex<HashMap<Arc<str>, HashMap<String, CachedNode>>>,
+    // A batch error says nothing about an individual ID or another batch of the same type.
+    batch_errors: Mutex<HashMap<Arc<str>, BatchErrors>>,
 }
 
 impl NodeResultCache {
@@ -308,6 +311,40 @@ impl NodeResultCache {
             .or_default()
             .insert(local_id.into(), value);
     }
+}
+
+async fn load_batch<Ctx>(
+    entry: &NodeTypeEntry<Ctx>,
+    cache: Option<&Arc<NodeResultCache>>,
+    keys: Vec<String>,
+    ctx: &Ctx,
+) -> Result<Vec<Option<Value>>, GraphQLError> {
+    let Some(cache) = cache else {
+        return (entry.load_many)(keys, ctx).await;
+    };
+    let cached = cache
+        .batch_errors
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&entry.typename)
+        .and_then(|batches| batches.get(keys.as_slice()))
+        .cloned();
+    if let Some(error) = cached {
+        return Err(error);
+    }
+
+    let batch_key = keys.clone();
+    let result = (entry.load_many)(keys, ctx).await;
+    if let Err(error) = &result {
+        cache
+            .batch_errors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(Arc::clone(&entry.typename))
+            .or_default()
+            .insert(batch_key, error.clone());
+    }
+    result
 }
 
 /// The per-schema Relay registry.
@@ -750,7 +787,7 @@ async fn resolve_many<Ctx: 'static>(
             loader_calls += 1;
         }
         let keys: Vec<String> = unique.iter().map(|id| (*id).to_owned()).collect();
-        let values = (entry.load_many)(keys, ctx).await?;
+        let values = load_batch(entry, cache, keys, ctx).await?;
         let mut positions: HashMap<&str, usize> = HashMap::with_capacity(unique.len());
         for (position, id) in unique.iter().enumerate() {
             positions.insert(*id, position);
@@ -772,63 +809,63 @@ async fn resolve_many<Ctx: 'static>(
     // Local IDs are not tied to a type, so try each registered loader. The first loader with a
     // value wins; this is deliberately a compatibility path rather than the primary dispatch.
     if !local.is_empty() {
-        let mut unique: Vec<&str> = Vec::with_capacity(local.len());
-        let mut seen: HashSet<&str> = HashSet::with_capacity(local.len());
-        for (_, id) in &local {
-            if seen.insert(id.as_str()) {
-                unique.push(id.as_str());
-            }
-        }
-        // The positions are the same for every loader, so build them once instead of searching
-        // `unique` per entry and ID.
-        let mut positions: HashMap<&str, usize> = HashMap::with_capacity(unique.len());
-        for (position, id) in unique.iter().enumerate() {
-            positions.insert(*id, position);
-        }
+        let mut positions = HashMap::new();
         for entry in entries {
             if local.iter().all(|(index, _)| resolved[*index]) {
                 break;
             }
+            positions.clear();
+            let mut keys = Vec::new();
             for (index, local_id) in &local {
                 if resolved[*index] {
                     continue;
                 }
                 if let Some(cached) = cache.and_then(|cache| cache.get(&entry.typename, local_id)) {
+                    #[cfg(feature = "tracing")]
+                    {
+                        cache_hits += 1;
+                    }
                     match cached {
                         Ok(Some(value)) => {
                             results[*index] = Some(value);
                             resolved[*index] = true;
                         }
+                        // Known absent for this type, but still eligible for later types.
                         Ok(None) => {}
                         Err(error) => return Err(error),
                     }
                     continue;
                 }
+                positions.entry(local_id.as_str()).or_insert_with(|| {
+                    let position = keys.len();
+                    keys.push(local_id.clone());
+                    position
+                });
             }
-            if local.iter().all(|(index, _)| resolved[*index]) {
-                break;
+            if keys.is_empty() {
+                continue;
             }
 
             #[cfg(feature = "tracing")]
             {
                 loader_calls += 1;
             }
-            let keys: Vec<String> = unique.iter().map(|id| (*id).to_owned()).collect();
-            let values = (entry.load_many)(keys, ctx).await?;
+            let values = load_batch(entry, cache, keys, ctx).await?;
+            if let Some(cache) = cache {
+                for (&local_id, &position) in &positions {
+                    let value = values.get(position).cloned().flatten();
+                    cache.insert(&entry.typename, local_id, Ok(value));
+                }
+            }
             for (index, local_id) in &local {
                 if resolved[*index] {
                     continue;
                 }
-                let value = positions
+                if let Some(Some(value)) = positions
                     .get(local_id.as_str())
                     .and_then(|position| values.get(*position))
-                    .cloned()
-                    .flatten();
-                if value.is_some() {
-                    if let Some(cache) = cache {
-                        cache.insert(&entry.typename, local_id.as_str(), Ok(value.clone()));
-                    }
-                    results[*index] = value;
+                {
+                    results[*index] = Some(value.clone());
                     resolved[*index] = true;
                 }
             }
