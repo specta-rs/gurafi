@@ -201,7 +201,8 @@ wire-compatible.
 
 - Global IDs are the default; local IDs must be opted in.
 - Unknown global type IDs in `nodes` produce a null item, not a null response.
-- Node loader errors are cached for the request, so a failing backend is not retried per field.
+- With request caching enabled, a completed loader error is reused for the same node ID or the
+  same ordered batch of distinct IDs. A batch error does not mark its individual IDs as failed.
 - `nodes` with only `load_one` runs bounded concurrent loads.
 - Request-scoped caching is opt-in through `with_request_cache`.
 

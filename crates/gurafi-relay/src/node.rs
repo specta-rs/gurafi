@@ -284,10 +284,13 @@ impl<M: ObjectModel, Ctx: 'static + Sync> NodeBuilder<M, Ctx> {
 /// outer name is an [`Arc<str>]` shared with the registry, and the inner key borrows the decoded
 /// local ID. Only an actual load allocates a key for its cached result.
 type CachedNode = Result<Option<Value>, GraphQLError>;
+type BatchErrors = HashMap<Vec<String>, GraphQLError>;
 
 #[derive(Default)]
 struct NodeResultCache {
     entries: Mutex<HashMap<Arc<str>, HashMap<String, CachedNode>>>,
+    // A batch error says nothing about an individual ID or another batch of the same type.
+    batch_errors: Mutex<HashMap<Arc<str>, BatchErrors>>,
 }
 
 impl NodeResultCache {
@@ -308,6 +311,40 @@ impl NodeResultCache {
             .or_default()
             .insert(local_id.into(), value);
     }
+}
+
+async fn load_batch<Ctx>(
+    entry: &NodeTypeEntry<Ctx>,
+    cache: Option<&Arc<NodeResultCache>>,
+    keys: Vec<String>,
+    ctx: &Ctx,
+) -> Result<Vec<Option<Value>>, GraphQLError> {
+    let Some(cache) = cache else {
+        return (entry.load_many)(keys, ctx).await;
+    };
+    let cached = cache
+        .batch_errors
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&entry.typename)
+        .and_then(|batches| batches.get(keys.as_slice()))
+        .cloned();
+    if let Some(error) = cached {
+        return Err(error);
+    }
+
+    let batch_key = keys.clone();
+    let result = (entry.load_many)(keys, ctx).await;
+    if let Err(error) = &result {
+        cache
+            .batch_errors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(Arc::clone(&entry.typename))
+            .or_default()
+            .insert(batch_key, error.clone());
+    }
+    result
 }
 
 /// The per-schema Relay registry.
@@ -750,7 +787,7 @@ async fn resolve_many<Ctx: 'static>(
             loader_calls += 1;
         }
         let keys: Vec<String> = unique.iter().map(|id| (*id).to_owned()).collect();
-        let values = (entry.load_many)(keys, ctx).await?;
+        let values = load_batch(entry, cache, keys, ctx).await?;
         let mut positions: HashMap<&str, usize> = HashMap::with_capacity(unique.len());
         for (position, id) in unique.iter().enumerate() {
             positions.insert(*id, position);
@@ -813,7 +850,7 @@ async fn resolve_many<Ctx: 'static>(
             {
                 loader_calls += 1;
             }
-            let values = (entry.load_many)(keys, ctx).await?;
+            let values = load_batch(entry, cache, keys, ctx).await?;
             if let Some(cache) = cache {
                 for (&local_id, &position) in &positions {
                     let value = values.get(position).cloned().flatten();

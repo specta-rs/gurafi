@@ -336,6 +336,84 @@ fn local_id_batches_skip_cached_misses_but_try_later_types() {
 }
 
 #[test]
+fn global_node_batch_errors_are_cached_by_exact_batch() {
+    assert_batch_errors_are_cached_by_exact_batch(false);
+}
+
+#[test]
+fn local_node_batch_errors_are_cached_by_exact_batch() {
+    assert_batch_errors_are_cached_by_exact_batch(true);
+}
+
+fn assert_batch_errors_are_cached_by_exact_batch(local: bool) {
+    let mut schema = Schema::<Ctx>::new();
+    let mut relay = Relay::<Ctx>::new()
+        .with_request_cache(|ctx: &Ctx| ctx.cache.clone())
+        .allow_local_ids(local);
+    relay
+        .node::<User>(&mut schema, |n| {
+            n.id(|user: &User| user.id.clone());
+            n.load_one(|id, ctx| {
+                Box::pin(async move { ctx.users.iter().find(|user| user.id == id).cloned() })
+            });
+            n.load_many_result(|ids, ctx| {
+                Box::pin(async move {
+                    ctx.user_ids.lock().unwrap().push(ids.clone());
+                    if ids == ["1", "2"] {
+                        return Err(gql::GraphQLError::new("batch failed"));
+                    }
+                    Ok(ids
+                        .into_iter()
+                        .map(|id| ctx.users.iter().find(|user| user.id == id).cloned())
+                        .collect())
+                })
+            });
+        })
+        .unwrap();
+    let schema = schema.build().expect("valid schema");
+
+    let id = |key: &str| {
+        if local {
+            key.to_owned()
+        } else {
+            GlobalId::<User>::new(key).encode()
+        }
+    };
+    let (one, two) = (id("1"), id("2"));
+    let ctx = Ctx::new();
+    let requested = Arc::clone(&ctx.user_ids);
+    // Reuse the context's cache while executing fields separately: a failing non-null `nodes`
+    // field can stop sibling execution before those siblings reach the cache.
+    let options = gql::ExecutionOptions::with_context(ctx);
+    let execute = |query: &str| block_on(gql::execute(&schema, gql::Request::new(query), &options));
+    let first = execute(&format!(
+        r#"{{ first: nodes(ids: ["{one}", "{two}"]) {{ id }} }}"#
+    ));
+    let repeat = execute(&format!(
+        r#"{{ repeat: nodes(ids: ["{one}", "{two}", "{two}"]) {{ id }} }}"#
+    ));
+
+    for (response, alias) in [(first, "first"), (repeat, "repeat")] {
+        assert_eq!(response.errors.len(), 1, "{:?}", response.errors);
+        let error = &response.errors[0];
+        assert_eq!(error.message(), "batch failed");
+        assert_eq!(error.path(), Some(&[gql::PathSegment::field(alias)][..]));
+    }
+    let subset = execute(&format!(r#"{{ nodes(ids: ["{one}"]) {{ id }} }}"#));
+    assert!(!subset.has_errors(), "{:?}", subset.errors);
+    let nodes = data(&subset).get("nodes").unwrap().as_list().unwrap();
+    assert!(!nodes[0].is_null());
+    let single = execute(&format!(r#"{{ node(id: "{two}") {{ id }} }}"#));
+    assert!(!single.has_errors(), "{:?}", single.errors);
+    assert!(!data(&single).get("node").unwrap().is_null());
+    assert_eq!(
+        *requested.lock().unwrap(),
+        [vec!["1", "2"], vec!["1"]],
+        "only the repeated batch should skip the loader"
+    );
+}
+
+#[test]
 fn object_authorization_is_not_bypassed() {
     let mut schema = Schema::<Ctx>::new();
     let mut relay = Relay::<Ctx>::new();
