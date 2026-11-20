@@ -517,6 +517,36 @@ async fn subscriptions_stream_as_server_sent_events() {
 }
 
 #[tokio::test]
+async fn sse_subscription_completion_has_a_data_field() {
+    let parts = support::parts(
+        Method::POST,
+        "/graphql",
+        &[
+            (header::CONTENT_TYPE, "application/json"),
+            (header::ACCEPT, "text/event-stream"),
+        ],
+    );
+    let result = run_default(
+        &support::server(),
+        &HttpConfig::default(),
+        &parts,
+        br#"{"query":"subscription { countdown }"}"#,
+    )
+    .await;
+    let HttpResult::Stream(mut stream) = result else {
+        panic!("expected an SSE stream");
+    };
+
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.stream.next().await {
+        body.extend_from_slice(&chunk.expect("chunk"));
+    }
+    let body = std::str::from_utf8(&body).expect("UTF-8");
+    // SSE parsers only dispatch a frame if it contains a data field.
+    assert!(body.ends_with("\n\nevent: complete\ndata:\n\n"), "{body:?}");
+}
+
+#[tokio::test]
 async fn subscriptions_without_event_stream_get_a_clear_error() {
     let server = support::server();
     let config = HttpConfig::default();

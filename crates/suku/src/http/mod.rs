@@ -820,7 +820,8 @@ fn sse_response(subscription: gql::SubscriptionResponse) -> HttpResult {
             Ok(Bytes::from(format!("event: next\ndata: {json}\n\n")))
         })
         .chain(stream::once(async {
-            Ok(Bytes::from_static(b"event: complete\n\n"))
+            // SSE clients discard events without a data field.
+            Ok(Bytes::from_static(b"event: complete\ndata:\n\n"))
         }));
 
     HttpResult::Stream(SseResponse {
