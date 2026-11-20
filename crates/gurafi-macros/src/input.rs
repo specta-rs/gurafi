@@ -373,7 +373,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                 fn input_type() -> ::gurafi::gql::TypeRef {
                     match <Self as ::gurafi::InputObject>::NAME {
                         ::core::option::Option::Some(name) => {
-                            ::gurafi::gql::TypeRef::named(name)
+                            ::gurafi::gql::TypeRef::named(name).non_null()
                         }
                         // Reaching this in a schema is reported as a build error by
                         // `TypeRegistry::unnamed_input`; the placeholder only keeps the type

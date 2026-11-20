@@ -166,6 +166,37 @@ fn recursive_derived_inputs_register_and_coerce() {
 }
 
 #[test]
+fn only_optional_derived_input_objects_are_nullable() {
+    #[derive(Input)]
+    #[graphql(name = "PageInput")]
+    struct Page {
+        first: i32,
+    }
+
+    #[derive(Input)]
+    struct Args {
+        required: Page,
+        optional: Option<Page>,
+        pages: Vec<Page>,
+    }
+
+    let mut schema = Schema::<Ctx>::new();
+    schema.query(|q| {
+        q.field("list", |args: Args, _: &Ctx| {
+            args.required.first
+                + args.optional.map_or(0, |page| page.first)
+                + args.pages.iter().map(|page| page.first).sum::<i32>()
+        });
+    });
+    let schema = schema.build().expect("schema builds");
+    let query = schema.object_type("Query").expect("Query");
+    let args = &query.get_field("list").expect("list").args;
+    assert_eq!(args["required"].ty.to_string(), "PageInput!");
+    assert_eq!(args["optional"].ty.to_string(), "PageInput");
+    assert_eq!(args["pages"].ty.to_string(), "[PageInput!]!");
+}
+
+#[test]
 fn a_one_of_input_used_directly_as_arguments_is_rejected() {
     #[derive(Input)]
     #[graphql(name = "Choice", one_of)]
