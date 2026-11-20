@@ -277,6 +277,65 @@ fn request_cache_and_multi_dedup_avoid_duplicate_loads() {
 }
 
 #[test]
+fn local_id_batches_skip_ids_resolved_by_earlier_types() {
+    let schema = node_schema_with_local_ids(true);
+    let ctx = Ctx::new();
+    let post_calls = Arc::clone(&ctx.post_load_one);
+    let response = execute(
+        &schema,
+        r#"{ nodes(ids: ["1", "p1", "p1"]) { __typename } }"#,
+        ctx,
+    );
+
+    assert!(!response.has_errors(), "{:?}", response.errors);
+    let nodes = data(&response).get("nodes").unwrap().as_list().unwrap();
+    let types: Vec<_> = nodes
+        .iter()
+        .map(|node| {
+            node.as_object()
+                .unwrap()
+                .get("__typename")
+                .unwrap()
+                .as_str()
+        })
+        .collect();
+    assert_eq!(types, [Some("User"), Some("Post"), Some("Post")]);
+    assert_eq!(post_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn local_id_batches_skip_cached_misses_but_try_later_types() {
+    let schema = node_schema_with_local_ids(true);
+    let ctx = Ctx::new();
+    let user_ids = Arc::clone(&ctx.user_ids);
+    let post_calls = Arc::clone(&ctx.post_load_one);
+    let user_miss = GlobalId::<User>::new("p1").encode();
+    let query = format!(
+        r#"{{
+            seed: node(id: "{user_miss}") {{ id }}
+            first: nodes(ids: ["p1", "gone"]) {{ __typename }}
+            second: nodes(ids: ["p1", "gone"]) {{ __typename }}
+        }}"#
+    );
+    let response = execute_with(&schema, &query, ctx, |ctx| {
+        gql::ExecutionOptions::with_context(ctx).max_concurrency(1)
+    });
+
+    assert!(!response.has_errors(), "{:?}", response.errors);
+    let data = data(&response);
+    assert!(data.get("seed").unwrap().is_null());
+    for field in ["first", "second"] {
+        let nodes = data.get(field).unwrap().as_list().unwrap();
+        assert_eq!(nodes.len(), 2);
+        let post = nodes[0].as_object().unwrap();
+        assert_eq!(post.get("__typename").unwrap().as_str(), Some("Post"));
+        assert!(nodes[1].is_null());
+    }
+    assert_eq!(*user_ids.lock().unwrap(), [["p1"], ["gone"]]);
+    assert_eq!(post_calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
 fn object_authorization_is_not_bypassed() {
     let mut schema = Schema::<Ctx>::new();
     let mut relay = Relay::<Ctx>::new();

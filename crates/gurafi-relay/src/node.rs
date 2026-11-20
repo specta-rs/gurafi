@@ -772,63 +772,63 @@ async fn resolve_many<Ctx: 'static>(
     // Local IDs are not tied to a type, so try each registered loader. The first loader with a
     // value wins; this is deliberately a compatibility path rather than the primary dispatch.
     if !local.is_empty() {
-        let mut unique: Vec<&str> = Vec::with_capacity(local.len());
-        let mut seen: HashSet<&str> = HashSet::with_capacity(local.len());
-        for (_, id) in &local {
-            if seen.insert(id.as_str()) {
-                unique.push(id.as_str());
-            }
-        }
-        // The positions are the same for every loader, so build them once instead of searching
-        // `unique` per entry and ID.
-        let mut positions: HashMap<&str, usize> = HashMap::with_capacity(unique.len());
-        for (position, id) in unique.iter().enumerate() {
-            positions.insert(*id, position);
-        }
+        let mut positions = HashMap::new();
         for entry in entries {
             if local.iter().all(|(index, _)| resolved[*index]) {
                 break;
             }
+            positions.clear();
+            let mut keys = Vec::new();
             for (index, local_id) in &local {
                 if resolved[*index] {
                     continue;
                 }
                 if let Some(cached) = cache.and_then(|cache| cache.get(&entry.typename, local_id)) {
+                    #[cfg(feature = "tracing")]
+                    {
+                        cache_hits += 1;
+                    }
                     match cached {
                         Ok(Some(value)) => {
                             results[*index] = Some(value);
                             resolved[*index] = true;
                         }
+                        // Known absent for this type, but still eligible for later types.
                         Ok(None) => {}
                         Err(error) => return Err(error),
                     }
                     continue;
                 }
+                positions.entry(local_id.as_str()).or_insert_with(|| {
+                    let position = keys.len();
+                    keys.push(local_id.clone());
+                    position
+                });
             }
-            if local.iter().all(|(index, _)| resolved[*index]) {
-                break;
+            if keys.is_empty() {
+                continue;
             }
 
             #[cfg(feature = "tracing")]
             {
                 loader_calls += 1;
             }
-            let keys: Vec<String> = unique.iter().map(|id| (*id).to_owned()).collect();
             let values = (entry.load_many)(keys, ctx).await?;
+            if let Some(cache) = cache {
+                for (&local_id, &position) in &positions {
+                    let value = values.get(position).cloned().flatten();
+                    cache.insert(&entry.typename, local_id, Ok(value));
+                }
+            }
             for (index, local_id) in &local {
                 if resolved[*index] {
                     continue;
                 }
-                let value = positions
+                if let Some(Some(value)) = positions
                     .get(local_id.as_str())
                     .and_then(|position| values.get(*position))
-                    .cloned()
-                    .flatten();
-                if value.is_some() {
-                    if let Some(cache) = cache {
-                        cache.insert(&entry.typename, local_id.as_str(), Ok(value.clone()));
-                    }
-                    results[*index] = value;
+                {
+                    results[*index] = Some(value.clone());
                     resolved[*index] = true;
                 }
             }
