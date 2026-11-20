@@ -252,6 +252,58 @@ fn prime_and_clear_control_the_cache() {
 }
 
 #[test]
+fn clearing_completed_results_does_not_discard_queued_waiters() {
+    for clear_all in [false, true] {
+        let log = Log::default();
+        let loader = Loader::<u32, u32>::with_config(
+            {
+                let log = log.clone();
+                move |keys: Vec<u32>| {
+                    let value = log.calls() as u32 + 1;
+                    log.record(keys.clone());
+                    async move { keys.into_iter().map(|_| Ok(value)).collect() }
+                }
+            },
+            LoaderConfig::new().with_max_attempts(1),
+        );
+        let mut context = Context::from_waker(Waker::noop());
+        let mut first = Box::pin(loader.load(1));
+        let mut second = Box::pin(loader.load(1));
+
+        assert!(first.as_mut().poll(&mut context).is_pending());
+        assert!(second.as_mut().poll(&mut context).is_pending());
+        assert_eq!(first.as_mut().poll(&mut context), Poll::Ready(Ok(1)));
+
+        if clear_all {
+            loader.clear();
+        } else {
+            loader.clear_key(&1);
+        }
+        assert!(!loader.is_cached(&1));
+        assert_eq!(second.as_mut().poll(&mut context), Poll::Ready(Ok(1)));
+        assert_eq!(log.batches(), vec![vec![1]]);
+        assert_eq!(block_on(loader.load(1)), Ok(2));
+        assert_eq!(log.batches(), vec![vec![1], vec![1]]);
+    }
+}
+
+#[test]
+fn priming_a_queued_key_resolves_its_waiter_without_a_batch() {
+    let log = Log::default();
+    let loader = doubling_loader(&log);
+    let mut context = Context::from_waker(Waker::noop());
+    let mut load = Box::pin(loader.load(1));
+
+    assert!(load.as_mut().poll(&mut context).is_pending());
+    loader.prime(1, 99);
+    loader.clear_key(&1);
+
+    assert_eq!(load.as_mut().poll(&mut context), Poll::Ready(Ok(99)));
+    assert_eq!(log.calls(), 0);
+    assert!(!loader.is_cached(&1));
+}
+
+#[test]
 fn clones_share_batches_and_cache() {
     let log = Log::default();
     let loader = doubling_loader(&log);
