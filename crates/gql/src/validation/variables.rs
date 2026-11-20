@@ -27,6 +27,7 @@ struct VariableUsage<'a> {
     ty: Option<&'a TypeRef>,
     location: Location,
     has_location_default: bool,
+    one_of_field: bool,
 }
 
 fn nullable(ty: &TypeRef) -> &TypeRef {
@@ -58,6 +59,7 @@ fn collect_value_usages<'a>(
             ty: expected,
             location,
             has_location_default: has_default,
+            one_of_field: false,
         }),
         Value::List(items) => {
             let item_type = expected.and_then(list_item);
@@ -69,13 +71,32 @@ fn collect_value_usages<'a>(
             }
         }
         Value::Object(fields) => {
+            let mut expected = expected;
+            // An object literal in a list position is coerced as a singleton list.
+            while let Some(item) = expected.and_then(list_item) {
+                expected = Some(item);
+            }
             let input = expected.and_then(|ty| match nullable(ty) {
                 TypeRef::Named(name) => schema.input_object_type(name),
                 _ => None,
             });
             for field in fields {
-                match input.and_then(|input| crate::types::map_get(&input.fields, field.name)) {
-                    Some(definition) => collect_value_usages(
+                let Some(input) = input else {
+                    collect_value_usages(schema, &field.value, None, false, field.location, out);
+                    continue;
+                };
+                let definition = crate::types::map_get(&input.fields, field.name);
+                match (definition, &field.value) {
+                    (Some(definition), Value::Variable(name)) if input.one_of => {
+                        out.push(VariableUsage {
+                            name,
+                            ty: Some(&definition.ty),
+                            location: field.location,
+                            has_location_default: false,
+                            one_of_field: true,
+                        });
+                    }
+                    (Some(definition), _) => collect_value_usages(
                         schema,
                         &field.value,
                         Some(&definition.ty),
@@ -83,7 +104,7 @@ fn collect_value_usages<'a>(
                         field.location,
                         out,
                     ),
-                    None => {
+                    (None, _) => {
                         collect_value_usages(schema, &field.value, None, false, field.location, out)
                     }
                 }
@@ -308,6 +329,10 @@ fn allowed_position(variable: &VariableDefinition<'_>, usage: &VariableUsage<'_>
         return true;
     };
 
+    if usage.one_of_field && !matches!(variable.ty, crate::ast::Type::NonNull(_)) {
+        return false;
+    }
+
     if location_type.is_non_null() && !matches!(variable.ty, crate::ast::Type::NonNull(_)) {
         let has_non_null_default = variable
             .default_value
@@ -411,15 +436,21 @@ pub(crate) fn check_variables<'a>(
                 continue;
             }
             reported.push((usage.name, usage.location));
-            errors.push(
-                GraphQLError::new(format!(
-                    "Variable \"${}\" of type \"{}\" used in position expecting type \"{}\".",
-                    usage.name,
-                    variable.ty,
-                    usage.ty.map_or_else(String::new, ToString::to_string)
-                ))
-                .at(usage.location),
-            );
+            let message =
+                if usage.one_of_field && !matches!(variable.ty, crate::ast::Type::NonNull(_)) {
+                    format!(
+                        "Variable \"${}\" must be non-nullable when used as a OneOf input field.",
+                        usage.name,
+                    )
+                } else {
+                    format!(
+                        "Variable \"${}\" of type \"{}\" used in position expecting type \"{}\".",
+                        usage.name,
+                        variable.ty,
+                        usage.ty.map_or_else(String::new, ToString::to_string)
+                    )
+                };
+            errors.push(GraphQLError::new(message).at(usage.location));
         }
     }
 }

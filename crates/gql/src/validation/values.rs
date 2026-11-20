@@ -108,6 +108,24 @@ fn validate_named(
                 return;
             };
 
+            if input.one_of {
+                match fields.as_slice() {
+                    [field] if matches!(field.value, Value::Null) => errors.push(
+                        GraphQLError::new(format!(
+                            "OneOf input object \"{name}\" must not have a null value."
+                        ))
+                        .at(field.location),
+                    ),
+                    [_] => {}
+                    _ => errors.push(
+                        GraphQLError::new(format!(
+                            "OneOf input object \"{name}\" must specify exactly one field."
+                        ))
+                        .at(location),
+                    ),
+                }
+            }
+
             for field in fields {
                 match crate::types::map_get(&input.fields, field.name) {
                     Some(definition) => validate_value(
