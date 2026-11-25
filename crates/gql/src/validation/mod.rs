@@ -130,7 +130,7 @@ fn check_fragment_chain<'a>(
 ///
 /// `OverlappingFieldsCanBeMerged` only reports a conflict for a response key selected more than
 /// once in the same selection set, so a document where every key is unique cannot violate it.
-/// Deciding that costs a single string comparison per selection, which is much less than the
+/// Deciding that costs a single membership test per selection, which is much less than the
 /// type-aware walk the rule needs.
 fn may_repeat_response_key<'a>(
     fragments: &HashMap<&'a str, &'a FragmentDefinition<'a>>,
@@ -140,8 +140,8 @@ fn may_repeat_response_key<'a>(
         if set_may_repeat_key(
             fragments,
             &operation.selection_set,
-            &mut SmallVec::new(),
-            &mut SmallVec::new(),
+            &mut NameSet::new(),
+            &mut NameSet::new(),
         ) {
             return true;
         }
@@ -150,8 +150,8 @@ fn may_repeat_response_key<'a>(
         if set_may_repeat_key(
             fragments,
             &fragment.selection_set,
-            &mut SmallVec::new(),
-            &mut SmallVec::new(),
+            &mut NameSet::new(),
+            &mut NameSet::new(),
         ) {
             return true;
         }
@@ -163,23 +163,22 @@ fn may_repeat_response_key<'a>(
 fn set_may_repeat_key<'a>(
     fragments: &HashMap<&'a str, &'a FragmentDefinition<'a>>,
     selection_set: &'a SelectionSet<'a>,
-    visited: &mut SmallVec<[&'a str; 8]>,
-    keys: &mut SmallVec<[&'a str; 16]>,
+    visited: &mut NameSet<'a>,
+    keys: &mut NameSet<'a>,
 ) -> bool {
     for selection in &selection_set.items {
         match selection {
             Selection::Field(field) => {
                 let response_key = field.response_key();
-                if keys.iter().any(|known| names_eq(known, response_key)) {
+                if !keys.insert(response_key) {
                     return true;
                 }
-                keys.push(response_key);
                 if let Some(child) = &field.selection_set {
                     if set_may_repeat_key(
                         fragments,
                         child,
-                        &mut SmallVec::new(),
-                        &mut SmallVec::new(),
+                        &mut NameSet::new(),
+                        &mut NameSet::new(),
                     ) {
                         return true;
                     }
@@ -191,10 +190,9 @@ fn set_may_repeat_key<'a>(
                 }
             }
             Selection::FragmentSpread(spread) => {
-                if visited.iter().any(|name| names_eq(name, spread.name)) {
+                if !visited.insert(spread.name) {
                     continue;
                 }
-                visited.push(spread.name);
                 if let Some(fragment) = fragments.get(spread.name) {
                     if set_may_repeat_key(fragments, &fragment.selection_set, visited, keys) {
                         return true;

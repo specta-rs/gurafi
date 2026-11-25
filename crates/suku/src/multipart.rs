@@ -19,7 +19,10 @@
 //!
 //! [spec]: https://github.com/jaydenseric/graphql-multipart-request-spec
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 
 use bytes::Bytes;
 use futures::stream;
@@ -224,9 +227,9 @@ fn parse_map(
         .as_object()
         .ok_or_else(|| invalid("`map` must be a JSON object"))?;
 
-    // A multipart request normally maps one file to one path, so a linear scan is cheaper than
-    // a tree or a hash set; duplicates are rare and still rejected.
-    let mut seen: Vec<String> = Vec::new();
+    // Use one request-wide set to reject duplicates both within an entry and across entries.
+    // Borrowing from `raw` avoids allocating a second copy of every path.
+    let mut seen: HashSet<&str> = HashSet::new();
     let mut map = BTreeMap::new();
 
     for (name, paths) in raw {
@@ -241,15 +244,11 @@ fn parse_map(
                 ))
             })?;
             let mapped_path = parse_path(path, operations)?;
-            if seen
-                .iter()
-                .any(|relative| relative == &mapped_path.relative)
-            {
+            if !seen.insert(path) {
                 return Err(invalid(format!(
                     "map paths contain \"{path}\" more than once"
                 )));
             }
-            seen.push(mapped_path.relative.clone());
             mapped.push(mapped_path);
         }
         map.insert(name.clone(), mapped);

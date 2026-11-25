@@ -62,7 +62,8 @@ pub struct Complexity {
 ///
 /// # Errors
 ///
-/// Returns an error when the operation is unknown, ambiguous, or exceeds a configured limit.
+/// Returns an error when the operation is unknown, ambiguous, exceeds a configured limit, or
+/// exceeds an internal analysis safety budget.
 pub fn analyze(
     schema: &Schema,
     document: &ast::Document<'_>,
@@ -81,13 +82,31 @@ pub fn analyze(
 ///
 /// # Errors
 ///
-/// Returns an error when the operation exceeds a configured limit.
+/// Returns an error when the operation exceeds a configured limit or an analysis safety budget.
 pub(crate) fn analyze_operation(
     schema: &Schema,
     document: &ast::Document<'_>,
     operation: &ast::OperationDefinition<'_>,
     variables: &Object,
     options: &ComplexityOptions,
+) -> Result<Complexity, GraphQLError> {
+    analyze_operation_with_mode(
+        schema,
+        document,
+        operation,
+        variables,
+        options,
+        AnalysisMode::Request,
+    )
+}
+
+fn analyze_operation_with_mode(
+    schema: &Schema,
+    document: &ast::Document<'_>,
+    operation: &ast::OperationDefinition<'_>,
+    variables: &Object,
+    options: &ComplexityOptions,
+    mode: AnalysisMode,
 ) -> Result<Complexity, GraphQLError> {
     let root = root_type_name(schema, operation.kind)?;
 
@@ -97,8 +116,10 @@ pub(crate) fn analyze_operation(
         variables,
         options,
         fragment_cache: FragmentCache::new(),
+        retained: RetainedBudget::default(),
         work: 0,
         breadth: 0,
+        mode,
     };
     let mut active_fragments = SmallVec::new();
     let (cost, depth) = analyzer.analyze_selection(
@@ -174,8 +195,49 @@ fn root_type_name(schema: &Schema, kind: OperationKind) -> Result<Arc<str>, Grap
 
 /// Maximum fragment nesting accepted by the analyzer.
 const MAX_FRAGMENT_DEPTH: usize = 128;
-/// Maximum number of selections the analyzer may visit before rejecting the operation.
+/// Maximum amount of field and selection inspection work before rejecting the operation.
 const MAX_ANALYSIS_WORK: u64 = 500_000;
+/// Maximum field entries retained across all temporary expansions and fragment-cache slots.
+const MAX_RETAINED_FIELDS: usize = 50_000;
+/// Maximum child-selection references retained across all temporary expansions and cache entries.
+const MAX_RETAINED_SELECTIONS: usize = 100_000;
+
+/// Whether analysis is accounting for a request or proving a variable-independent safety bound.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnalysisMode {
+    Request,
+    Safety,
+}
+
+/// Cumulative allocation budget for the analyzer's merged representation.
+///
+/// Charges are not refunded when a temporary expansion is dropped. Repeated copies therefore
+/// cannot make total allocation work unbounded, even when the live representation becomes small
+/// again after a merge.
+#[derive(Default)]
+struct RetainedBudget {
+    fields: usize,
+    selections: usize,
+}
+
+impl RetainedBudget {
+    fn reserve(
+        &mut self,
+        additional_fields: usize,
+        additional_selections: usize,
+    ) -> Result<(), GraphQLError> {
+        if additional_fields > MAX_RETAINED_FIELDS.saturating_sub(self.fields)
+            || additional_selections > MAX_RETAINED_SELECTIONS.saturating_sub(self.selections)
+        {
+            return Err(GraphQLError::new(
+                "The query retains too many selections to analyse safely.",
+            ));
+        }
+        self.fields += additional_fields;
+        self.selections += additional_selections;
+        Ok(())
+    }
+}
 
 /// A field selection after fragment expansion and duplicate-response-key merging.
 #[derive(Clone)]
@@ -270,8 +332,10 @@ struct Analyzer<'a, 'document, 'source> {
     variables: &'a Object,
     options: &'a ComplexityOptions,
     fragment_cache: FragmentCache<'source, 'document>,
+    retained: RetainedBudget,
     work: u64,
     breadth: usize,
+    mode: AnalysisMode,
 }
 
 impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
@@ -289,7 +353,9 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
         let mut collected: CollectedFields<'source, 'document> = SmallVec::new();
         let mut index = FieldIndex::new();
         self.collect_fields(items, scope, active_fragments, &mut collected, &mut index)?;
-        self.breadth = self.breadth.max(distinct_response_keys(&collected));
+        if self.mode == AnalysisMode::Request {
+            self.breadth = self.breadth.max(distinct_response_keys(&collected));
+        }
 
         // Every field in the set is looked up on the same parent type, so it is resolved once for
         // the set instead of once per field. A field merged from a fragment with a narrower scope
@@ -325,19 +391,14 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
         I: IntoIterator<Item = &'document ast::Selection<'source>>,
     {
         for selection in items {
-            self.work = self.work.saturating_add(1);
-            if self.work > MAX_ANALYSIS_WORK {
-                return Err(GraphQLError::new(
-                    "The query expands to too many fields to analyse safely.",
-                ));
-            }
+            charge_work(&mut self.work, 1)?;
             if !self.is_included(selection.directives()) {
                 continue;
             }
 
             match selection {
                 ast::Selection::Field(field) => {
-                    merge_field(output, index, field, scope);
+                    merge_field(output, index, field, scope, &mut self.retained)?;
                 }
                 ast::Selection::FragmentSpread(spread) => {
                     if active_fragments.contains(&spread.name) {
@@ -364,7 +425,13 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
 
                     let key = (spread.name, Arc::clone(&effective_scope));
                     if let Some(fields) = self.fragment_cache.get(&key) {
-                        merge_all(output, index, fields);
+                        merge_all(
+                            output,
+                            index,
+                            fields,
+                            &mut self.retained,
+                            Some(&mut self.work),
+                        )?;
                         continue;
                     }
 
@@ -380,7 +447,11 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
                     );
                     active_fragments.pop();
                     result?;
-                    merge_all(output, index, &fields);
+                    merge_all(output, index, &fields, &mut self.retained, None)?;
+                    self.retained.reserve(
+                        1usize.saturating_add(fields.len()),
+                        retained_selections(&fields),
+                    )?;
                     self.fragment_cache.insert(key, fields);
                 }
                 ast::Selection::InlineFragment(fragment) => {
@@ -419,7 +490,11 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
         } else {
             self.field_definition(&field.scope, field.node.name)
         };
-        let base = self.field_cost(field, definition);
+        let base = if self.mode == AnalysisMode::Safety {
+            0
+        } else {
+            self.field_cost(field, definition)
+        };
 
         if field.selections.is_empty() {
             return Ok((base, depth));
@@ -480,6 +555,11 @@ impl<'a, 'document, 'source> Analyzer<'a, 'document, 'source> {
     /// A variable that is missing or not a boolean is treated as `false`, which is what validation
     /// assumed when it let the document through.
     fn is_included(&self, directives: &[ast::Directive<'source>]) -> bool {
+        if self.mode == AnalysisMode::Safety {
+            // Preparation must prove the safety budgets for every directive branch. Counting a
+            // branch that a request later skips is conservative; running user estimators is not.
+            return true;
+        }
         for directive in directives {
             match directive.name {
                 "skip" => {
@@ -551,7 +631,7 @@ impl StaticComplexity {
 /// Compute a conservative upper bound for an already selected operation.
 ///
 /// Returns `None` when the bound cannot be proven (a custom complexity estimator, an unexpected
-/// expansion, an unresolved fragment or the analysis work limit). The caller then falls back to
+/// expansion, an unresolved fragment or an analysis safety budget). The caller then falls back to
 /// [`analyze_operation`] so behaviour is never weakened.
 pub(crate) fn static_bound(
     schema: &Schema,
@@ -576,6 +656,23 @@ pub(crate) fn static_bound(
             &mut keys,
         )
         .ok()?;
+    // A cost/depth/breadth bound says nothing about the retained-state budget. Prove that safety
+    // separately with every directive branch included; otherwise prepared execution must run the
+    // exact per-request analysis, even when all public limits are disabled.
+    let variables = Object::new();
+    if analyze_operation_with_mode(
+        schema,
+        document,
+        operation,
+        &variables,
+        &ComplexityOptions::default(),
+        AnalysisMode::Safety,
+    )
+    .is_err()
+    {
+        return None;
+    }
+
     Some(StaticComplexity {
         coefficients: bound.coefficients,
         depth: bound.depth,
@@ -803,12 +900,85 @@ fn distinct_response_keys(fields: &[CollectedField<'_, '_>]) -> usize {
 /// allocates a hash map. Only a document with many distinct response keys pays for hashing.
 struct FieldIndex<'source> {
     map: Option<FxHashMap<&'source str, SmallVec<[usize; 1]>>>,
+    /// AST identities for fields whose retained sub-selections are large enough to need hashing.
+    selection_ids: FxHashMap<usize, FxHashSet<usize>>,
 }
 
 impl<'source> FieldIndex<'source> {
     fn new() -> Self {
-        Self { map: None }
+        Self {
+            map: None,
+            selection_ids: FxHashMap::default(),
+        }
     }
+}
+
+/// Above this many retained sub-selections, identity checks use a hash set.
+const LINEAR_SELECTION_LIMIT: usize = 16;
+
+/// Identity of an AST node, stable for every borrowed occurrence of that node.
+fn selection_identity(selection: &ast::Selection<'_>) -> usize {
+    std::ptr::from_ref(selection).cast::<u8>() as usize
+}
+
+/// Append only AST nodes that are not already retained for this merged field.
+///
+/// Repeated spreads can reach the same AST selection through several cache paths. GraphQL field
+/// merging makes those repeated nodes idempotent, while distinct nodes with identical text must
+/// remain: only node identity is deduplicated.
+fn append_unique_selections<'source, 'document>(
+    output: &mut CollectedFields<'source, 'document>,
+    index: &mut FieldIndex<'source>,
+    position: usize,
+    selections: impl ExactSizeIterator<Item = &'document ast::Selection<'source>> + Clone,
+    retained: &mut RetainedBudget,
+    mut work: Option<&mut u64>,
+) -> Result<(), GraphQLError> {
+    let selection_count = selections.len();
+    if output[position].selections.len() > LINEAR_SELECTION_LIMIT
+        || selection_count > LINEAR_SELECTION_LIMIT
+    {
+        if !index.selection_ids.contains_key(&position) {
+            charge_optional_work(&mut work, output[position].selections.len())?;
+        }
+        let known = index.selection_ids.entry(position).or_insert_with(|| {
+            output[position]
+                .selections
+                .iter()
+                .map(|selection| selection_identity(selection))
+                .collect()
+        });
+        let mut additional = 0;
+        for selection in selections.clone() {
+            charge_optional_work(&mut work, 1)?;
+            if !known.contains(&selection_identity(selection)) {
+                additional += 1;
+            }
+        }
+        retained.reserve(0, additional)?;
+        for selection in selections {
+            charge_optional_work(&mut work, 1)?;
+            if known.insert(selection_identity(selection)) {
+                output[position].selections.push(selection);
+            }
+        }
+    } else {
+        let mut additional = 0;
+        for selection in selections.clone() {
+            charge_optional_work(&mut work, 1)?;
+            if !contains_selection(&output[position].selections, selection, work.as_deref_mut())? {
+                additional += 1;
+            }
+        }
+        retained.reserve(0, additional)?;
+        for selection in selections {
+            charge_optional_work(&mut work, 1)?;
+            if !contains_selection(&output[position].selections, selection, work.as_deref_mut())? {
+                output[position].selections.push(selection);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn merge_field<'source, 'document>(
@@ -816,18 +986,29 @@ fn merge_field<'source, 'document>(
     index: &mut FieldIndex<'source>,
     field: &'document ast::Field<'source>,
     scope: &Arc<str>,
-) {
+    retained: &mut RetainedBudget,
+) -> Result<(), GraphQLError> {
     let response_key = field.response_key();
-    if let Some(existing) = find_entry(output, index, response_key, scope) {
+    if let Some(existing) = find_entry(output, index, response_key, scope, None)? {
         // The specification merges field nodes with the same response key and the same parent
         // scope; their sub-selections are collected once.
         if let Some(selection_set) = &field.selection_set {
-            output[existing]
-                .selections
-                .extend(selection_set.items.iter());
+            append_unique_selections(
+                output,
+                index,
+                existing,
+                selection_set.items.iter(),
+                retained,
+                None,
+            )?;
         }
-        return;
+        return Ok(());
     }
+    let selection_count = field
+        .selection_set
+        .as_ref()
+        .map_or(0, |selection_set| selection_set.items.len());
+    retained.reserve(1, selection_count)?;
     // The same response key selected through a different, overlapping fragment scope is kept as a
     // separate accounting entry. The executor still resolves it once; charging both scopes is
     // deliberately conservative and prevents a narrow scope from hiding expensive fields that
@@ -846,22 +1027,81 @@ fn merge_field<'source, 'document>(
                 .unwrap_or_default(),
         },
     );
+    Ok(())
 }
 
 fn merge_all<'source, 'document>(
     output: &mut CollectedFields<'source, 'document>,
     index: &mut FieldIndex<'source>,
     fields: &[CollectedField<'source, 'document>],
-) {
+    retained: &mut RetainedBudget,
+    mut work: Option<&mut u64>,
+) -> Result<(), GraphQLError> {
     for field in fields {
         // Re-run the scope-aware merge for the cached fragment's fields.
-        match find_entry(output, index, field.response_key, &field.scope) {
-            Some(existing) => output[existing]
-                .selections
-                .extend(field.selections.iter().copied()),
-            None => push_entry(output, index, field.clone()),
+        charge_optional_work(&mut work, 1)?;
+        match find_entry(
+            output,
+            index,
+            field.response_key,
+            &field.scope,
+            work.as_deref_mut(),
+        )? {
+            Some(existing) => append_unique_selections(
+                output,
+                index,
+                existing,
+                field.selections.iter().copied(),
+                retained,
+                work.as_deref_mut(),
+            )?,
+            None => {
+                charge_optional_work(&mut work, field.selections.len())?;
+                retained.reserve(1, field.selections.len())?;
+                push_entry(output, index, field.clone());
+            }
         }
     }
+    Ok(())
+}
+
+fn retained_selections(fields: &[CollectedField<'_, '_>]) -> usize {
+    fields.iter().fold(0, |total, field| {
+        total.saturating_add(field.selections.len())
+    })
+}
+
+fn charge_work(work: &mut u64, amount: u64) -> Result<(), GraphQLError> {
+    *work = work.saturating_add(amount);
+    if *work > MAX_ANALYSIS_WORK {
+        return Err(GraphQLError::new(
+            "The query expands to too many fields to analyse safely.",
+        ));
+    }
+    Ok(())
+}
+
+fn charge_optional_work(work: &mut Option<&mut u64>, amount: usize) -> Result<(), GraphQLError> {
+    if let Some(work) = work.as_deref_mut() {
+        charge_work(work, amount as u64)?;
+    }
+    Ok(())
+}
+
+fn contains_selection(
+    selections: &[&ast::Selection<'_>],
+    selection: &ast::Selection<'_>,
+    mut work: Option<&mut u64>,
+) -> Result<bool, GraphQLError> {
+    for known in selections {
+        if let Some(work) = work.as_deref_mut() {
+            charge_work(work, 1)?;
+        }
+        if std::ptr::eq(*known, selection) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn find_entry<'source, 'document>(
@@ -869,17 +1109,33 @@ fn find_entry<'source, 'document>(
     index: &FieldIndex<'source>,
     response_key: &str,
     scope: &str,
-) -> Option<usize> {
+    mut work: Option<&mut u64>,
+) -> Result<Option<usize>, GraphQLError> {
     match &index.map {
-        Some(map) => map.get(response_key).and_then(|positions| {
-            positions
-                .iter()
-                .copied()
-                .find(|position| output[*position].scope.as_ref() == scope)
-        }),
-        None => output.iter().position(|collected| {
-            collected.response_key == response_key && collected.scope.as_ref() == scope
-        }),
+        Some(map) => {
+            if let Some(positions) = map.get(response_key) {
+                for position in positions {
+                    if let Some(work) = work.as_deref_mut() {
+                        charge_work(work, 1)?;
+                    }
+                    if output[*position].scope.as_ref() == scope {
+                        return Ok(Some(*position));
+                    }
+                }
+            }
+            Ok(None)
+        }
+        None => {
+            for (position, collected) in output.iter().enumerate() {
+                if let Some(work) = work.as_deref_mut() {
+                    charge_work(work, 1)?;
+                }
+                if collected.response_key == response_key && collected.scope.as_ref() == scope {
+                    return Ok(Some(position));
+                }
+            }
+            Ok(None)
+        }
     }
 }
 

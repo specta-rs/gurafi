@@ -1076,7 +1076,10 @@ fn a_subscribe_closure_that_panics_before_returning_a_stream_is_isolated() {
     assert_eq!(response.errors.len(), 1, "{response:?}");
     assert_eq!(response.errors[0].message(), INTERNAL_MESSAGE);
     assert_eq!(code(&response.errors[0]), Some(INTERNAL_CODE));
-    assert_eq!(response.errors[0].path(), None);
+    assert_eq!(
+        response.errors[0].path(),
+        Some(&[PathSegment::field("tick")][..])
+    );
 }
 
 #[test]

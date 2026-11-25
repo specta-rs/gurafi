@@ -47,7 +47,7 @@
 //! [spec]: https://github.com/enisdenjo/graphql-ws/blob/master/PROTOCOL.md
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, hash_map::Entry},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::Duration,
 };
@@ -61,6 +61,7 @@ use tokio::{sync::mpsc, task::AbortHandle};
 use crate::{
     Context, GraphQLRequest, Server,
     error::{ErrorKind, ResponseMeta},
+    response::{FallibleResponseExt as _, INTERNAL_ERROR_JSON, internal_error_response},
 };
 
 /// The WebSocket subprotocol implemented by this module.
@@ -318,7 +319,7 @@ async fn run_connection<S>(
 ) where
     S: Stream<Item = WsInput> + Unpin + Send + 'static,
 {
-    let active_ids: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let active_ids: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut tasks: HashMap<String, ActiveOperation> = HashMap::new();
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<Done>();
     let mut sequence = 0u64;
@@ -384,15 +385,16 @@ async fn run_connection<S>(
                         }
                         let admitted = {
                             let mut ids = lock_ids(&active_ids);
-                            if ids.contains(&id) {
-                                None
-                            } else if config.max_operations != 0
-                                && ids.len() >= config.max_operations
-                            {
-                                Some(false)
-                            } else {
-                                ids.insert(id.clone());
-                                Some(true)
+                            let at_limit = config.max_operations != 0
+                                && ids.len() >= config.max_operations;
+                            match ids.entry(id.clone()) {
+                                Entry::Occupied(_) => None,
+                                Entry::Vacant(_entry) if at_limit => Some(false),
+                                Entry::Vacant(entry) => {
+                                    sequence += 1;
+                                    entry.insert(sequence);
+                                    Some(true)
+                                }
                             }
                         };
                         match admitted {
@@ -415,11 +417,16 @@ async fn run_connection<S>(
                                     ResponseMeta::none(),
                                     ErrorKind::Request,
                                 );
-                                send_error(&outgoing, &id, &response).await;
+                                send_error(
+                                    &outgoing,
+                                    &server,
+                                    ResponseMeta::none(),
+                                    &id,
+                                    &response,
+                                )
+                                .await;
                             }
                             Some(true) => {
-                                sequence += 1;
-                                let sequence = sequence;
                                 let handle = tokio::spawn(run_operation(
                                     OperationTask {
                                         server: server.clone(),
@@ -432,21 +439,33 @@ async fn run_connection<S>(
                                         active: Arc::clone(&active_ids),
                                     },
                                 ));
-                                tasks.insert(
-                                    id,
-                                    ActiveOperation {
-                                        sequence,
-                                        handle: handle.abort_handle(),
-                                    },
-                                );
+                                let operation = ActiveOperation {
+                                    sequence,
+                                    handle: handle.abort_handle(),
+                                };
+                                // A completed predecessor can retain its map entry until
+                                // its `Done` message is processed. Abort it before replacing
+                                // the handle; its guard cannot remove this new generation.
+                                match tasks.entry(id) {
+                                    Entry::Occupied(mut entry) => {
+                                        entry.get_mut().handle.abort();
+                                        entry.insert(operation);
+                                    }
+                                    Entry::Vacant(entry) => {
+                                        entry.insert(operation);
+                                    }
+                                }
                             }
                         }
                     }
                     ClientMessage::Complete { id } => {
                         if let Some(active) = tasks.remove(&id) {
                             active.handle.abort();
+                            let mut ids = lock_ids(&active_ids);
+                            if ids.get(&id) == Some(&active.sequence) {
+                                ids.remove(&id);
+                            }
                         }
-                        lock_ids(&active_ids).remove(&id);
                     }
                 }
             }
@@ -466,7 +485,7 @@ struct OperationTask {
     sequence: u64,
     outgoing: mpsc::Sender<WsOutput>,
     done: mpsc::UnboundedSender<Done>,
-    active: Arc<Mutex<HashSet<String>>>,
+    active: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 /// Removes the operation id and notifies the connection even if the task is aborted or panics.
@@ -475,7 +494,7 @@ struct FinishGuard {
     sequence: u64,
     outgoing: mpsc::Sender<WsOutput>,
     done: mpsc::UnboundedSender<Done>,
-    active: Arc<Mutex<HashSet<String>>>,
+    active: Arc<Mutex<HashMap<String, u64>>>,
     removed: bool,
     finished: bool,
 }
@@ -495,7 +514,10 @@ impl FinishGuard {
 
     fn remove_id(&mut self) {
         if !self.removed {
-            lock_ids(&self.active).remove(&self.id);
+            let mut ids = lock_ids(&self.active);
+            if ids.get(&self.id) == Some(&self.sequence) {
+                ids.remove(&self.id);
+            }
             self.removed = true;
         }
     }
@@ -539,16 +561,11 @@ async fn run_operation(task: OperationTask) {
         ..
     } = task;
 
-    let kind = match server.operation_kind(&request) {
+    let meta = ResponseMeta::from_request(&request);
+    let kind = match server.operation_kind_outcome(&request) {
         Ok(kind) => kind,
-        Err(error) => {
-            let mut response = Response::error(error);
-            server.format_response(
-                &mut response,
-                ResponseMeta::from_request(&request),
-                ErrorKind::Request,
-            );
-            let message = error_message(&id, &response);
+        Err(outcome) => {
+            let message = error_message(&server, meta, &id, &outcome.response);
             guard.finish(Some(message)).await;
             return;
         }
@@ -559,7 +576,7 @@ async fn run_operation(task: OperationTask) {
             Ok(subscription) => {
                 let mut stream = subscription.stream;
                 while let Some(response) = stream.next().await {
-                    let message = next_message(&id, &response);
+                    let message = next_message(&server, meta, &id, &response);
                     if outgoing.send(WsOutput::Text(message)).await.is_err() {
                         return;
                     }
@@ -567,7 +584,7 @@ async fn run_operation(task: OperationTask) {
                 guard.finish(Some(complete_message(&id))).await;
             }
             Err(response) => {
-                let message = error_message(&id, &response);
+                let message = error_message(&server, meta, &id, &response);
                 guard.finish(Some(message)).await;
             }
         }
@@ -577,11 +594,11 @@ async fn run_operation(task: OperationTask) {
     let response = server.execute(&request, context).await;
     if is_request_error(&response) {
         // `error` terminates the operation; no `complete` follows it.
-        let message = error_message(&id, &response);
+        let message = error_message(&server, meta, &id, &response);
         guard.finish(Some(message)).await;
     } else {
         if outgoing
-            .send(WsOutput::Text(next_message(&id, &response)))
+            .send(WsOutput::Text(next_message(&server, meta, &id, &response)))
             .await
             .is_err()
         {
@@ -642,43 +659,66 @@ struct Pong<'a> {
 const CONNECTION_ACK: &str = r#"{"type":"connection_ack"}"#;
 const PONG: &str = r#"{"type":"pong"}"#;
 
-fn next_message(id: &str, response: &Response) -> String {
+fn next_message(server: &Server, meta: ResponseMeta<'_>, id: &str, response: &Response) -> String {
     match serde_json::to_string(&Message {
         id,
         kind: "next",
         payload: response,
     }) {
         Ok(message) => message,
-        // Only an opaque model value can fail to serialize, and the HTTP transport answers it
-        // with a specification-shaped error. Keep the same fallback payload here.
-        Err(error) => serde_json::to_string(&Message {
-            id,
-            kind: "next",
-            payload: crate::response::serialization_error(error),
-        })
-        .unwrap_or_default(),
+        Err(_) => {
+            let fallback = server.serialization_failure_response(meta);
+            let payload = fallback
+                .try_to_json_string()
+                .unwrap_or_else(|_| INTERNAL_ERROR_JSON.to_owned());
+            // The fallible helper either produced JSON or returned the known-safe constant.
+            let payload = serde_json::value::RawValue::from_string(payload)
+                .expect("GraphQL response serialization produces valid JSON");
+            serde_json::to_string(&Message {
+                id,
+                kind: "next",
+                payload: &payload,
+            })
+            .unwrap_or_default()
+        }
     }
 }
 
-fn error_message(id: &str, response: &Response) -> String {
+fn error_message(server: &Server, meta: ResponseMeta<'_>, id: &str, response: &Response) -> String {
     match serde_json::to_string(&Message {
         id,
         kind: "error",
         payload: &response.errors,
     }) {
         Ok(message) => message,
-        Err(_) => serde_json::to_string(&Message {
-            id,
-            kind: "error",
-            payload: &[] as &[gql::GraphQLError],
-        })
-        .unwrap_or_default(),
+        Err(_) => {
+            let fallback = server.serialization_failure_response(meta);
+            let payload = serde_json::to_string(&fallback.errors).unwrap_or_else(|_| {
+                serde_json::to_string(&internal_error_response().errors)
+                    .expect("generic GraphQL errors serialize to JSON")
+            });
+            // The fallible helper either produced JSON or returned a known-safe error array.
+            let payload = serde_json::value::RawValue::from_string(payload)
+                .expect("GraphQL error serialization produces valid JSON");
+            serde_json::to_string(&Message {
+                id,
+                kind: "error",
+                payload: &payload,
+            })
+            .unwrap_or_default()
+        }
     }
 }
 
-async fn send_error(outgoing: &mpsc::Sender<WsOutput>, id: &str, response: &Response) {
+async fn send_error(
+    outgoing: &mpsc::Sender<WsOutput>,
+    server: &Server,
+    meta: ResponseMeta<'_>,
+    id: &str,
+    response: &Response,
+) {
     let _ = outgoing
-        .send(WsOutput::Text(error_message(id, response)))
+        .send(WsOutput::Text(error_message(server, meta, id, response)))
         .await;
 }
 
@@ -715,7 +755,7 @@ async fn close(outgoing: &mpsc::Sender<WsOutput>, code: u16, reason: &str) {
         .await;
 }
 
-fn lock_ids(ids: &Mutex<HashSet<String>>) -> MutexGuard<'_, HashSet<String>> {
+fn lock_ids(ids: &Mutex<HashMap<String, u64>>) -> MutexGuard<'_, HashMap<String, u64>> {
     ids.lock().unwrap_or_else(PoisonError::into_inner)
 }
 

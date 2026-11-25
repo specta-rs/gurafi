@@ -7,6 +7,12 @@
 use gql::{GraphQLError, Response};
 use serde_json::{Value, json};
 
+use crate::error::INTERNAL_ERROR_MESSAGE;
+
+/// A known-safe fallback for the degenerate case where a formatter itself returns an
+/// unserializable error. Transport code must never expose a serializer diagnostic.
+pub(crate) const INTERNAL_ERROR_JSON: &str = r#"{"errors":[{"message":"Internal server error"}]}"#;
+
 /// The canonical GraphQL response type.
 ///
 /// This is an alias rather than a wrapper: `suku` never defines a second response model, so
@@ -18,7 +24,9 @@ pub trait ResponseExt {
     /// Serialize the response to a JSON value.
     ///
     /// If serialization fails (only possible when a schema leaked an opaque model value into the
-    /// response), a spec-shaped error response is returned instead of panicking.
+    /// response), a generic spec-shaped error response is returned instead of panicking. Server
+    /// transports use the fallible helper so they can also format the fallback and return HTTP
+    /// 500.
     fn to_json(&self) -> Value;
 
     /// Serialize the response to a JSON string.
@@ -26,6 +34,25 @@ pub trait ResponseExt {
 
     /// Serialize the response to UTF-8 JSON bytes.
     fn to_json_bytes(&self) -> Vec<u8>;
+}
+
+/// Fallible serialization for transports that must react to a late serialization failure.
+pub(crate) trait FallibleResponseExt {
+    /// Serialize to a JSON string without replacing the error.
+    fn try_to_json_string(&self) -> serde_json::Result<String>;
+
+    /// Serialize to UTF-8 JSON bytes without replacing the error.
+    fn try_to_json_bytes(&self) -> serde_json::Result<Vec<u8>>;
+}
+
+impl FallibleResponseExt for Response {
+    fn try_to_json_string(&self) -> serde_json::Result<String> {
+        serde_json::to_string(self)
+    }
+
+    fn try_to_json_bytes(&self) -> serde_json::Result<Vec<u8>> {
+        serde_json::to_vec(self)
+    }
 }
 
 impl ResponseExt for Response {
@@ -66,16 +93,21 @@ pub fn error_response(message: impl Into<String>) -> Response {
     Response::error(GraphQLError::new(message.into()))
 }
 
+/// A fresh, generic internal error response.
+pub(crate) fn internal_error_response() -> Response {
+    error_response(INTERNAL_ERROR_MESSAGE)
+}
+
 /// A specification-shaped error response as JSON bytes.
 #[must_use]
 pub fn error_json_bytes(message: impl Into<String>) -> Vec<u8> {
     error_response(message).to_json_bytes()
 }
 
-pub(crate) fn serialization_error(error: serde_json::Error) -> Value {
+pub(crate) fn serialization_error(_error: serde_json::Error) -> Value {
     json!({
         "errors": [{
-            "message": format!("Failed to serialize the GraphQL response: {error}")
+            "message": INTERNAL_ERROR_MESSAGE
         }]
     })
 }

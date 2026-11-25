@@ -49,11 +49,12 @@ use futures::future::BoxFuture;
 
 use crate::{
     Context, Server,
+    error::{ErrorKind, ResponseMeta},
     http::{
         ContextRequest, ExtractContext, HttpConfig, HttpError, HttpResponse, HttpResult,
         SseResponse,
     },
-    response::ResponseExt as _,
+    response::{FallibleResponseExt as _, INTERNAL_ERROR_JSON},
 };
 
 #[cfg(feature = "ws")]
@@ -363,15 +364,11 @@ fn header_has_token(headers: &HeaderMap, name: HeaderName, token: &str) -> bool 
 fn http_error_response(server: &Server, mut error: HttpError) -> AxumResponse {
     server.format_response(
         &mut error.response,
-        crate::error::ResponseMeta::none(),
-        crate::error::ErrorKind::Request,
+        ResponseMeta::none(),
+        ErrorKind::Request,
     );
-    let mut response = AxumResponse::new(Body::from(error.response.to_json_bytes()));
-    *response.status_mut() = error.status;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/graphql-response+json; charset=utf-8"),
-    );
+    let mut response =
+        error_json_response(server, ResponseMeta::none(), error.status, &error.response);
     response.headers_mut().extend(error.headers);
     response
 }
@@ -385,12 +382,27 @@ fn stream_response(response: SseResponse) -> AxumResponse {
 
 fn error_response(server: &Server, status: StatusCode, message: &str) -> AxumResponse {
     let mut error = crate::response::error_response(message);
-    server.format_response(
-        &mut error,
-        crate::error::ResponseMeta::none(),
-        crate::error::ErrorKind::Request,
-    );
-    let mut response = AxumResponse::new(Body::from(error.to_json_bytes()));
+    server.format_response(&mut error, ResponseMeta::none(), ErrorKind::Request);
+    error_json_response(server, ResponseMeta::none(), status, &error)
+}
+
+fn error_json_response(
+    server: &Server,
+    meta: ResponseMeta<'_>,
+    status: StatusCode,
+    response: &gql::Response,
+) -> AxumResponse {
+    let (status, body) = match response.try_to_json_bytes() {
+        Ok(body) => (status, body),
+        Err(_) => {
+            let fallback = server.serialization_failure_response(meta);
+            let body = fallback
+                .try_to_json_bytes()
+                .unwrap_or_else(|_| INTERNAL_ERROR_JSON.as_bytes().to_vec());
+            (StatusCode::INTERNAL_SERVER_ERROR, body)
+        }
+    };
+    let mut response = AxumResponse::new(Body::from(body));
     *response.status_mut() = status;
     response.headers_mut().insert(
         header::CONTENT_TYPE,

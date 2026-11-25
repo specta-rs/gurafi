@@ -7,8 +7,8 @@
 
 use futures::{StreamExt, executor::block_on, stream};
 use gql::{
-    ExecutionOptions, Field, GraphQLError, InterfaceType, Object, ObjectType, Request, Response,
-    Schema, TypeRef, Value, prepared::PreparedQuery,
+    ExecutionOptions, Field, GraphQLError, InterfaceType, Object, ObjectType, PathSegment, Request,
+    Response, Schema, TypeRef, Value, prepared::PreparedQuery,
 };
 
 const INTERNAL_MESSAGE: &str = "Internal server error";
@@ -303,7 +303,10 @@ fn subscription_setup_panic_returns_an_error_response() {
     assert_eq!(response.errors.len(), 1, "{response:?}");
     assert_eq!(response.errors[0].message(), INTERNAL_MESSAGE);
     assert_eq!(code(&response.errors[0]), Some(INTERNAL_CODE));
-    assert_eq!(response.errors[0].path(), None);
+    assert_eq!(
+        response.errors[0].path(),
+        Some(&[PathSegment::field("tick")][..])
+    );
 }
 
 #[test]

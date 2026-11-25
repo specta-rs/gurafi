@@ -236,9 +236,9 @@ is `413`; malformed JSON, a bad `map`, an unknown or missing file, or a non-`nul
 - **Uploads** are read into memory, so set the application limit *and* the reverse proxy limit
   (`client_max_body_size` in nginx, equivalent elsewhere) to the same value. Leave headroom for
   the JSON fields and multipart boundaries.
-- **Timeouts**: `Server::timeout` bounds each operation/subscription setup, not its lifetime. A
-  long subscription is expected to outlive it; a proxy read timeout, not the execution timeout,
-  should close idle sockets.
+- **Timeouts**: `Server::timeout` bounds each operation, subscription setup and each subscription
+  event. Waiting for the next source event does not consume the event timeout, so a long or quiet
+  subscription can outlive it; a proxy read timeout should close idle sockets.
 - Every connection is independent. Authenticate at the upgrade, then rely on
   `Server::authorizer` for field-level checks that must run per operation.
 

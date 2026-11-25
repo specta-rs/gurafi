@@ -225,15 +225,31 @@ pub(crate) fn format_response_errors(
     request_id: Option<&str>,
     default_kind: ErrorKind,
 ) {
-    for error in &mut response.errors {
-        // A response path is the strongest signal that a field was resolved. Responses from
-        // `gql::execute` mix request errors (parse, validation, coercion) with execution errors
-        // in the same `errors` array, so classify each error instead of the whole response.
-        let kind = if error.path().is_some() {
+    format_response_errors_with(formatter, response, operation_name, request_id, |error| {
+        if error.path().is_some() {
             ErrorKind::Execution
         } else {
             default_kind
-        };
+        }
+    });
+}
+
+/// Apply a formatter using a caller-supplied classification for each error.
+///
+/// Subscription setup needs this because `gql` can return a root resolver or authorizer error
+/// without attaching its known response path. The server can still distinguish those execution
+/// failures from parse, validation and coercion diagnostics.
+pub(crate) fn format_response_errors_with<C>(
+    formatter: &dyn ErrorFormatter,
+    response: &mut gql::Response,
+    operation_name: Option<&str>,
+    request_id: Option<&str>,
+    classify: C,
+) where
+    C: Fn(&GraphQLError) -> ErrorKind,
+{
+    for error in &mut response.errors {
+        let kind = classify(error);
         let context = ErrorContext::new(kind, operation_name, request_id, error.path());
         *error = formatter.format(error, &context);
     }

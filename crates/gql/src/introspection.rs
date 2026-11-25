@@ -90,19 +90,29 @@ pub(crate) fn types() -> Vec<Type> {
 pub(crate) fn resolve_meta_field(
     field_name: &str,
     field: &crate::ast::Field<'_>,
+    args: &Object,
     context: &crate::execution::ExecutionContext,
 ) -> Option<Result<Value, crate::error::GraphQLError>> {
     match field_name {
         "__schema" => Some(Ok(descriptor([(TYPENAME_KEY, Value::from(SCHEMA_TYPE))]))),
-        "__type" => Some(resolve_type_meta_field(field, context)),
+        "__type" => Some(resolve_type_meta_field(field, args, context)),
         _ => None,
     }
 }
 
-fn resolve_type_meta_field(
+/// Coerce the arguments of a synthetic meta-field before authorization and resolution.
+///
+/// Only __type takes an argument. Its name: String! value is coerced here so the authorizer and
+/// resolver receive the same object, just as they do for schema-defined fields.
+pub(crate) fn coerce_meta_field_arguments(
+    field_name: &str,
     field: &ast::Field<'_>,
-    context: &ExecutionContext,
-) -> Result<Value, GraphQLError> {
+    variables: &Object,
+) -> Result<Object, GraphQLError> {
+    if field_name != "__type" {
+        return Ok(Object::new());
+    }
+
     let Some(argument) = field.argument("name") else {
         return Err(GraphQLError::new(
             "Field \"__type\" requires a \"name\" argument of type String!.",
@@ -110,12 +120,10 @@ fn resolve_type_meta_field(
         .at(field.location));
     };
 
-    // The `name` argument is `String!`. Coercing it directly keeps introspection independent of
-    // the general input coercion machinery and is exactly what the specification prescribes.
     let name = match &argument.value {
-        ast::Value::String(name) => name.as_ref().to_owned(),
-        ast::Value::Variable(variable) => match context.variables.get(variable) {
-            Some(Value::String(value)) => value.to_string(),
+        ast::Value::String(name) => Value::from(name.as_ref()),
+        ast::Value::Variable(variable) => match variables.get(variable) {
+            Some(Value::String(value)) => Value::from(value.as_ref()),
             Some(other) => {
                 return Err(GraphQLError::new(format!(
                     "Argument \"name\" of \"__type\" must be a String, but variable \"${variable}\" holds {}.",
@@ -137,6 +145,21 @@ fn resolve_type_meta_field(
             .at(argument.location));
         }
     };
+
+    let mut args = Object::with_capacity(1);
+    args.insert("name", name);
+    Ok(args)
+}
+
+fn resolve_type_meta_field(
+    field: &ast::Field<'_>,
+    args: &Object,
+    context: &ExecutionContext,
+) -> Result<Value, GraphQLError> {
+    let name = args.get("name").and_then(Value::as_str).ok_or_else(|| {
+        GraphQLError::new("Field \"__type\" requires a \"name\" argument of type String!.")
+            .at(field.location)
+    })?;
 
     if context.schema.get_type(&name).is_none() {
         return Ok(Value::Null);

@@ -12,10 +12,10 @@ repository.workspace = true
 # The GraphQL-over-HTTP specification is the core of this crate and needs no feature flag.
 # Everything below is an extension beyond that specification and is opt-in.
 default = ["axum"]
-axum = ["dep:axum", "dep:tokio", "tokio/sync", "tokio/time"]
+axum = ["dep:axum", "dep:tokio", "gql/tokio", "tokio/sync", "tokio/time"]
 # Server-sent-event subscriptions (`Accept: text/event-stream`). A transport extension: the
 # GraphQL over HTTP specification does not define subscriptions.
-sse = []
+sse = ["gql/tokio"]
 # WebSocket subscriptions use the `graphql-transport-ws` protocol, another non-HTTP transport.
 ws = ["axum", "axum/ws"]
 # GraphQL multipart requests (file uploads). A community specification, not part of GraphQL over

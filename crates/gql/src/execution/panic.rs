@@ -12,8 +12,11 @@
 //!
 //! The success path adds no allocation: the resolver future is already boxed, and the isolation
 //! is a wrapper around polling it plus a `match` on the result. The error (and its extension
-//! object) is only built when a panic was actually caught. The panic payload is discarded, never
-//! formatted, so a payload whose `Debug` implementation panics cannot cause a second panic.
+//! object) is only built when a panic was actually caught. The panic payload is never formatted
+//! and is intentionally forgotten rather than dropped: an arbitrary payload can contain multiple
+//! panicking destructors, and a double panic during `Drop` aborts the process even inside
+//! `catch_unwind`. Isolation therefore takes precedence over reclaiming exceptional payload
+//! allocations.
 //!
 //! `catch_unwind` only works when the binary unwinds. A profile with `panic = "abort"` aborts on
 //! the first panic before any of this can run; see the crate documentation.
@@ -48,9 +51,20 @@ fn internal_error() -> GraphQLError {
 fn caught<T>(result: Result<T, Box<dyn Any + Send>>) -> Result<T, GraphQLError> {
     match result {
         Ok(value) => Ok(value),
-        // Dropping the payload is safe: it is not inspected or formatted here.
-        Err(_) => Err(internal_error()),
+        Err(payload) => {
+            discard_payload(payload);
+            Err(internal_error())
+        }
     }
+}
+
+/// Dispose of a caught payload without running application-controlled destructors.
+///
+/// Dropping an arbitrary payload is not safe inside panic isolation: one panicking destructor can
+/// be caught, but a second panic while that drop is already unwinding aborts the process. Panics are
+/// exceptional, so the payload is deliberately leaked rather than risking process termination.
+fn discard_payload(payload: Box<dyn Any + Send>) {
+    std::mem::forget(payload);
 }
 
 /// Run synchronous user resolver code, turning a panic into a field error.
@@ -71,7 +85,7 @@ pub(crate) fn resolver<'a>(
 ) -> impl Future<Output = FieldResult> + 'a {
     AssertUnwindSafe(async move { resolve(context).await })
         .catch_unwind()
-        .map(|result| result.unwrap_or_else(|_| Err(internal_error())))
+        .map(|result| caught(result).flatten())
 }
 
 /// Await a subscription setup resolver, turning a panic into an error response.
@@ -81,5 +95,5 @@ pub(crate) fn subscription<'a>(
 ) -> impl Future<Output = Result<SubscriptionStream, GraphQLError>> + 'a {
     AssertUnwindSafe(async move { subscribe(context).await })
         .catch_unwind()
-        .map(|result| result.unwrap_or_else(|_| Err(internal_error())))
+        .map(|result| caught(result).flatten())
 }

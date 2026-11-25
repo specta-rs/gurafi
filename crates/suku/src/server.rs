@@ -21,6 +21,7 @@ use crate::{
     error::{ErrorContext, ErrorFormatter, ErrorKind, ResponseMeta, format_response_errors},
     prepared::{PreparedQueries, persisted_query_not_found, persisted_query_not_found_error},
     request::GraphQLRequest,
+    response::internal_error_response,
 };
 
 /// Default maximum request body size: 1 MiB.
@@ -249,7 +250,10 @@ impl Server {
         self
     }
 
-    /// Set a wall-clock timeout for each operation. `None` disables it.
+    /// Set a wall-clock timeout for each operation, subscription setup and subscription event.
+    ///
+    /// Waiting for the next source event does not consume this timeout; each event gets its own
+    /// deadline when it begins executing.
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.inner_mut().timeout = Some(timeout);
@@ -507,7 +511,7 @@ impl Server {
                 Ok(None) => {}
                 Err(error) => {
                     return ExecutionOutcome::server(
-                        self.request_response(request, Response::error(error)),
+                        self.server_response(request, Response::error(error)),
                     );
                 }
             }
@@ -629,17 +633,14 @@ impl Server {
                     let meta = ResponseMeta::from_request(request)
                         .with_operation_name(prepared.operation_name());
                     let future = prepared.subscribe(variables.as_ref(), &options);
-                    return match self.await_subscribe(meta, options.timeout, future).await {
-                        Ok(subscription) => Ok(subscription),
-                        Err((response, timed_out)) => {
-                            Err(ExecutionOutcome::after_execution(response, timed_out, None))
-                        }
-                    };
+                    return self
+                        .await_subscribe(meta, options.timeout, future, request, true)
+                        .await;
                 }
                 Ok(None) => {}
                 Err(error) => {
                     return Err(ExecutionOutcome::server(
-                        self.request_response(request, Response::error(error)),
+                        self.server_response(request, Response::error(error)),
                     ));
                 }
             }
@@ -660,17 +661,14 @@ impl Server {
 
         let gql_request = request.as_gql(variables.as_ref());
         let future = gql::subscribe(&self.inner.schema, gql_request, &options);
-        match self
-            .await_subscribe(ResponseMeta::from_request(request), options.timeout, future)
-            .await
-        {
-            Ok(subscription) => Ok(subscription),
-            Err((response, timed_out)) => Err(ExecutionOutcome::after_execution(
-                response,
-                timed_out,
-                Some(request),
-            )),
-        }
+        self.await_subscribe(
+            ResponseMeta::from_request(request),
+            options.timeout,
+            future,
+            request,
+            false,
+        )
+        .await
     }
 
     /// Determine the operation kind a request will execute.
@@ -680,30 +678,49 @@ impl Server {
     pub(crate) fn operation_kind(
         &self,
         request: &GraphQLRequest,
-    ) -> Result<Option<OperationKind>, gql::GraphQLError> {
+    ) -> Result<Option<OperationKind>, OperationKindError> {
         if let Some(id) = request.prepared_id() {
             match self.prepared_query_for_current_schema(id) {
                 Ok(Some(prepared)) => {
                     if let Some(error) =
                         prepared_operation_name_error(prepared, request.operation_name.as_deref())
                     {
-                        return Err(error);
+                        return Err(OperationKindError::Request(error));
                     }
                     return Ok(Some(prepared.kind()));
                 }
                 Ok(None) => {}
-                Err(error) => return Err(error),
+                Err(error) => return Err(OperationKindError::Server(error)),
             }
             if self.inner.require_prepared || request.query.trim().is_empty() {
-                return Err(persisted_query_not_found_error(id));
+                return Err(OperationKindError::Request(
+                    persisted_query_not_found_error(id),
+                ));
             }
         } else if self.inner.require_prepared {
-            return Err(persisted_query_not_found_error(""));
+            return Err(OperationKindError::Request(
+                persisted_query_not_found_error(""),
+            ));
         } else if request.query.trim().is_empty() {
-            return Err(missing_query_error());
+            return Err(OperationKindError::Request(missing_query_error()));
         }
 
-        operation_kind_from_text(request)
+        operation_kind_from_text(request).map_err(OperationKindError::Request)
+    }
+
+    /// Classify and format an operation-kind failure for transports that cannot execute it.
+    pub(crate) fn operation_kind_outcome(
+        &self,
+        request: &GraphQLRequest,
+    ) -> Result<Option<OperationKind>, ExecutionOutcome> {
+        self.operation_kind(request).map_err(|error| match error {
+            OperationKindError::Request(error) => {
+                ExecutionOutcome::request(self.request_response(request, Response::error(error)))
+            }
+            OperationKindError::Server(error) => {
+                ExecutionOutcome::server(self.server_response(request, Response::error(error)))
+            }
+        })
     }
 
     fn execution_options(&self, context: Context) -> ExecutionOptions {
@@ -740,6 +757,24 @@ impl Server {
             meta.request_id,
             default_kind,
         );
+    }
+
+    /// Build and format a fresh generic response for a transport serialization failure.
+    pub(crate) fn serialization_failure_response(&self, meta: ResponseMeta<'_>) -> gql::Response {
+        let mut response = internal_error_response();
+        self.format_response(&mut response, meta, ErrorKind::Execution);
+        response
+    }
+
+    /// Format a response built for a server-side failure.
+    fn server_response(&self, request: &GraphQLRequest, response: gql::Response) -> gql::Response {
+        let mut response = response;
+        self.format_response(
+            &mut response,
+            ResponseMeta::from_request(request),
+            ErrorKind::Execution,
+        );
+        response
     }
 
     /// Format a response built for a request error.
@@ -793,7 +828,9 @@ impl Server {
         meta: ResponseMeta<'_>,
         timeout: Option<Duration>,
         future: F,
-    ) -> Result<SubscriptionResponse, (gql::Response, bool)>
+        request: &GraphQLRequest,
+        prepared: bool,
+    ) -> Result<SubscriptionResponse, ExecutionOutcome>
     where
         F: Future<Output = Result<SubscriptionResponse, gql::Response>>,
     {
@@ -805,9 +842,33 @@ impl Server {
         };
         match outcome {
             Ok(subscription) => Ok(self.format_subscription(subscription, meta)),
-            Err((mut response, kind, timed_out)) => {
-                self.format_response(&mut response, meta, kind);
-                Err((response, timed_out))
+            Err((mut response, _kind, timed_out)) => {
+                // Setup failures before field execution are pathless request diagnostics. Root
+                // authorizer and source failures carry the root response path from `gql`, so
+                // the normal formatter classifies them as execution errors without re-running
+                // parsing, validation or coercion here.
+                let has_execution_errors = timed_out
+                    || response.errors.is_empty()
+                    || response.errors.iter().any(|error| error.path().is_some());
+                let failure = if timed_out {
+                    Some(FailureKind::Timeout)
+                } else if has_execution_errors {
+                    Some(FailureKind::Server)
+                } else if !prepared && gql::parser::parse_query(&request.query).is_err() {
+                    Some(FailureKind::Parse)
+                } else {
+                    Some(FailureKind::Request)
+                };
+                self.format_response(
+                    &mut response,
+                    meta,
+                    if timed_out {
+                        ErrorKind::Execution
+                    } else {
+                        ErrorKind::Request
+                    },
+                );
+                Err(ExecutionOutcome { response, failure })
             }
         }
     }
@@ -839,6 +900,14 @@ impl Server {
             .boxed();
         SubscriptionResponse { stream }
     }
+}
+
+/// A failure while determining which operation a request would execute.
+pub(crate) enum OperationKindError {
+    /// The request document or persisted-query selector was invalid.
+    Request(GraphQLError),
+    /// The persisted query was prepared for a different schema instance.
+    Server(GraphQLError),
 }
 
 /// The phase that prevented a request from executing.
@@ -956,7 +1025,8 @@ fn operation_kind_from_text(
     }
 }
 
-/// Enforce a real wall-clock deadline around execution.///
+/// Enforce a real wall-clock deadline around execution.
+///
 /// `gql` checks its own deadline between fields so it can report a partial result, but a resolver
 /// that never yields would otherwise run forever. Transports that have a timer runtime wrap the
 /// future and turn an expiry into a normal GraphQL error response.

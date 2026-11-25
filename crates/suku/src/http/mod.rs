@@ -35,7 +35,7 @@ use crate::{
     Context, Server,
     error::{ErrorKind, ResponseMeta},
     request::GraphQLRequest,
-    response::ResponseExt as _,
+    response::{FallibleResponseExt as _, INTERNAL_ERROR_JSON},
     server::{ExecutionOutcome, FailureKind},
 };
 
@@ -617,7 +617,13 @@ where
 
     let outcome = server.execute_outcome(&request, context).await;
     let status = outcome_status(&outcome);
-    HttpResult::Response(json_response(status, accept, &outcome.response))
+    HttpResult::Response(json_response(
+        server,
+        ResponseMeta::from_request(&request),
+        status,
+        accept,
+        &outcome.response,
+    ))
 }
 
 async fn handle_post<F, Fut>(
@@ -730,16 +736,32 @@ where
     if kind.is_err() && accept.event_stream {
         let outcome = server.execute_outcome(&request, context).await;
         let status = outcome_status(&outcome);
-        return HttpResult::Response(json_response(status, accept, &outcome.response));
+        return HttpResult::Response(json_response(
+            server,
+            ResponseMeta::from_request(&request),
+            status,
+            accept,
+            &outcome.response,
+        ));
     }
 
     #[cfg(feature = "sse")]
     if subscription && accept.event_stream {
         return match server.subscribe_outcome(&request, context).await {
-            Ok(subscription) => sse_response(subscription),
+            Ok(subscription) => sse_response(
+                server.clone(),
+                subscription,
+                ResponseMeta::from_request(&request),
+            ),
             Err(outcome) => {
                 let status = outcome_status(&outcome);
-                HttpResult::Response(json_response(status, accept, &outcome.response))
+                HttpResult::Response(json_response(
+                    server,
+                    ResponseMeta::from_request(&request),
+                    status,
+                    accept,
+                    &outcome.response,
+                ))
             }
         };
     }
@@ -769,7 +791,13 @@ where
 
     let outcome = server.execute_outcome(&request, context).await;
     let status = outcome_status(&outcome);
-    HttpResult::Response(json_response(status, accept, &outcome.response))
+    HttpResult::Response(json_response(
+        server,
+        ResponseMeta::from_request(&request),
+        status,
+        accept,
+        &outcome.response,
+    ))
 }
 
 /// Map an execution outcome to the status code the specification recommends.
@@ -800,12 +828,17 @@ fn partial_success_status() -> StatusCode {
 }
 
 #[cfg(feature = "sse")]
-fn sse_response(subscription: gql::SubscriptionResponse) -> HttpResult {
+fn sse_response(
+    server: Server,
+    subscription: gql::SubscriptionResponse,
+    meta: ResponseMeta<'_>,
+) -> HttpResult {
     use futures::{StreamExt as _, stream};
 
+    let meta = meta.into_owned();
     let events = subscription
         .stream
-        .map(|response| -> Result<Bytes, Infallible> {
+        .map(move |response| -> Result<Bytes, Infallible> {
             #[cfg(feature = "tracing")]
             if tracing::enabled!(target: "suku::subscription", tracing::Level::TRACE) {
                 tracing::trace!(
@@ -815,7 +848,17 @@ fn sse_response(subscription: gql::SubscriptionResponse) -> HttpResult {
                     "suku.subscription.event"
                 );
             }
-            let json = response.to_json_string();
+            let json = match response.try_to_json_string() {
+                Ok(json) => json,
+                Err(_) => {
+                    let fallback = server.serialization_failure_response(ResponseMeta {
+                        operation_name: meta.operation_name.as_deref(),
+                        request_id: meta.request_id.as_deref(),
+                    });
+                    serde_json::to_string(&fallback)
+                        .unwrap_or_else(|_| INTERNAL_ERROR_JSON.to_owned())
+                }
+            };
             Ok(Bytes::from(format!("event: next\ndata: {json}\n\n")))
         })
         .chain(stream::once(async {
@@ -838,7 +881,23 @@ fn sse_response(subscription: gql::SubscriptionResponse) -> HttpResult {
         fields(status = status.as_u16(), errors = response.errors.len(), body_bytes = tracing::field::Empty)
     )
 )]
-fn json_response(status: StatusCode, accept: &Accept, response: &Response) -> HttpResponse {
+fn json_response(
+    server: &Server,
+    meta: ResponseMeta<'_>,
+    status: StatusCode,
+    accept: &Accept,
+    response: &Response,
+) -> HttpResponse {
+    let (status, body) = match response.try_to_json_bytes() {
+        Ok(body) => (status, body),
+        Err(_) => {
+            let fallback = server.serialization_failure_response(meta);
+            let body = fallback
+                .try_to_json_bytes()
+                .unwrap_or_else(|_| INTERNAL_ERROR_JSON.as_bytes().to_vec());
+            (StatusCode::INTERNAL_SERVER_ERROR, body)
+        }
+    };
     let mut http = HttpResponse::new(status);
     http.headers.insert(
         header::CONTENT_TYPE,
@@ -848,7 +907,7 @@ fn json_response(status: StatusCode, accept: &Accept, response: &Response) -> Ht
         .insert(header::VARY, HeaderValue::from_static("Accept"));
     http.headers
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    http.body = response.to_json_bytes();
+    http.body = body;
     #[cfg(feature = "tracing")]
     {
         let span = tracing::Span::current();
@@ -876,7 +935,7 @@ fn request_error(
     let mut response = crate::response::error_response(message);
     let meta = request.map_or_else(ResponseMeta::none, ResponseMeta::from_request);
     server.format_response(&mut response, meta, ErrorKind::Request);
-    HttpResult::Response(json_response(status, accept, &response))
+    HttpResult::Response(json_response(server, meta, status, accept, &response))
 }
 
 fn context_error_response(server: &Server, accept: &Accept, mut error: HttpError) -> HttpResult {
@@ -892,7 +951,13 @@ fn context_error_response(server: &Server, accept: &Accept, mut error: HttpError
         ResponseMeta::none(),
         ErrorKind::Request,
     );
-    let mut http = json_response(error.status, accept, &error.response);
+    let mut http = json_response(
+        server,
+        ResponseMeta::none(),
+        error.status,
+        accept,
+        &error.response,
+    );
     http.headers.extend(error.headers);
     HttpResult::Response(http)
 }
@@ -908,7 +973,13 @@ fn method_not_allowed(server: &Server, accept: &Accept, allow: &'static str) -> 
     let mut response =
         crate::response::error_response(format!("Method not allowed. Supported methods: {allow}."));
     server.format_response(&mut response, ResponseMeta::none(), ErrorKind::Request);
-    let mut http = json_response(StatusCode::METHOD_NOT_ALLOWED, accept, &response);
+    let mut http = json_response(
+        server,
+        ResponseMeta::none(),
+        StatusCode::METHOD_NOT_ALLOWED,
+        accept,
+        &response,
+    );
     http.headers
         .insert(header::ALLOW, HeaderValue::from_static(allow));
     HttpResult::Response(http)
@@ -926,7 +997,13 @@ fn not_acceptable(server: &Server, accept: &Accept) -> HttpResult {
         "No acceptable response type; use `application/graphql-response+json` or `application/json`.",
     );
     server.format_response(&mut response, ResponseMeta::none(), ErrorKind::Request);
-    HttpResult::Response(json_response(StatusCode::NOT_ACCEPTABLE, accept, &response))
+    HttpResult::Response(json_response(
+        server,
+        ResponseMeta::none(),
+        StatusCode::NOT_ACCEPTABLE,
+        accept,
+        &response,
+    ))
 }
 
 fn graphiql_response() -> HttpResponse {

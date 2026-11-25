@@ -293,6 +293,58 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             ))?;
         })
     });
+    let one_of_from_object_validation = if attrs.one_of {
+        quote! {
+            if input.len() != 1 {
+                return ::core::result::Result::Err(::gurafi::gql::GraphQLError::new(
+                    ::std::format!(
+                        "OneOf input object \"{}\" must specify exactly one non-null field, \
+                         but {} were selected.",
+                        #graphql_type_name,
+                        input.len(),
+                    ),
+                ));
+            }
+            if input
+                .values()
+                .next()
+                .is_some_and(::gurafi::gql::Value::is_null)
+            {
+                return ::core::result::Result::Err(::gurafi::gql::GraphQLError::new(
+                    ::std::format!(
+                        "OneOf input object \"{}\" must specify exactly one non-null field, \
+                         but the selected field was null.",
+                        #graphql_type_name,
+                    ),
+                ));
+            }
+        }
+    } else {
+        quote! {}
+    };
+    let one_of_validation = if attrs.one_of {
+        let field_idents = parsed.iter().map(|field| &field.ident);
+        quote! {
+            let mut selected = 0usize;
+            #(
+                if ::core::option::Option::is_some(&self.#field_idents) {
+                    selected += 1;
+                }
+            )*
+            if selected != 1 {
+                return ::core::result::Result::Err(::gurafi::gql::GraphQLError::new(
+                    ::std::format!(
+                        "OneOf input object \"{}\" must specify exactly one non-null field, \
+                         but {} were selected.",
+                        #graphql_type_name,
+                        selected,
+                    ),
+                ));
+            }
+        }
+    } else {
+        quote! {}
+    };
     let type_validation = attrs.validate.as_ref().map(|path| {
         quote! {
             #path(self).map_err(|error| ::gurafi::gql::GraphQLError::new(::std::format!(
@@ -344,12 +396,14 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                     Self,
                     ::gurafi::gql::GraphQLError,
                 > {
+                    #one_of_from_object_validation
                     ::core::result::Result::Ok(Self {
                         #(#constructor_fields)*
                     })
                 }
 
                 fn validate(&self) -> ::core::result::Result<(), ::gurafi::gql::GraphQLError> {
+                    #one_of_validation
                     #(#field_validations)*
                     #type_validation
                     ::core::result::Result::Ok(())

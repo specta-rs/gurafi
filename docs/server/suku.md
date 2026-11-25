@@ -76,7 +76,7 @@ let server = Server::new(schema)
 | `max_breadth` | `1_000` | Maximum distinct response keys in one selection set. |
 | `max_errors` | `100` | Errors reported before execution stops adding them. |
 | `max_body_bytes` | 1 MiB | HTTP body and `GET` query-string limit; `0` disables it. |
-| `timeout` | `30s` | Wall-clock timeout for one operation or subscription setup. |
+| `timeout` | `30s` | Wall-clock timeout for one operation, subscription setup or subscription event. Source-event waiting is not bounded. |
 | `max_concurrency` | `16` | Sibling fields resolved concurrently per operation; `0` is unlimited. Mutations stay serial. |
 | `batch_concurrency` | `16` | Operations executed concurrently by the in-process `execute_batch` helper. |
 
@@ -281,6 +281,7 @@ The status follows the GraphQL result, not the other way around:
 | `data` present, with `errors` | `294 Partial Success` |
 | document cannot be parsed | `400 Bad Request` |
 | validation, operation selection or variable coercion failed | `422 Unprocessable Content` |
+| server-side subscription setup failed | `500 Internal Server Error` |
 | not a well-formed GraphQL-over-HTTP request (including a batch array) | `422 Unprocessable Content` |
 | malformed JSON body | `400 Bad Request` |
 | mutation or subscription over `GET` | `405 Method Not Allowed` (`Allow: POST`) |
@@ -364,7 +365,8 @@ event: complete
 ```
 
 Validation or setup errors are returned as a JSON response before the stream starts (`400` for a
-parse failure, `422` for a validation or coercion failure), never as a broken stream. A
+parse failure, `422` for a validation or coercion failure, `500` for a server-side subscription
+setup failure), never as a broken stream. A
 subscription requested without `text/event-stream` receives `422` with a clear GraphQL error when
 JSON is acceptable, or `406` when `text/event-stream` is the only acceptable type and the feature
 is disabled. Subscriptions are `POST`-only and cannot be batched.

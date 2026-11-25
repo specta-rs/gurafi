@@ -320,9 +320,9 @@ pub(crate) async fn execute_prepared_operation<'doc>(
         }
     };
 
-    // A prepared document's expansion is fixed, so a bound computed at preparation proves the
-    // limits for every request whose options fall inside it. The exact analysis still runs when the
-    // bound is unknown or exceeds a limit, preserving the usual error messages.
+    // A prepared document's bound is stored only after preparation proves its expansion
+    // stays within the analyzer's safety budgets. The exact analysis still runs when that proof or
+    // the configured-limit bound is unavailable, preserving the usual safety errors and messages.
     if prepared_needs_exact_analysis(static_complexity, options) {
         if let Err(error) = complexity::analyze_operation(
             schema,
@@ -367,10 +367,8 @@ pub(crate) fn prepared_needs_exact_analysis(
     static_complexity: Option<&StaticComplexity>,
     options: &ExecutionOptions,
 ) -> bool {
-    if options.max_complexity == 0 && options.max_depth == 0 && options.max_breadth == 0 {
-        // No limit is configured, so there is nothing to reject.
-        return false;
-    }
+    // Zero-valued public limits disable policy checks, not the analyzer's retained-state
+    // and work safety budgets. An absent bound means preparation could not prove those budgets.
     match static_complexity {
         Some(bound) => !bound.within_limits(&ComplexityOptions {
             list_factor: options.list_complexity,
@@ -550,9 +548,9 @@ pub(crate) async fn run_operation<'doc>(
 /// The document is re-parsed because the returned response stream is `'static` and therefore
 /// cannot borrow the request string; owning a parsed document would require the AST to own its
 /// source instead of borrowing it. Validation, variable coercion, complexity analysis and the
-/// single-root-field check all happened during setup and are not repeated, and the root field was
-/// authorized during setup, so event execution only resolves values with that event's own
-/// deadline. Re-parsing per event is a known cost for high-frequency subscriptions.
+/// single-root-field check all happened during setup and are not repeated. The root field is
+/// authorized again immediately before each event's resolve because permission may have changed
+/// since setup. Re-parsing per event is a known cost for high-frequency subscriptions.
 #[cfg_attr(
     feature = "tracing",
     tracing::instrument(
@@ -584,7 +582,7 @@ pub(crate) async fn execute_subscription_event(
     };
     let fragments = Fragments::new(&document);
     run_operation(
-        context, fragments, None, root_type, operation, event, deadline, true, true,
+        context, fragments, None, root_type, operation, event, deadline, true, false,
     )
     .await
 }
@@ -597,11 +595,10 @@ struct Executor<'doc> {
     deadline: Option<Instant>,
     /// Whether sibling fields at this level may resolve concurrently.
     parallel: bool,
-    /// Whether the operation's single root field was already authorized during setup.
+    /// Whether the caller has already authorized the operation's single root field.
     ///
-    /// Subscription setup authorizes the root field before subscribing. Every source event then
-    /// re-executes the same root field, so running the authorizer again would repeat the same
-    /// decision once per event. Nested fields are still authorized for every event.
+    /// Subscription events leave this false: setup authorization does not make a later decision
+    /// permanent, so every event is authorized immediately before its root resolver runs.
     skip_root_authorization: bool,
     /// The operation being executed, made available to resolvers through `ResolveInfo`.
     operation: &'doc ast::OperationDefinition<'doc>,
@@ -1281,7 +1278,23 @@ impl<'doc> Executor<'doc> {
                 parent: object_type.name.as_ref(),
                 name: first.name,
             };
-            let empty_args = Object::new();
+            let args = match introspection::coerce_meta_field_arguments(
+                first.name,
+                first,
+                &self.context.variables,
+            ) {
+                Ok(args) => args,
+                Err(error) => {
+                    return finish_field(
+                        Err(error),
+                        Some(&ty),
+                        path,
+                        location,
+                        errors,
+                        self.context.max_errors,
+                    );
+                }
+            };
             let info = self.resolve_info(
                 first.name,
                 object_type.name.as_ref(),
@@ -1297,7 +1310,7 @@ impl<'doc> Executor<'doc> {
                         parent_type: object_type.name.as_ref(),
                         return_type: &ty,
                         path: path.as_slice(),
-                        args: &empty_args,
+                        args: &args,
                         info: &info,
                     };
                     authorizer.authorize_async(&authorization).await.err()
@@ -1306,7 +1319,7 @@ impl<'doc> Executor<'doc> {
             };
             let outcome = match denial {
                 Some(error) => Err(error),
-                None => match self.resolve_meta(object_type, parent, first) {
+                None => match self.resolve_meta(object_type, parent, first, &args) {
                     Ok(value) => {
                         match self.complete_leaf(&value, &ty, label, location, path, false) {
                             Some(completed) => completed,
@@ -1652,7 +1665,23 @@ impl<'doc> Executor<'doc> {
                 parent: object_type.name.as_ref(),
                 name: first.name,
             };
-            let empty_args = Object::new();
+            let args = match introspection::coerce_meta_field_arguments(
+                first.name,
+                first,
+                &self.context.variables,
+            ) {
+                Ok(args) => args,
+                Err(error) => {
+                    return finish_field(
+                        Err(error),
+                        Some(&ty),
+                        path,
+                        location,
+                        errors,
+                        self.context.max_errors,
+                    );
+                }
+            };
             let info = self.resolve_info(
                 first.name,
                 object_type.name.as_ref(),
@@ -1668,7 +1697,7 @@ impl<'doc> Executor<'doc> {
                         parent_type: object_type.name.as_ref(),
                         return_type: &ty,
                         path: path.as_slice(),
-                        args: &empty_args,
+                        args: &args,
                         info: &info,
                     };
                     authorizer.authorize_async(&authorization).await.err()
@@ -1677,7 +1706,7 @@ impl<'doc> Executor<'doc> {
             };
             let outcome = match denial {
                 Some(error) => Err(error),
-                None => match self.resolve_meta(object_type, parent, first) {
+                None => match self.resolve_meta(object_type, parent, first, &args) {
                     Ok(value) => {
                         match self.complete_leaf(&value, &ty, label, location, path, false) {
                             Some(completed) => completed,
@@ -2225,11 +2254,27 @@ impl<'doc> Executor<'doc> {
                 parent: object_type.name.as_ref(),
                 name: first.name,
             };
+            let args = match introspection::coerce_meta_field_arguments(
+                first.name,
+                first,
+                &self.context.variables,
+            ) {
+                Ok(args) => args,
+                Err(error) => {
+                    return finish_field(
+                        Err(error),
+                        Some(&ty),
+                        path,
+                        location,
+                        errors,
+                        self.context.max_errors,
+                    );
+                }
+            };
             let denial = match self.context.authorizer.as_ref() {
                 Some(authorizer) => {
                     // The merged nodes are only materialized when a caller can observe them.
                     let field_nodes = group.nodes.field_node_refs();
-                    let empty_args = Object::new();
                     let info = self.resolve_info(
                         first.name,
                         object_type.name.as_ref(),
@@ -2243,7 +2288,7 @@ impl<'doc> Executor<'doc> {
                         parent_type: object_type.name.as_ref(),
                         return_type: &ty,
                         path: path.as_slice(),
-                        args: &empty_args,
+                        args: &args,
                         info: &info,
                     };
                     authorizer.authorize_async(&authorization).await.err()
@@ -2252,7 +2297,7 @@ impl<'doc> Executor<'doc> {
             };
             let outcome = match denial {
                 Some(error) => Err(error),
-                None => match self.resolve_meta(object_type, parent, first) {
+                None => match self.resolve_meta(object_type, parent, first, &args) {
                     Ok(value) => {
                         match self.complete_leaf(&value, &ty, label, location, path, false) {
                             Some(completed) => completed,
@@ -4426,6 +4471,7 @@ impl<'doc> Executor<'doc> {
         object_type: &ObjectType,
         parent: &Value,
         node: &ast::Field<'_>,
+        args: &Object,
     ) -> Result<Value, GraphQLError> {
         if node.name == "__schema" || node.name == "__type" {
             if self.context.schema.query_name().as_ref() != object_type.name.as_ref() {
@@ -4442,11 +4488,12 @@ impl<'doc> Executor<'doc> {
                 ))
                 .at(node.location));
             }
-            return introspection::resolve_meta_field(node.name, node, self.context)
+            return introspection::resolve_meta_field(node.name, node, args, self.context)
                 .unwrap_or_else(|| Err(unknown_meta_field(node, object_type)));
         }
 
-        if let Some(result) = introspection::resolve_meta_field(node.name, node, self.context) {
+        if let Some(result) = introspection::resolve_meta_field(node.name, node, args, self.context)
+        {
             return result;
         }
 

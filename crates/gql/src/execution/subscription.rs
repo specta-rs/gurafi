@@ -145,6 +145,14 @@ where
         )));
     }
 
+    if schema.subscription_type().is_none() {
+        let mut error = GraphQLError::new("Schema is not configured for subscriptions.");
+        if let Some(response_key) = subscription_root_response_key(document, operation) {
+            error = locate(error, response_key.as_ref(), operation.location);
+        }
+        return Err(Response::error(error));
+    }
+
     let variables = match prepared.as_ref().and_then(|prepared| prepared.variables) {
         Some(compiled) => compiled.coerce(schema, request_variables),
         None => coerce::coerce_variable_values(schema, operation, request_variables),
@@ -259,13 +267,14 @@ where
         ));
     };
     let Some(subscribe) = field.subscribe.clone() else {
-        return Err(Response::error(
+        return Err(Response::error(locate(
             GraphQLError::new(format!(
                 "Subscription field \"{}.{}\" does not define a subscribe resolver.",
                 subscription_type.name, field.name
-            ))
-            .at(node.location),
-        ));
+            )),
+            response_key,
+            node.location,
+        )));
     };
 
     let args = coerce::coerce_argument_values(schema, field, node, &context.variables)
@@ -297,7 +306,7 @@ where
             info: &info,
         };
         if let Err(error) = authorizer.authorize_async(&authorization).await {
-            return Err(Response::error(error));
+            return Err(Response::error(locate(error, response_key, node.location)));
         }
     }
 
@@ -311,7 +320,7 @@ where
         },
     )
     .await
-    .map_err(Response::error)?;
+    .map_err(|error| Response::error(locate(error, response_key, node.location)))?;
 
     let field_ty = field.ty.clone();
     let location = node.location;
@@ -319,7 +328,8 @@ where
     // Each event gets its own deadline: a subscription is long-lived, so one absolute deadline
     // would kill the stream after the first timeout window.
     let context = Arc::new(context);
-    let handler = make_event_handler(Arc::clone(&context), options.timeout);
+    let timeout = options.timeout;
+    let handler = make_event_handler(Arc::clone(&context), timeout);
 
     let stream = source
         .then(move |event| {
@@ -329,7 +339,25 @@ where
             let response_key = response_key.clone();
             async move {
                 match event {
-                    Ok(value) => handler(context, value).await,
+                    Ok(value) => {
+                        match execute_event_with_timeout(
+                            handler,
+                            Arc::clone(&context),
+                            value,
+                            timeout,
+                        )
+                        .await
+                        {
+                            Ok(response) => response,
+                            Err(error) => event_error_response(
+                                error,
+                                &response_key,
+                                &field_ty,
+                                location,
+                                &context,
+                            ),
+                        }
+                    }
                     Err(error) => {
                         event_error_response(error, &response_key, &field_ty, location, &context)
                     }
@@ -339,6 +367,31 @@ where
         .boxed();
 
     Ok(SubscriptionResponse { stream })
+}
+
+/// Execute one event with a hard deadline when a Tokio runtime is available.
+///
+/// The deadline starts only after the source yields an event. Waiting for the next source event is
+/// not event execution and must not consume the subscription's lifetime. Dropping the timed-out
+/// future also drops any resolver work retained inside it.
+async fn execute_event_with_timeout(
+    handler: EventHandler,
+    context: Arc<ExecutionContext>,
+    event: Value,
+    timeout: Option<Duration>,
+) -> Result<Response, GraphQLError> {
+    let future = handler(context, event);
+    #[cfg(feature = "tokio")]
+    if let Some(timeout) = timeout.filter(|_| tokio::runtime::Handle::try_current().is_ok()) {
+        return tokio::time::timeout(timeout, future).await.map_err(|_| {
+            GraphQLError::new(format!(
+                "The subscription event timed out after {timeout:?}."
+            ))
+        });
+    }
+    #[cfg(not(feature = "tokio"))]
+    let _ = timeout;
+    Ok(future.await)
 }
 
 /// Shape a failed source event according to the root field's nullability.
@@ -364,6 +417,49 @@ fn event_error_response(
         errors: vec![error],
         extensions: super::executor::take_extensions(context),
     }
+}
+
+/// Find the selected root field's response key for schema-side setup errors.
+///
+/// Validation has already established that a subscription selects one root field. Following
+/// fragment spreads here keeps the error path correct when that field is inside a fragment.
+fn subscription_root_response_key<'source>(
+    document: &ast::Document<'source>,
+    operation: &ast::OperationDefinition<'source>,
+) -> Option<Arc<str>> {
+    fn visit<'source>(
+        selection: &ast::Selection<'source>,
+        document: &ast::Document<'source>,
+        depth: usize,
+    ) -> Option<Arc<str>> {
+        if depth > 128 {
+            return None;
+        }
+        match selection {
+            ast::Selection::Field(field) => Some(Arc::from(field.response_key())),
+            ast::Selection::FragmentSpread(spread) => {
+                let fragment = document
+                    .fragments()
+                    .find(|fragment| fragment.name == spread.name)?;
+                fragment
+                    .selection_set
+                    .items
+                    .iter()
+                    .find_map(|selection| visit(selection, document, depth + 1))
+            }
+            ast::Selection::InlineFragment(fragment) => fragment
+                .selection_set
+                .items
+                .iter()
+                .find_map(|selection| visit(selection, document, depth + 1)),
+        }
+    }
+
+    operation
+        .selection_set
+        .items
+        .iter()
+        .find_map(|selection| visit(selection, document, 0))
 }
 
 fn locate(mut error: GraphQLError, response_key: &str, location: Location) -> GraphQLError {

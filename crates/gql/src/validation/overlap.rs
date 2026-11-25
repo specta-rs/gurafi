@@ -3,7 +3,8 @@
 //! Two fields may share a response key only when they are the same field selected with the same
 //! arguments and compatible types. Fields coming from fragments are only compared when their
 //! parent types can occur together, and comparisons are memoised so fragments shared by many
-//! operations are not rechecked exponentially often.
+//! operations are not rechecked exponentially often. An aggregate comparison budget bounds the
+//! work done by both direct and recursively merged selection sets.
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
@@ -33,6 +34,17 @@ type Group<'a> = (&'a str, SmallVec<[Entry<'a>; 4]>);
 
 /// Above this many response keys a hash index beats a linear scan.
 const LINEAR_INDEX_LIMIT: usize = 16;
+
+/// Maximum number of field pairs compared during one overlap validation pass.
+///
+/// The budget is shared by top-level groups and recursive merged-field comparisons. Reserving a
+/// whole group's pairs before entering its loops prevents a single large group from monopolising
+/// the pass before the limit can be observed.
+const MAX_OVERLAP_COMPARISONS: usize = 100_000;
+
+fn unordered_pair_count(len: usize) -> usize {
+    len.saturating_mul(len.saturating_sub(1)) / 2
+}
 
 /// Group entries by response key, preserving first-seen order.
 fn group_entries<'a>(entries: Entries<'a>) -> SmallVec<[Group<'a>; 8]> {
@@ -80,9 +92,29 @@ struct State<'a, 'b> {
     /// Conflicts already reported, to avoid duplicates when the same selection set is reached
     /// through more than one fragment.
     reported: HashSet<(String, Location, Location)>,
+    /// Pairwise comparisons left in the aggregate work budget.
+    comparisons_remaining: usize,
+    /// Whether the budget error has already been emitted and pair enumeration must stop.
+    budget_exhausted: bool,
 }
 
 impl<'a> State<'a, '_> {
+    fn reserve_comparisons(&mut self, count: usize) -> bool {
+        if self.budget_exhausted {
+            return false;
+        }
+        if count > self.comparisons_remaining {
+            self.comparisons_remaining = 0;
+            self.budget_exhausted = true;
+            self.errors.push(GraphQLError::new(format!(
+                "Overlapping fields validation exceeded the comparison budget of {MAX_OVERLAP_COMPARISONS}."
+            )));
+            return false;
+        }
+        self.comparisons_remaining -= count;
+        true
+    }
+
     fn collect(
         &self,
         parent: &'a Type,
@@ -241,9 +273,16 @@ impl<'a> State<'a, '_> {
             let Some((_, right_group)) = right_groups.iter().find(|(known, _)| known == key) else {
                 continue;
             };
+            let pair_count = left_group.len().saturating_mul(right_group.len());
+            if !self.reserve_comparisons(pair_count) {
+                return;
+            }
             for left_entry in left_group {
                 for right_entry in right_group {
                     self.compare(key, left_entry, right_entry, mutually_exclusive);
+                    if self.budget_exhausted {
+                        return;
+                    }
                 }
             }
         }
@@ -267,14 +306,23 @@ impl<'a> State<'a, '_> {
     }
 
     fn check_selection_set(&mut self, parent: &'a Type, selection_set: &'a SelectionSet<'a>) {
+        if self.budget_exhausted {
+            return;
+        }
         let mut entries = Entries::new();
         self.collect(parent, selection_set, &mut Visited::new(), &mut entries);
 
         let groups = group_entries(entries);
         for (key, group) in &groups {
+            if !self.reserve_comparisons(unordered_pair_count(group.len())) {
+                return;
+            }
             for left in 0..group.len() {
                 for right in (left + 1)..group.len() {
                     self.compare(key, &group[left], &group[right], false);
+                    if self.budget_exhausted {
+                        return;
+                    }
                 }
             }
         }
@@ -367,6 +415,8 @@ pub(crate) fn check<'a>(
         errors,
         compared: HashSet::default(),
         reported: HashSet::default(),
+        comparisons_remaining: MAX_OVERLAP_COMPARISONS,
+        budget_exhausted: false,
     };
 
     for operation in document.operations() {
@@ -374,6 +424,9 @@ pub(crate) fn check<'a>(
             continue;
         };
         state.check_selection_set(root, &operation.selection_set);
+        if state.budget_exhausted {
+            return;
+        }
     }
 
     for fragment in document.fragments() {
@@ -382,6 +435,9 @@ pub(crate) fn check<'a>(
             .filter(|ty| ty.is_composite())
         {
             state.check_selection_set(condition, &fragment.selection_set);
+            if state.budget_exhausted {
+                return;
+            }
         }
     }
 }

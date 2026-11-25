@@ -257,7 +257,7 @@ impl<T> Connection<T> {
         Ok(Self {
             edges,
             page_info,
-            total_count: Some(items.len() as i32),
+            total_count: i32::try_from(items.len()).ok(),
         })
     }
 
@@ -379,7 +379,7 @@ impl<T> Connection<T> {
         Ok(Self {
             edges,
             page_info,
-            total_count: Some(items.len() as i32),
+            total_count: i32::try_from(items.len()).ok(),
         })
     }
 }

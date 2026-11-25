@@ -370,7 +370,9 @@ pub(crate) fn check_variables<'a>(
         );
 
         let mut undefined = Names::new();
+        let mut used = Names::new();
         for usage in &usages {
+            used.insert(usage.name);
             if definitions.get(usage.name).is_none() && undefined.insert(usage.name) {
                 let message = match operation.name {
                     Some(name) => format!(
@@ -384,7 +386,7 @@ pub(crate) fn check_variables<'a>(
         }
 
         for variable in definitions.iter() {
-            if !usages.iter().any(|usage| usage.name == variable.name) {
+            if !used.contains(variable.name) {
                 let message = match operation.name {
                     Some(name) => format!(
                         "Variable \"${}\" is never used in operation \"{name}\".",

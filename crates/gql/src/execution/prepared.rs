@@ -36,8 +36,9 @@ pub(crate) struct PreparedDocument<'a> {
     /// disabled, in discovery order. Empty when the document does not use `__schema` or `__type`.
     pub(crate) introspection_errors: Vec<GraphQLError>,
     /// A conservative upper bound on the selected operation's cost, depth and breadth, computed
-    /// once because the document is fixed. `None` when no bound can be proven, in which case every
-    /// request runs the exact analysis.
+    /// once because the document is fixed. `None` when either the limit bound or the
+    /// analysis-safety proof cannot be established, in which case every request runs the exact
+    /// analysis.
     pub(crate) static_complexity: Option<StaticComplexity>,
     /// The selected operation's variable definitions, compiled once. `None` when they could not be
     /// compiled, in which case the general per-request coercion path is used.
@@ -125,7 +126,7 @@ pub(crate) async fn execute_event<'a>(
         event,
         deadline,
         true,
-        true,
+        false,
     )
     .await
 }
@@ -189,7 +190,7 @@ pub(crate) fn build<'a>(
     };
 
     // The document's expansion cannot change between requests, so derive the conservative
-    // complexity bound once and store it next to the document.
+    // complexity bound and its safety proof once and store them next to the document.
     let static_complexity = match document.definitions.get(operation_index) {
         Some(ast::Definition::Operation(operation)) => {
             complexity::static_bound(schema, &document, operation)
