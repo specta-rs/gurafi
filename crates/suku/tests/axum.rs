@@ -208,6 +208,7 @@ async fn body_limit_is_enforced_before_parsing() {
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
+#[cfg(feature = "sse")]
 #[tokio::test]
 async fn subscription_requests_stream_sse() {
     let (status, headers, body) = send(
@@ -244,6 +245,6 @@ async fn unsupported_method_is_405_via_the_router() {
         headers
             .get(header::ALLOW)
             .and_then(|value| value.to_str().ok()),
-        Some("GET, POST")
+        Some("GET, HEAD, POST")
     );
 }

@@ -184,8 +184,8 @@ curl http://localhost:3000/graphql \
 ```
 
 Files may be nested in input objects (`variables.input.avatar`) or lists
-(`variables.files.0`), and a batch prefixes paths with the request index. Paths must point at an
-existing `null` inside `variables`; a file cannot be injected anywhere else. See
+(`variables.files.0`). Paths must point at an existing `null` inside `variables`; a file cannot be
+injected anywhere else. See
 [Serving over HTTP](../server/suku.md#multipart-uploads) for limits and error handling.
 
 The transport buffers each request up to `max_body_bytes` (1 MiB by default). Raise it for real

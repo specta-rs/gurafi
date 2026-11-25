@@ -130,16 +130,16 @@ present, and the resulting flags/counts.
 
 ```
 suku.request                       INFO   method, path, body_bytes, status
-├─ suku.parse                      DEBUG  body_bytes, max_batch_size
-├─ suku.process                    DEBUG  batch_size, operation, request_id
-│  ├─ suku.execute                 DEBUG  operation, prepared, document_bytes,
+├─ suku.parse                      DEBUG  body_bytes
+├─ suku.execute                    DEBUG  operation, prepared, document_bytes,
 │  │                                       variable_count, errors
 │  │  └─ gql.execute               INFO   (the gql tree above)
-│  ├─ suku.execute_batch           DEBUG  batch_size, concurrency
-│  └─ suku.subscription            DEBUG  operation, prepared
-├─ suku.serialize                  DEBUG  status, errors, body_bytes
-└─ suku.serialize_batch            DEBUG  responses, body_bytes
+├─ suku.subscription               DEBUG  operation, prepared
+└─ suku.serialize                  DEBUG  status, errors, body_bytes
 ```
+
+In-process `Server::execute_batch` calls emit `suku.execute_batch` with `batch_size` and
+`concurrency`; the HTTP endpoint does not batch.
 
 `suku.request.error` is a WARN event with `status` and `code` for transport/extractor failures
 (`REQUEST`, `CONTEXT`, `ACCEPT`, `METHOD`). `suku.subscription.event` is a TRACE event with

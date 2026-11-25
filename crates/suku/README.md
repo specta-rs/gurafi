@@ -1,42 +1,49 @@
 # suku
 
-A production GraphQL-over-HTTP server built on the [`gql`](../gql) reference implementation.
+A GraphQL over HTTP server built on the [`gql`](../gql) reference implementation, implementing the
+[GraphQL over HTTP specification](https://http-spec.graphql.org/September2026/) (September 2026
+edition).
 
-`suku` owns the HTTP side of GraphQL: request parsing, content negotiation, batches, GraphiQL,
-server-sent-event subscriptions, body limits and authentication hooks. It deliberately does not
-reimplement execution; every operation is handed to `gql`.
+`suku` owns the HTTP side of GraphQL: request parsing, `Accept` negotiation, the specification's
+status codes, GraphiQL, body limits and authentication hooks. It deliberately does not reimplement
+execution; every operation is handed to `gql`. Subscriptions (`sse`), WebSocket (`ws`) and file
+uploads (`multipart`) are opt-in extensions beyond the specification.
 
 ## Layers
 
 | Layer | Purpose |
 | --- | --- |
 | `Server` | Executes queries, mutations and subscriptions. No HTTP types. |
-| `suku::http` | Transport-agnostic `handle` function, status codes, SSE, multipart, GraphiQL. |
-| `suku::axum` | Optional (default) Axum router and authentication helper. |
-| `suku::ws` | Framework-neutral `graphql-transport-ws` connection driver. |
+| `suku::http` | Transport-agnostic `handle` function, status codes, GraphiQL, optional SSE and multipart. |
+| `suku::axum` | Axum router and authentication helper (default feature). |
+| `suku::ws` | Framework-neutral `graphql-transport-ws` connection driver (opt-in). |
 
 ## Feature flags
+
+The specification is always implemented. Everything beyond it is opt-in.
 
 | Feature | Default | Purpose |
 | --- | --- | --- |
 | `axum` | yes | Axum router and `ExtractContext` integration. |
-| `ws` | yes | `graphql-transport-ws` WebSocket subscriptions; implies `axum`. |
-| `multipart` | yes | GraphQL multipart requests (file uploads); uses `multer`. |
+| `sse` | no | Server-sent-event subscriptions (`text/event-stream`). A transport extension. |
+| `ws` | no | `graphql-transport-ws` WebSocket subscriptions; implies `axum`. |
+| `multipart` | no | GraphQL multipart requests (file uploads); uses `multer`. |
 | `tracing` | no | Request spans, and `gql/tracing`. |
 
-Turn off a default feature with `default-features = false`:
-
 ```toml
-# Axum with SSE subscriptions and uploads, but no WebSocket endpoint.
-suku = { version = "0.1.2", default-features = false, features = ["axum", "multipart"] }
+# The specification's HTTP endpoint.
+suku = { version = "0.1.2" }
 
-# Axum and WebSockets, but no multipart parser.
-suku = { version = "0.1.2", default-features = false, features = ["axum", "ws"] }
+# Add server-sent-event subscriptions.
+suku = { version = "0.1.2", features = ["sse"] }
+
+# Add uploads and WebSocket subscriptions.
+suku = { version = "0.1.2", features = ["multipart", "ws"] }
 ```
 
 At runtime, `GraphQL::websocket(false)` disables upgrades on one mount without rebuilding. With
 the `ws` feature off, or the switch off, an upgrade request is handled like any other `GET`
-(usually GraphiQL or a `400`), never as a socket.
+(usually GraphiQL or a `422` request error), never as a socket.
 
 ## Mounting on Axum
 
@@ -130,7 +137,7 @@ let app = GraphQL::new(server)
 
 ## Multipart uploads
 
-With the `multipart` feature (default), `POST multipart/form-data` follows the
+With the `multipart` feature, `POST multipart/form-data` follows the
 [GraphQL multipart request specification](https://github.com/jaydenseric/graphql-multipart-request-spec).
 The fields must appear in order: `operations`, `map`, then one file part per map entry.
 
@@ -141,11 +148,10 @@ curl http://localhost:3000/graphql \
   -F 0=@a.txt
 ```
 
-For a batch, `operations` is an array and every path is prefixed with the request index, for
-example `0.variables.file` and `1.variables.files.0`. One file may be mapped to several paths; the
-bytes are shared, not copied. Every mapped destination must already exist in `variables` and be
-`null`, which is what prevents arbitrary JSON writes. Only paths rooted at `variables` are
-accepted.
+`operations` is a single request object; batching is not part of the specification and is not
+supported. One file may be mapped to several paths; the bytes are shared, not copied. Every mapped
+destination must already exist in `variables` and be `null`, which is what prevents arbitrary JSON
+writes. Only paths rooted at `variables` are accepted.
 
 Files become `gql::Upload` values (re-exported as `suku::Upload`) inserted as
 `gql::Value::External`. Execution stays transport-free; a custom scalar owns the bytes. In raw
@@ -251,7 +257,6 @@ let server = suku::Server::new(schema)
     .max_body_bytes(512 * 1024)
     .timeout(Duration::from_secs(10))
     .max_concurrency(16)
-    .max_batch_size(10)
     .batch_concurrency(8);
 # let _ = server;
 # }
@@ -298,8 +303,8 @@ The context never exposes the schema, resolver value, user context or other serv
 `format_error_with(Arc<dyn ErrorFormatter>)` is available when the formatter is a named type or
 shared with other endpoints.
 
-Formatting is applied to single operations, every response in a batch (in request order),
-persisted operations, subscription setup errors and every subscription event. It also covers
+Formatting is applied to single operations, every response from `execute_batch` (in request
+order), persisted operations, subscription setup errors and every subscription event. It also covers
 request errors raised by the HTTP layer, including malformed JSON, multipart fields, missing
 queries, extractor denials and content-negotiation/method rejections, and WebSocket `error`
 messages and `next` payloads. Transport-level body-read failures in the Axum adapter are formatted
@@ -380,21 +385,16 @@ let server = Server::new(schema).prepared_queries(prepared);
 # }
 ```
 
-A request can then send only an identifier, in any of these shapes:
+A request can then send only an identifier. The specification reserves `extensions` for
+implementer-defined data, so the identifier lives there:
 
 ```json
-{ "id": "hello" }
-{ "doc_id": "hello" }
-{ "documentId": "hello" }
-{ "queryId": "hello" }
+{ "extensions": { "persistedQuery": { "id": "hello" } } }
 { "extensions": { "persistedQuery": { "version": 1, "sha256Hash": "hello" } } }
 ```
 
-`id`, `doc_id`, `documentId` and `queryId` are also accepted in `extensions`, and
-`extensions.persistedQuery` accepts `sha256Hash`, `hash`, `id`, `queryId` or `documentId`.
-Identifiers and hashes are opaque keys: a `sha256Hash` entry is not hash-verified. The
-`X-Persisted-Query-Id` and `X-Query-Id` headers are a fallback used only when the request carries
-no identifier in the body or extensions; for a batch they fill in every item without one. GET
+`id` is this crate's shape; `sha256Hash` is Apollo's automatic persisted query spelling. Both are
+opaque keys: a `sha256Hash` entry is not hash-verified. There is no custom header fallback. GET
 requests may omit `query` when they send an identifier, including an `extensions.persistedQuery`
 hash in the query string.
 
@@ -414,9 +414,8 @@ let server = suku::Server::new(schema).require_prepared(true);
 ```
 
 In allowlist mode a missing or unknown identifier returns a GraphQL error with message
-`PersistedQueryNotFound` and `extensions.code = "PERSISTED_QUERY_NOT_FOUND"`. With
-`Accept: application/graphql-response+json` that request error uses HTTP 400, matching the
-transport's normal request-error handling; legacy `application/json` keeps HTTP 200.
+`PersistedQueryNotFound` and `extensions.code = "PERSISTED_QUERY_NOT_FOUND"`. An unresolved
+identifier is a request error and uses HTTP `422 Unprocessable Content`.
 
 Prepared subscriptions are supported: setup reuses the parsed document and each source event reuses
 it too, so a persisted subscription does not re-parse per event.
@@ -458,31 +457,39 @@ the unmodified MIT-licensed upstream production builds; their licenses are next 
 
 ## Transport behaviour
 
-| Request | Result |
+| Request / result | Response |
 | --- | --- |
-| `POST application/json` (single object) | 200 with a GraphQL response |
-| `POST application/json` (array) | 200 with an array of responses, executed with bounded concurrency |
-| `GET` with `query`, `variables`, `operationName`, `extensions` | 200 with a GraphQL response |
-| `GET` + `Accept: text/html` | GraphiQL (after authentication) |
-| `GET` + mutation/subscription | 405; GET is query-only |
-| `Accept: application/graphql-response+json` | Request errors use 400; `application/json` keeps 200 |
-| `Accept: text/event-stream` + subscription | SSE: `event: next`, `data: …`, then `event: complete` |
-| `GET` + `Upgrade: websocket` | `graphql-transport-ws`; queries, mutations and subscriptions over one socket |
-| `POST multipart/form-data` | GraphQL multipart request; files become `suku::Upload` values |
-| Unsupported method | 405 with `Allow: GET, POST` |
-| Missing/unsupported `Content-Type` | 415 |
-| No acceptable `Accept` | 406 |
-| Body over the limit | 413 |
-| Malformed JSON, multipart fields or batch | 400 with `{"errors":[…]}` |
+| `POST application/json` with a request object | `2xx` with a GraphQL response |
+| `POST application/json` with an array | `422`; batching is not specified |
+| `GET` with `query`, `variables`, `operationName`, `extensions` | `2xx` with a GraphQL response |
+| `GET`/`HEAD` + `Accept: text/html` | GraphiQL (after authentication) |
+| `GET` + mutation or subscription | `405` with `Allow: POST` |
+| `data` + no `errors` | `200 OK` |
+| `data` + `errors` | `294 Partial Success` |
+| Parse failure / validation, coercion or operation-selection failure | `400` / `422` |
+| Unresolved persisted identifier | `422` |
+| `Accept: text/event-stream` + subscription (`sse`) | SSE: `event: next`, `data: …`, then `event: complete` |
+| `GET` + `Upgrade: websocket` (`ws`) | `graphql-transport-ws`; queries, mutations and subscriptions over one socket |
+| `POST multipart/form-data` (`multipart`) | GraphQL multipart request; files become `suku::Upload` values |
+| Unsupported method | `405` with `Allow: GET, HEAD, POST` |
+| Missing/unsupported `Content-Type` | `415` |
+| No acceptable `Accept` | `406` |
+| Body over the limit / URI too long | `413` / `414` |
+| Malformed JSON | `400` with `{"errors":[…]}` |
+
+A request that accepts only `application/json` receives `Content-Type: application/json` on `2xx`
+responses, while non-`2xx` responses keep `application/graphql-response+json`, as the
+specification recommends.
 
 The `Authorization` header is never read by the transport. Authentication is always an
 `ExtractContext` closure that receives a cloneable `ContextRequest` with the request method, URI,
 headers, cookies and HTTP extensions.
 
-## Empty batches and limits
+## Limits
 
-Batches must be non-empty. `Server::max_batch_size` (or `HttpConfig::max_batch_size`) rejects
-oversized arrays, and `Server::batch_concurrency` bounds how many operations run at once.
+The HTTP endpoint accepts one operation per request. `max_body_bytes` bounds the `POST` body and
+the `GET` query string; oversized requests use `413` and `414` respectively. `Server::execute_batch`
+remains available for in-process callers and bounds concurrency with `batch_concurrency`.
 
 ## Observability
 
@@ -494,8 +501,7 @@ followed by the parser/executor tree:
 suku = { version = "0.1.2", features = ["tracing"] }
 ```
 
-`suku.request` is INFO and records method, path, body size, operation, request id, batch size and
-status. Its children cover parsing, execution, serialization and subscriptions. Transport and
+`suku.request` is INFO and records method, path, body size, request id and status. Its children cover parsing, execution, serialization and subscriptions. Transport and
 extractor failures are WARN events with a status and code. Bodies, headers, tokens and variable
 values are never recorded. See [`docs/plugins/tracing.md`](../../docs/plugins/tracing.md) for the span
 tree and the recommended `tracing-subscriber` setup.

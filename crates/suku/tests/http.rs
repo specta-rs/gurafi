@@ -1,11 +1,11 @@
 //! GraphQL-over-HTTP transport tests.
 //!
-//! These call `suku::http::handle` directly; no socket is involved.
+//! These call `suku::http::handle` directly; no socket is involved. The expected status codes
+//! follow the GraphQL over HTTP specification (September 2026).
 
 mod support;
 
 use ::http::{Method, StatusCode, header};
-use futures::StreamExt as _;
 use serde_json::json;
 use suku::{
     Context, HttpConfig, HttpError, HttpResponse, HttpResult, Server,
@@ -36,6 +36,32 @@ fn content_type(response: &HttpResponse) -> &str {
         .unwrap_or_default()
 }
 
+fn allow(response: &HttpResponse) -> Option<&str> {
+    response
+        .headers
+        .get(header::ALLOW)
+        .and_then(|value| value.to_str().ok())
+}
+
+fn post(content_type: &'static str, accept: &'static str) -> ::http::request::Parts {
+    support::parts(
+        Method::POST,
+        "/graphql",
+        &[
+            (header::CONTENT_TYPE, content_type),
+            (header::ACCEPT, accept),
+        ],
+    )
+}
+
+fn get(query: &str, accept: &'static str) -> ::http::request::Parts {
+    support::parts(
+        Method::GET,
+        &format!("/graphql?{query}"),
+        &[(header::ACCEPT, accept)],
+    )
+}
+
 #[tokio::test]
 async fn get_with_html_accept_returns_graphiql() {
     let server = support::server();
@@ -59,7 +85,22 @@ async fn graphiql_can_be_disabled() {
     let parts = support::parts(Method::GET, "/graphql", &[(header::ACCEPT, "text/html")]);
 
     let response = buffered(run_default(&server, &config, &parts, b"").await);
-    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    assert_eq!(response.status, StatusCode::NOT_ACCEPTABLE);
+}
+
+#[tokio::test]
+async fn json_is_preferred_over_graphiql_when_a_client_lists_both() {
+    let server = support::server();
+    let config = HttpConfig::default();
+    let query = serde_urlencoded::to_string([("query", "{ hello }")]).expect("query string");
+    let parts = get(
+        &query,
+        "text/html, application/graphql-response+json, application/json",
+    );
+
+    let response = buffered(run_default(&server, &config, &parts, b"").await);
+    assert_eq!(response.status, StatusCode::OK);
+    assert!(content_type(&response).starts_with("application/graphql-response+json"));
 }
 
 #[tokio::test]
@@ -67,14 +108,24 @@ async fn get_executes_a_query_from_query_parameters() {
     let server = support::server();
     let config = HttpConfig::default();
     let query = serde_urlencoded::to_string([("query", "{ hello }")]).expect("query string");
-    let uri = format!("/graphql?{query}");
-    let parts = support::parts(Method::GET, &uri, &[(header::ACCEPT, "application/json")]);
+    let parts = get(&query, "application/graphql-response+json");
 
     let response = buffered(run_default(&server, &config, &parts, b"").await);
     assert_eq!(response.status, StatusCode::OK);
-    assert!(content_type(&response).starts_with("application/json"));
-    let body = support::json_body(&response.body);
-    assert_eq!(body["data"]["hello"], "world");
+    assert!(content_type(&response).starts_with("application/graphql-response+json"));
+    assert_eq!(support::json_body(&response.body)["data"]["hello"], "world");
+}
+
+#[tokio::test]
+async fn a_missing_accept_header_uses_the_specification_media_type() {
+    let server = support::server();
+    let config = HttpConfig::default();
+    let query = serde_urlencoded::to_string([("query", "{ hello }")]).expect("query string");
+    let parts = support::parts(Method::GET, &format!("/graphql?{query}"), &[]);
+
+    let response = buffered(run_default(&server, &config, &parts, b"").await);
+    assert_eq!(response.status, StatusCode::OK);
+    assert!(content_type(&response).starts_with("application/graphql-response+json"));
 }
 
 #[tokio::test]
@@ -89,11 +140,7 @@ async fn get_parses_variables() {
         ("variables", r#"{"message":"from get"}"#),
     ])
     .expect("query string");
-    let parts = support::parts(
-        Method::GET,
-        &format!("/graphql?{query}"),
-        &[(header::ACCEPT, "application/json")],
-    );
+    let parts = get(&query, "application/graphql-response+json");
 
     let response = buffered(run_default(&server, &config, &parts, b"").await);
     assert_eq!(response.status, StatusCode::OK);
@@ -115,11 +162,7 @@ async fn get_rejects_invalid_variables_json() {
         ("variables", "{not json"),
     ])
     .expect("query string");
-    let parts = support::parts(
-        Method::GET,
-        &format!("/graphql?{query}"),
-        &[(header::ACCEPT, "application/json")],
-    );
+    let parts = get(&query, "application/graphql-response+json");
 
     let response = buffered(run_default(&server, &config, &parts, b"").await);
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
@@ -127,73 +170,102 @@ async fn get_rejects_invalid_variables_json() {
 }
 
 #[tokio::test]
-async fn post_executes_a_json_request() {
+async fn get_rejects_variables_that_are_not_an_object() {
     let server = support::server();
     let config = HttpConfig::default();
-    let body = br#"{"query":"{ hello }"}"#;
-    let parts = support::parts(
-        Method::POST,
-        "/graphql",
-        &[
-            (header::CONTENT_TYPE, "application/json"),
-            (header::ACCEPT, "application/json"),
-        ],
-    );
+    let query = serde_urlencoded::to_string([("query", "{ hello }"), ("variables", "[1,2,3]")])
+        .expect("query string");
+    let parts = get(&query, "application/graphql-response+json");
 
-    let response = buffered(run_default(&server, &config, &parts, body).await);
-    assert_eq!(response.status, StatusCode::OK);
-    assert!(content_type(&response).starts_with("application/json"));
-    assert_eq!(support::json_body(&response.body)["data"]["hello"], "world");
+    let response = buffered(run_default(&server, &config, &parts, b"").await);
+    assert_eq!(response.status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]
-async fn post_executes_a_batch_in_order() {
+async fn get_without_a_query_is_422() {
     let server = support::server();
     let config = HttpConfig::default();
-    let body = br#"[{"query":"{ hello }"},{"query":"{ echo(message: \"two\") }"}]"#;
-    let parts = support::parts(
-        Method::POST,
-        "/graphql",
-        &[(header::CONTENT_TYPE, "application/json")],
-    );
+    let parts = get("", "application/graphql-response+json");
 
-    let response = buffered(run_default(&server, &config, &parts, body).await);
-    assert_eq!(response.status, StatusCode::OK);
-    let body = support::json_body(&response.body);
-    let batch = body.as_array().expect("batch array");
-    assert_eq!(batch.len(), 2);
-    assert_eq!(batch[0]["data"]["hello"], "world");
-    assert_eq!(batch[1]["data"]["echo"], "two");
-}
-
-#[tokio::test]
-async fn rejects_empty_batches() {
-    let server = support::server();
-    let config = HttpConfig::default();
-    let parts = support::parts(
-        Method::POST,
-        "/graphql",
-        &[(header::CONTENT_TYPE, "application/json")],
-    );
-
-    let response = buffered(run_default(&server, &config, &parts, b"[]").await);
-    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    let response = buffered(run_default(&server, &config, &parts, b"").await);
+    assert_eq!(response.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(support::json_body(&response.body)["errors"].is_array());
 }
 
 #[tokio::test]
-async fn rejects_batches_over_the_limit() {
-    let server = support::server().max_batch_size(1);
+async fn get_rejects_mutations_with_405_and_allow_post() {
+    let server = support::server();
     let config = HttpConfig::default();
-    let body = br#"[{"query":"{ hello }"},{"query":"{ hello }"}]"#;
-    let parts = support::parts(
-        Method::POST,
-        "/graphql",
-        &[(header::CONTENT_TYPE, "application/json")],
+    let query = serde_urlencoded::to_string([("query", "mutation { hello }")]).expect("query");
+    let parts = get(&query, "application/graphql-response+json");
+
+    let response = buffered(run_default(&server, &config, &parts, b"").await);
+    assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(allow(&response), Some("POST"));
+}
+
+#[tokio::test]
+async fn get_rejects_subscriptions_with_405_and_allow_post() {
+    let server = support::server();
+    let config = HttpConfig::default();
+    let query =
+        serde_urlencoded::to_string([("query", "subscription { countdown }")]).expect("query");
+    let parts = get(&query, "text/event-stream");
+
+    let response = buffered(run_default(&server, &config, &parts, b"").await);
+    assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(allow(&response), Some("POST"));
+}
+
+#[tokio::test]
+async fn post_executes_a_json_request() {
+    let server = support::server();
+    let config = HttpConfig::default();
+    let parts = post("application/json", "application/graphql-response+json");
+
+    let response =
+        buffered(run_default(&server, &config, &parts, br#"{"query":"{ hello }"}"#).await);
+    assert_eq!(response.status, StatusCode::OK);
+    assert!(content_type(&response).starts_with("application/graphql-response+json"));
+    assert_eq!(support::json_body(&response.body)["data"]["hello"], "world");
+}
+
+#[tokio::test]
+async fn post_accepts_a_utf8_charset_parameter() {
+    let server = support::server();
+    let config = HttpConfig::default();
+    let parts = post(
+        "application/json; charset=UTF-8",
+        "application/graphql-response+json",
     );
 
+    let response =
+        buffered(run_default(&server, &config, &parts, br#"{"query":"{ hello }"}"#).await);
+    assert_eq!(response.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn post_rejects_a_non_utf8_charset_with_415() {
+    let server = support::server();
+    let config = HttpConfig::default();
+    let parts = post(
+        "application/json; charset=utf-16",
+        "application/graphql-response+json",
+    );
+
+    let response = buffered(run_default(&server, &config, &parts, b"{}").await);
+    assert_eq!(response.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
+async fn post_rejects_json_arrays_beacuse_batching_is_not_specified() {
+    let server = support::server();
+    let config = HttpConfig::default();
+    let parts = post("application/json", "application/graphql-response+json");
+    let body = br#"[{"query":"{ hello }"},{"query":"{ hello }"}]"#;
+
     let response = buffered(run_default(&server, &config, &parts, body).await);
-    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    assert_eq!(response.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(support::json_body(&response.body)["errors"].is_array());
 }
 
@@ -201,14 +273,7 @@ async fn rejects_batches_over_the_limit() {
 async fn malformed_json_is_a_400_with_a_graphql_shaped_body() {
     let server = support::server();
     let config = HttpConfig::default();
-    let parts = support::parts(
-        Method::POST,
-        "/graphql",
-        &[
-            (header::CONTENT_TYPE, "application/json"),
-            (header::ACCEPT, "application/json"),
-        ],
-    );
+    let parts = post("application/json", "application/graphql-response+json");
 
     let response = buffered(run_default(&server, &config, &parts, b"{").await);
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
@@ -216,125 +281,168 @@ async fn malformed_json_is_a_400_with_a_graphql_shaped_body() {
 }
 
 #[tokio::test]
-async fn graphql_response_json_uses_200_for_success() {
+async fn a_wrongly_shaped_request_is_422() {
     let server = support::server();
     let config = HttpConfig::default();
-    let parts = support::parts(
-        Method::POST,
-        "/graphql",
-        &[
-            (header::CONTENT_TYPE, "application/json"),
-            (header::ACCEPT, "application/graphql-response+json"),
-        ],
-    );
+    let parts = post("application/json", "application/graphql-response+json");
+    let body = br#"{"query":"{ hello }","variables":[7]}"#;
 
-    let response =
-        buffered(run_default(&server, &config, &parts, br#"{"query":"{ hello }"}"#).await);
+    let response = buffered(run_default(&server, &config, &parts, body).await);
+    assert_eq!(response.status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn unknown_request_members_are_ignored() {
+    let server = support::server();
+    let config = HttpConfig::default();
+    let parts = post("application/json", "application/graphql-response+json");
+    let body = br#"{"query":"{ hello }","somethingNew":{"nested":true}}"#;
+
+    let response = buffered(run_default(&server, &config, &parts, body).await);
     assert_eq!(response.status, StatusCode::OK);
-    assert!(content_type(&response).starts_with("application/graphql-response+json"));
     assert_eq!(support::json_body(&response.body)["data"]["hello"], "world");
 }
 
 #[tokio::test]
-async fn graphql_response_json_uses_200_for_execution_errors() {
+async fn a_document_that_cannot_be_parsed_is_400() {
     let server = support::server();
     let config = HttpConfig::default();
-    let parts = support::parts(
-        Method::POST,
-        "/graphql",
-        &[
-            (header::CONTENT_TYPE, "application/json"),
-            (header::ACCEPT, "application/graphql-response+json"),
-        ],
-    );
+    let parts = post("application/json", "application/graphql-response+json");
 
-    let response =
-        buffered(run_default(&server, &config, &parts, br#"{"query":"{ boom }"}"#).await);
-    assert_eq!(response.status, StatusCode::OK);
-    assert!(support::json_body(&response.body)["errors"].is_array());
-}
-
-#[tokio::test]
-async fn the_server_body_limit_is_used_when_the_mount_does_not_override_it() {
-    let server = support::server().max_body_bytes(8);
-    let config = HttpConfig::default();
-    let parts = support::parts(
-        Method::POST,
-        "/graphql",
-        &[(header::CONTENT_TYPE, "application/json")],
-    );
-
-    let response =
-        buffered(run_default(&server, &config, &parts, br#"{"query":"{ hello }"}"#).await);
-    assert_eq!(response.status, StatusCode::PAYLOAD_TOO_LARGE);
-}
-
-#[tokio::test]
-async fn graphql_response_json_uses_400_for_request_errors() {
-    let server = support::server();
-    let config = HttpConfig::default();
-    let body = br#"{"query":"{"}"#;
-    let parts = support::parts(
-        Method::POST,
-        "/graphql",
-        &[
-            (header::CONTENT_TYPE, "application/json"),
-            (header::ACCEPT, "application/graphql-response+json"),
-        ],
-    );
-
-    let response = buffered(run_default(&server, &config, &parts, body).await);
+    let response = buffered(run_default(&server, &config, &parts, br#"{"query":"{"}"#).await);
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
     assert!(content_type(&response).starts_with("application/graphql-response+json"));
 }
 
 #[tokio::test]
-async fn legacy_json_uses_200_for_request_errors() {
+async fn a_document_that_fails_validation_is_422() {
     let server = support::server();
     let config = HttpConfig::default();
-    let body = br#"{"query":"{"}"#;
-    let parts = support::parts(
-        Method::POST,
-        "/graphql",
-        &[
-            (header::CONTENT_TYPE, "application/json"),
-            (header::ACCEPT, "application/json"),
-        ],
-    );
+    let parts = post("application/json", "application/graphql-response+json");
+    let body = br#"{"query":"{ unknownField }"}"#;
 
     let response = buffered(run_default(&server, &config, &parts, body).await);
-    assert_eq!(response.status, StatusCode::OK);
-    assert!(support::json_body(&response.body)["errors"].is_array());
+    assert_eq!(response.status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]
-async fn unsupported_method_is_405() {
+async fn an_operation_that_cannot_be_selected_is_422() {
+    let server = support::server();
+    let config = HttpConfig::default();
+    let parts = post("application/json", "application/graphql-response+json");
+    let body = br#"{"query":"query A { hello } query B { hello }"}"#;
+
+    let response = buffered(run_default(&server, &config, &parts, body).await);
+    assert_eq!(response.status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn variable_coercion_failure_is_422() {
+    let server = support::server();
+    let config = HttpConfig::default();
+    let parts = post("application/json", "application/graphql-response+json");
+    let body =
+        br#"{"query":"query($message: String!) { echo(message: $message) }","variables":{}}"#;
+
+    let response = buffered(run_default(&server, &config, &parts, body).await);
+    assert_eq!(response.status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn a_field_error_with_data_is_294_partial_success() {
+    let server = support::server();
+    let config = HttpConfig::default();
+    let parts = post("application/json", "application/graphql-response+json");
+
+    let response =
+        buffered(run_default(&server, &config, &parts, br#"{"query":"{ boom }"}"#).await);
+    assert_eq!(response.status.as_u16(), 294);
+    let body = support::json_body(&response.body);
+    assert!(body["data"].is_object() || body["data"].is_null());
+    assert!(body["errors"].is_array());
+}
+
+#[tokio::test]
+async fn legacy_json_uses_application_json_for_successes() {
+    let server = support::server();
+    let config = HttpConfig::default();
+    let parts = post("application/json", "application/json");
+
+    let response =
+        buffered(run_default(&server, &config, &parts, br#"{"query":"{ hello }"}"#).await);
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(content_type(&response), "application/json; charset=utf-8");
+}
+
+#[tokio::test]
+async fn legacy_json_still_uses_specification_status_codes_and_media_type_for_errors() {
+    let server = support::server();
+    let config = HttpConfig::default();
+    let parts = post("application/json", "application/json");
+
+    let response = buffered(run_default(&server, &config, &parts, br#"{"query":"{"}"#).await);
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    assert!(content_type(&response).starts_with("application/graphql-response+json"));
+}
+
+#[tokio::test]
+async fn legacy_json_uses_application_json_for_294() {
+    let server = support::server();
+    let config = HttpConfig::default();
+    let parts = post("application/json", "application/json");
+
+    let response =
+        buffered(run_default(&server, &config, &parts, br#"{"query":"{ boom }"}"#).await);
+    assert_eq!(response.status.as_u16(), 294);
+    assert_eq!(content_type(&response), "application/json; charset=utf-8");
+}
+
+#[tokio::test]
+async fn unsupported_method_is_405_with_allow() {
     let server = support::server();
     let config = HttpConfig::default();
     let parts = support::parts(Method::PUT, "/graphql", &[]);
 
     let response = buffered(run_default(&server, &config, &parts, b"").await);
     assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED);
-    assert_eq!(
-        response
-            .headers
-            .get(header::ALLOW)
-            .and_then(|value| value.to_str().ok()),
-        Some("GET, POST")
+    assert_eq!(allow(&response), Some("GET, HEAD, POST"));
+}
+
+#[tokio::test]
+async fn head_runs_a_query_and_strips_the_body() {
+    let server = support::server();
+    let config = HttpConfig::default();
+    let query = serde_urlencoded::to_string([("query", "{ hello }")]).expect("query string");
+    let parts = support::parts(
+        Method::HEAD,
+        &format!("/graphql?{query}"),
+        &[(header::ACCEPT, "application/graphql-response+json")],
     );
+
+    let response = buffered(run_default(&server, &config, &parts, b"").await);
+    assert_eq!(response.status, StatusCode::OK);
+    assert!(response.body.is_empty());
+    assert!(content_type(&response).starts_with("application/graphql-response+json"));
 }
 
 #[tokio::test]
 async fn unsupported_content_type_is_415() {
     let server = support::server();
     let config = HttpConfig::default();
-    let parts = support::parts(
-        Method::POST,
-        "/graphql",
-        &[(header::CONTENT_TYPE, "text/plain")],
-    );
+    let parts = post("text/plain", "application/graphql-response+json");
 
     let response = buffered(run_default(&server, &config, &parts, b"{ hello }").await);
+    assert_eq!(response.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
+async fn the_response_media_type_is_not_accepted_as_a_request_type() {
+    let server = support::server();
+    let config = HttpConfig::default();
+    let parts = post("application/graphql-response+json", "application/json");
+
+    let response =
+        buffered(run_default(&server, &config, &parts, br#"{"query":"{ hello }"}"#).await);
     assert_eq!(response.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
 }
 
@@ -352,14 +460,7 @@ async fn missing_content_type_is_415() {
 async fn unacceptable_accept_is_406() {
     let server = support::server();
     let config = HttpConfig::default();
-    let parts = support::parts(
-        Method::POST,
-        "/graphql",
-        &[
-            (header::CONTENT_TYPE, "application/json"),
-            (header::ACCEPT, "text/plain"),
-        ],
-    );
+    let parts = post("application/json", "text/plain");
 
     let response =
         buffered(run_default(&server, &config, &parts, br#"{"query":"{ hello }"}"#).await);
@@ -370,11 +471,7 @@ async fn unacceptable_accept_is_406() {
 async fn body_limit_is_413() {
     let server = support::server();
     let config = HttpConfig::default().max_body_bytes(8);
-    let parts = support::parts(
-        Method::POST,
-        "/graphql",
-        &[(header::CONTENT_TYPE, "application/json")],
-    );
+    let parts = post("application/json", "application/graphql-response+json");
 
     let response =
         buffered(run_default(&server, &config, &parts, br#"{"query":"{ hello }"}"#).await);
@@ -382,14 +479,21 @@ async fn body_limit_is_413() {
 }
 
 #[tokio::test]
+async fn an_oversized_uri_is_414() {
+    let server = support::server();
+    let config = HttpConfig::default().max_body_bytes(8);
+    let query = serde_urlencoded::to_string([("query", "{ hello }")]).expect("query string");
+    let parts = get(&query, "application/graphql-response+json");
+
+    let response = buffered(run_default(&server, &config, &parts, b"").await);
+    assert_eq!(response.status, StatusCode::URI_TOO_LONG);
+}
+
+#[tokio::test]
 async fn denied_context_is_a_401_before_execution() {
     let server = support::server();
     let config = HttpConfig::default();
-    let parts = support::parts(
-        Method::POST,
-        "/graphql",
-        &[(header::CONTENT_TYPE, "application/json")],
-    );
+    let parts = post("application/json", "application/graphql-response+json");
 
     let result = handle(
         &server,
@@ -479,17 +583,37 @@ async fn cookies_are_visible_to_the_extractor() {
 }
 
 #[tokio::test]
-async fn subscriptions_stream_as_server_sent_events() {
+async fn a_subscription_without_event_stream_is_422_when_json_is_acceptable() {
     let server = support::server();
     let config = HttpConfig::default();
-    let parts = support::parts(
-        Method::POST,
-        "/graphql",
-        &[
-            (header::CONTENT_TYPE, "application/json"),
-            (header::ACCEPT, "text/event-stream"),
-        ],
+    let parts = post("application/json", "application/graphql-response+json");
+
+    let response = buffered(
+        run_default(
+            &server,
+            &config,
+            &parts,
+            br#"{"query":"subscription { countdown }"}"#,
+        )
+        .await,
     );
+    assert_eq!(response.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        support::json_body(&response.body)["errors"][0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Subscriptions")
+    );
+}
+
+#[cfg(feature = "sse")]
+#[tokio::test]
+async fn subscriptions_stream_as_server_sent_events() {
+    use futures::StreamExt as _;
+
+    let server = support::server();
+    let config = HttpConfig::default();
+    let parts = post("application/json", "text/event-stream");
 
     let result = handle(
         &server,
@@ -516,18 +640,25 @@ async fn subscriptions_stream_as_server_sent_events() {
     assert!(body.contains("\"countdown\":3"));
 }
 
+#[cfg(feature = "sse")]
 #[tokio::test]
-async fn subscriptions_without_event_stream_get_a_clear_error() {
+async fn malformed_subscriptions_return_json_before_streaming() {
     let server = support::server();
     let config = HttpConfig::default();
-    let parts = support::parts(
-        Method::POST,
-        "/graphql",
-        &[
-            (header::CONTENT_TYPE, "application/json"),
-            (header::ACCEPT, "application/json"),
-        ],
-    );
+    let parts = post("application/json", "text/event-stream");
+
+    let response =
+        buffered(run_default(&server, &config, &parts, br#"{"query":"subscription {"}"#).await);
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    assert!(support::json_body(&response.body)["errors"][0]["message"].is_string());
+}
+
+#[cfg(not(feature = "sse"))]
+#[tokio::test]
+async fn event_stream_only_is_406_without_the_sse_feature() {
+    let server = support::server();
+    let config = HttpConfig::default();
+    let parts = post("application/json", "text/event-stream");
 
     let response = buffered(
         run_default(
@@ -538,46 +669,14 @@ async fn subscriptions_without_event_stream_get_a_clear_error() {
         )
         .await,
     );
-    assert_eq!(response.status, StatusCode::OK);
-    assert!(
-        support::json_body(&response.body)["errors"][0]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("text/event-stream")
-    );
-}
-
-#[tokio::test]
-async fn malformed_subscriptions_return_json_before_streaming() {
-    let server = support::server();
-    let config = HttpConfig::default();
-    let parts = support::parts(
-        Method::POST,
-        "/graphql",
-        &[
-            (header::CONTENT_TYPE, "application/json"),
-            (header::ACCEPT, "text/event-stream"),
-        ],
-    );
-
-    let response =
-        buffered(run_default(&server, &config, &parts, br#"{"query":"subscription {"}"#).await);
-    assert_eq!(response.status, StatusCode::BAD_REQUEST);
-    assert!(support::json_body(&response.body)["errors"][0]["message"].is_string());
+    assert_eq!(response.status, StatusCode::NOT_ACCEPTABLE);
 }
 
 #[tokio::test]
 async fn event_stream_is_rejected_for_non_subscriptions() {
     let server = support::server();
     let config = HttpConfig::default();
-    let parts = support::parts(
-        Method::POST,
-        "/graphql",
-        &[
-            (header::CONTENT_TYPE, "application/json"),
-            (header::ACCEPT, "text/event-stream"),
-        ],
-    );
+    let parts = post("application/json", "text/event-stream");
 
     let response =
         buffered(run_default(&server, &config, &parts, br#"{"query":"{ hello }"}"#).await);
@@ -588,11 +687,7 @@ async fn event_stream_is_rejected_for_non_subscriptions() {
 async fn response_includes_vary_and_no_store() {
     let server = support::server();
     let config = HttpConfig::default();
-    let parts = support::parts(
-        Method::POST,
-        "/graphql",
-        &[(header::CONTENT_TYPE, "application/json")],
-    );
+    let parts = post("application/json", "application/graphql-response+json");
 
     let response =
         buffered(run_default(&server, &config, &parts, br#"{"query":"{ hello }"}"#).await);
@@ -616,14 +711,10 @@ async fn response_includes_vary_and_no_store() {
 async fn request_extensions_are_accepted() {
     let server = support::server();
     let config = HttpConfig::default();
-    let parts = support::parts(
-        Method::POST,
-        "/graphql",
-        &[(header::CONTENT_TYPE, "application/json")],
-    );
+    let parts = post("application/json", "application/graphql-response+json");
     let body = json!({
         "query": "{ hello }",
-        "extensions": { "persistedQuery": { "version": 1, "sha256Hash": "abc" } }
+        "extensions": { "trace": true }
     });
 
     let response =

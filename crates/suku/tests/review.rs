@@ -40,7 +40,8 @@ fn no_timeout_outside_a_tokio_runtime() {
     assert!(response.data.is_some());
 }
 
-/// GET query strings are bounded by the same body-size setting as POST.
+/// GET query strings are bounded by the same body-size setting as POST, but use `414 URI Too
+/// Long`.
 #[tokio::test]
 async fn get_query_string_obeys_max_body_bytes() {
     use suku::{HttpConfig, HttpResult, http::handle};
@@ -66,7 +67,7 @@ async fn get_query_string_obeys_max_body_bytes() {
     let HttpResult::Response(response) = result else {
         panic!("expected a buffered response");
     };
-    assert_eq!(response.status, ::http::StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(response.status, ::http::StatusCode::URI_TOO_LONG);
 }
 
 /// The default server limits still allow the standard GraphiQL introspection query.

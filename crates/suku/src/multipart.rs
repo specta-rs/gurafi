@@ -27,7 +27,7 @@ use gql::Upload;
 use multer::Multipart;
 use serde_json::Value as JsonValue;
 
-use crate::request::{GraphQLRequest, RequestError, RequestPayload, UploadBinding};
+use crate::request::{GraphQLRequest, RequestError, UploadBinding};
 
 /// The default maximum number of multipart fields, including `operations` and `map`.
 pub const DEFAULT_MAX_MULTIPART_PARTS: usize = 32;
@@ -35,27 +35,20 @@ pub const DEFAULT_MAX_MULTIPART_PARTS: usize = 32;
 /// Parse a multipart request body.
 ///
 /// `content_type` is the full request `Content-Type`, including its `boundary` parameter.
-/// `max_parts` limits the number of fields; `0` disables the limit. `max_batch_size` applies when
-/// `operations` is an array.
+/// `max_parts` limits the number of fields; `0` disables the limit. The specification does not
+/// define batching, so `operations` must be a single request object.
 ///
 /// # Errors
 ///
 /// Returns a request error for an invalid content type or body, missing or duplicate fields,
 /// unknown file fields, a malformed `map`, a path that does not point at `null` inside
-/// `variables`, or a missing file. A batch that is empty or exceeds `max_batch_size` is rejected.
+/// `variables`, a missing file, or an `operations` value that is not an object.
 pub async fn parse(
     content_type: &str,
     body: &[u8],
     max_parts: usize,
-    max_batch_size: usize,
-) -> Result<RequestPayload, RequestError> {
-    parse_bytes(
-        content_type,
-        Bytes::copy_from_slice(body),
-        max_parts,
-        max_batch_size,
-    )
-    .await
+) -> Result<GraphQLRequest, RequestError> {
+    parse_bytes(content_type, Bytes::copy_from_slice(body), max_parts).await
 }
 
 /// [`parse`] for an owned body.
@@ -66,8 +59,7 @@ pub(crate) async fn parse_bytes(
     content_type: &str,
     body: Bytes,
     max_parts: usize,
-    max_batch_size: usize,
-) -> Result<RequestPayload, RequestError> {
+) -> Result<GraphQLRequest, RequestError> {
     let boundary = multer::parse_boundary(content_type)
         .map_err(|error| invalid(format!("invalid multipart content type: {error}")))?;
 
@@ -101,25 +93,10 @@ pub(crate) async fn parse_bytes(
                     .map_err(|error| invalid(format!("could not read `operations`: {error}")))?;
                 let value: JsonValue = serde_json::from_str(&text)
                     .map_err(|error| invalid(format!("invalid `operations` JSON: {error}")))?;
-                match &value {
-                    JsonValue::Object(_) => {}
-                    JsonValue::Array(requests) => {
-                        if requests.is_empty() {
-                            return Err(invalid(
-                                "a batch `operations` array must contain at least one request",
-                            ));
-                        }
-                        if max_batch_size != 0 && requests.len() > max_batch_size {
-                            return Err(RequestError::new(format!(
-                                "A batch request may contain at most {max_batch_size} operations."
-                            )));
-                        }
-                    }
-                    _ => {
-                        return Err(invalid(
-                            "`operations` must be an object or an array of requests",
-                        ));
-                    }
+                if !value.is_object() {
+                    return Err(invalid(
+                        "`operations` must be a single GraphQL request object; batching is not supported",
+                    ));
                 }
                 operations = Some(value);
             }
@@ -203,7 +180,7 @@ pub(crate) async fn parse_bytes(
         }
     }
 
-    let (mut requests, batch) = into_requests(operations)?;
+    let mut request = into_request(operations)?;
     for (name, mut paths) in map {
         let upload = files
             .remove(&name)
@@ -215,46 +192,24 @@ pub(crate) async fn parse_bytes(
         // Clone the shared upload only while another binding still needs it; the final path
         // takes ownership.
         for path in paths {
-            bind(&mut requests, path, upload.clone(), &name)?;
+            bind(&mut request, path, upload.clone());
         }
-        bind(&mut requests, last, upload, &name)?;
+        bind(&mut request, last, upload);
     }
 
-    Ok(if batch {
-        RequestPayload::Batch(requests)
-    } else {
-        RequestPayload::Single(
-            requests
-                .pop()
-                .ok_or_else(|| invalid("missing the `operations` field"))?,
-        )
-    })
+    Ok(request)
 }
 
-/// Attach one upload to the request's variables path, or report an out-of-range batch index.
-fn bind(
-    requests: &mut [GraphQLRequest],
-    path: MappedPath,
-    upload: Upload,
-    name: &str,
-) -> Result<(), RequestError> {
-    let request_count = requests.len();
-    let request = requests.get_mut(path.request_index).ok_or_else(|| {
-        invalid(format!(
-            "map entry \"{name}\" refers to batch index {}, but the batch has {request_count} requests",
-            path.request_index
-        ))
-    })?;
+/// Attach one upload to the request's variables path.
+fn bind(request: &mut GraphQLRequest, path: MappedPath, upload: Upload) {
     request
         .uploads
         .push(UploadBinding::new(path.relative, upload));
-    Ok(())
 }
 
-/// A file's destination inside one request's variables.
+/// A file's destination inside the request's variables.
 struct MappedPath {
-    request_index: usize,
-    /// The operations path with any batch index removed (it always starts with `variables`).
+    /// The operations path, which always starts with `variables`.
     relative: String,
 }
 
@@ -269,10 +224,9 @@ fn parse_map(
         .as_object()
         .ok_or_else(|| invalid("`map` must be a JSON object"))?;
 
-    let batch_len = operations.as_array().map(Vec::len);
     // A multipart request normally maps one file to one path, so a linear scan is cheaper than
     // a tree or a hash set; duplicates are rare and still rejected.
-    let mut seen: Vec<(usize, String)> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
     let mut map = BTreeMap::new();
 
     for (name, paths) in raw {
@@ -286,15 +240,16 @@ fn parse_map(
                     "map entry \"{name}\" contains a path that is not a string"
                 ))
             })?;
-            let mapped_path = parse_path(path, operations, batch_len)?;
-            if seen.iter().any(|(index, relative)| {
-                *index == mapped_path.request_index && relative == &mapped_path.relative
-            }) {
+            let mapped_path = parse_path(path, operations)?;
+            if seen
+                .iter()
+                .any(|relative| relative == &mapped_path.relative)
+            {
                 return Err(invalid(format!(
                     "map paths contain \"{path}\" more than once"
                 )));
             }
-            seen.push((mapped_path.request_index, mapped_path.relative.clone()));
+            seen.push(mapped_path.relative.clone());
             mapped.push(mapped_path);
         }
         map.insert(name.clone(), mapped);
@@ -304,38 +259,14 @@ fn parse_map(
 }
 
 /// Validate one operations path and confirm its destination is `null`.
-fn parse_path(
-    path: &str,
-    operations: &JsonValue,
-    batch_len: Option<usize>,
-) -> Result<MappedPath, RequestError> {
-    // Splitting repeatedly rather than collecting keeps this allocation-free; the only string
-    // this function allocates is the relative path it stores.
+fn parse_path(path: &str, operations: &JsonValue) -> Result<MappedPath, RequestError> {
     if path.is_empty() || path.starts_with('.') || path.ends_with('.') || path.contains("..") {
         return Err(invalid(format!(
             "map path \"{path}\" contains an empty segment"
         )));
     }
 
-    let (request_index, relative) = match batch_len {
-        Some(len) => {
-            let (index, relative) = path.split_once('.').unwrap_or((path, ""));
-            let index = index.parse::<usize>().map_err(|_| {
-                invalid(format!(
-                    "map path \"{path}\" must start with a batch index because `operations` is an array"
-                ))
-            })?;
-            if index >= len {
-                return Err(invalid(format!(
-                    "map path \"{path}\" refers to batch index {index}, but the batch has {len} requests"
-                )));
-            }
-            (index, relative)
-        }
-        None => (0, path),
-    };
-
-    let mut segments = relative.split('.');
+    let mut segments = path.split('.');
     if segments.next() != Some("variables") {
         return Err(invalid(format!(
             "map path \"{path}\" must address `variables`; files may only be placed in request variables"
@@ -347,11 +278,8 @@ fn parse_path(
         )));
     }
 
-    let mut value = match batch_len {
-        Some(_) => &operations[request_index],
-        None => operations,
-    };
-    for segment in relative.split('.') {
+    let mut value = operations;
+    for segment in path.split('.') {
         value = match value {
             JsonValue::Object(object) => object.get(segment),
             JsonValue::Array(list) => segment
@@ -373,27 +301,19 @@ fn parse_path(
     }
 
     Ok(MappedPath {
-        request_index,
-        // Drop the batch index, keep `variables` so the executor can validate the root again.
-        relative: relative.to_owned(),
+        relative: path.to_owned(),
     })
 }
 
-/// Convert the `operations` JSON into requests, reporting the payload shape.
-fn into_requests(operations: JsonValue) -> Result<(Vec<GraphQLRequest>, bool), RequestError> {
-    match operations {
-        JsonValue::Array(requests) => {
-            let requests =
-                serde_json::from_value::<Vec<GraphQLRequest>>(JsonValue::Array(requests))
-                    .map_err(|error| invalid(format!("invalid `operations` JSON: {error}")))?;
-            Ok((requests, true))
-        }
-        operation => {
-            let request = serde_json::from_value::<GraphQLRequest>(operation)
-                .map_err(|error| invalid(format!("invalid `operations` JSON: {error}")))?;
-            Ok((vec![request], false))
-        }
+/// Convert the `operations` JSON into a request, reporting the payload shape.
+fn into_request(operations: JsonValue) -> Result<GraphQLRequest, RequestError> {
+    if !operations.is_object() {
+        return Err(invalid(
+            "`operations` must be a single GraphQL request object; batching is not supported",
+        ));
     }
+    serde_json::from_value::<GraphQLRequest>(operations)
+        .map_err(|error| invalid(format!("invalid `operations` JSON: {error}")))
 }
 
 fn invalid(message: impl Into<String>) -> RequestError {

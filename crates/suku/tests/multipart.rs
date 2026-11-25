@@ -231,7 +231,7 @@ async fn nested_variables_are_supported() {
 }
 
 #[tokio::test]
-async fn batch_operations_with_files_are_supported() {
+async fn batch_operations_are_rejected() {
     let server = Server::new(schema());
     let (content_type, body) = multipart(
         r#"[{"query":"mutation($file: Upload!){ upload(file:$file) }","variables":{"file":null}},{"query":"mutation($file: Upload!){ upload(file:$file) }","variables":{"file":null}}]"#,
@@ -243,10 +243,7 @@ async fn batch_operations_with_files_are_supported() {
     );
 
     let response = post(&server, &HttpConfig::default(), &content_type, &body).await;
-    assert_eq!(response.status, StatusCode::OK);
-    let body = body_json(&response);
-    assert_eq!(body[0]["data"]["upload"], "first.txt:text/plain:first");
-    assert_eq!(body[1]["data"]["upload"], "second.txt:text/plain:second");
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

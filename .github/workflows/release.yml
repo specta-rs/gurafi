@@ -47,8 +47,8 @@ jobs:
             exit 1
           fi
 
-      - run: cargo check --workspace --all-targets --locked
-      - run: cargo test --workspace --locked
+      - run: cargo check --workspace --all-targets --all-features --locked
+      - run: cargo test --workspace --all-features --locked
 
   publish:
     name: Publish to crates.io

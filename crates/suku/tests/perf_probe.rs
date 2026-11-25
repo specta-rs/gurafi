@@ -344,7 +344,7 @@ fn push_part(
 }
 
 async fn parse_multipart(content_type: String, body: Vec<u8>) {
-    let payload = suku::multipart::parse(&content_type, &body, 32, 10)
+    let payload = suku::multipart::parse(&content_type, &body, 32)
         .await
         .expect("parse");
     black_box(payload);
@@ -459,7 +459,6 @@ fn variable_request(count: usize) -> suku::GraphQLRequest {
     }
     suku::GraphQLRequest {
         query: String::from("query Q { hello }"),
-        id: None,
         operation_name: None,
         variables: Some(variables),
         extensions: None,
@@ -480,45 +479,39 @@ fn variables_conversion_allocations() {
     }
 }
 
-// ---- HTTP batch ------------------------------------------------------------------------------
+// ---- HTTP request ----------------------------------------------------------------------------
 
 #[test]
-fn http_batch_allocations() {
+fn http_request_allocations() {
     use ::http::Request;
 
     let _measuring = measuring();
     let runtime = runtime();
     let server = Server::new(schema());
+    let body = r#"{"query":"{ hello }"}"#;
+    let parts = {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/graphql")
+            .header(::http::header::CONTENT_TYPE, "application/json")
+            .header(::http::header::ACCEPT, "application/graphql-response+json")
+            .body(())
+            .expect("request");
+        request.into_parts().0
+    };
 
-    for count in [1usize, 100] {
-        let operations = std::iter::repeat_n(r#"{"query":"{ hello }"}"#, count)
-            .collect::<Vec<_>>()
-            .join(",");
-        let body = format!("[{operations}]");
-        let parts = {
-            let request = Request::builder()
-                .method("POST")
-                .uri("/graphql")
-                .header(::http::header::CONTENT_TYPE, "application/json")
-                .header(::http::header::ACCEPT, "application/json")
-                .body(())
-                .expect("request");
-            request.into_parts().0
-        };
-
-        let before = ALLOCATIONS.load(Ordering::Relaxed);
-        let result = runtime.block_on(suku::http::handle(
-            &server,
-            &suku::HttpConfig::default().max_batch_size(1_000),
-            &parts,
-            body.as_bytes(),
-            |_request| async { Ok(Context::empty()) },
-        ));
-        let allocs = ALLOCATIONS.load(Ordering::Relaxed) - before;
-        match result {
-            suku::HttpResult::Response(response) => assert_eq!(response.status, 200),
-            suku::HttpResult::Stream(_) => panic!("expected a buffered response"),
-        }
-        eprintln!("http_batch operations={count} allocs={allocs}");
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let result = runtime.block_on(suku::http::handle(
+        &server,
+        &suku::HttpConfig::default(),
+        &parts,
+        body.as_bytes(),
+        |_request| async { Ok(Context::empty()) },
+    ));
+    let allocs = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    match result {
+        suku::HttpResult::Response(response) => assert_eq!(response.status, 200),
+        suku::HttpResult::Stream(_) => panic!("expected a buffered response"),
     }
+    eprintln!("http_request allocs={allocs}");
 }

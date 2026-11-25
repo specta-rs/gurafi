@@ -225,10 +225,9 @@ async fn rejected_requests_do_not_execute() {
     assert_eq!(bumps.load(Ordering::SeqCst), 0);
 }
 
-/// Control: a batch shares one context but each operation is executed (and therefore
-/// authorized) individually against it.
+/// Every field of a request is authorized individually against the request context.
 #[tokio::test]
-async fn batch_operations_are_authorized_by_the_shared_context() {
+async fn fields_are_authorized_individually() {
     let authorizer = Arc::new(Mutex::new(Vec::new()));
 
     struct Record(Arc<Mutex<Vec<String>>>);
@@ -253,11 +252,7 @@ async fn batch_operations_are_authorized_by_the_shared_context() {
         "/graphql",
         &[(header::CONTENT_TYPE, "application/json")],
     );
-    let body = serde_json::to_vec(&vec![
-        GraphQLRequest::new("{ hello }"),
-        GraphQLRequest::new("{ bumps }"),
-    ])
-    .expect("body");
+    let body = serde_json::to_vec(&GraphQLRequest::new("{ hello bumps }")).expect("body");
 
     let response = buffered(
         handle(

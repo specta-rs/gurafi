@@ -120,13 +120,6 @@ impl GraphQL {
         self
     }
 
-    /// Override the batch size limit for this mount.
-    #[must_use]
-    pub const fn max_batch_size(mut self, size: usize) -> Self {
-        self.config.max_batch_size = Some(size);
-        self
-    }
-
     /// Override the multipart part limit for this mount.
     #[must_use]
     pub const fn max_multipart_parts(mut self, parts: usize) -> Self {
@@ -224,7 +217,6 @@ pub fn graphql(server: Server) -> GraphQL {
 /// Build an Axum router for a server using the default configuration.
 ///
 /// Equivalent to `GraphQL::new(server).into_router()`.
-#[must_use]
 pub fn router(server: Server) -> Router {
     GraphQL::new(server).into_router()
 }
@@ -378,7 +370,7 @@ fn http_error_response(server: &Server, mut error: HttpError) -> AxumResponse {
     *response.status_mut() = error.status;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json; charset=utf-8"),
+        HeaderValue::from_static("application/graphql-response+json; charset=utf-8"),
     );
     response.headers_mut().extend(error.headers);
     response
@@ -402,7 +394,7 @@ fn error_response(server: &Server, status: StatusCode, message: &str) -> AxumRes
     *response.status_mut() = status;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json; charset=utf-8"),
+        HeaderValue::from_static("application/graphql-response+json; charset=utf-8"),
     );
     response
 }

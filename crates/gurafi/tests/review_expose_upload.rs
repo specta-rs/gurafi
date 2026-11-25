@@ -1638,11 +1638,8 @@ fn suku_multipart_body_reaches_a_gurafi_resolver() {
         r#"{"0":["variables.file"]}"#,
         &[("0", "avatar.png", "image/png", b"\x89PNG")],
     );
-    let payload = block_on(suku::multipart::parse(&content_type, &body, 32, 16))
+    let request = block_on(suku::multipart::parse(&content_type, &body, 32))
         .expect("the multipart body parses");
-    let suku::RequestPayload::Single(request) = payload else {
-        panic!("expected a single request");
-    };
     let variables = request.variables_object().expect("variables convert");
     let response = block_on(gql::execute(
         &schema,

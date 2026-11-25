@@ -32,7 +32,7 @@ The approach is inspired by [Pothos GraphQL](https://pothos-graphql.dev)'s
 | [`gurafi`](crates/gurafi) | An intuitive, type-safe, code-first schema builder built on `gql`. Rust types drive the GraphQL type system; `gurafi` only adds developer experience. |
 | [`gurafi-macros`](crates/gurafi-macros) | Procedural macros for `gurafi` (`Object`, `Input`, `Args`, `Enum`, `Scalar`, `Union`, `ErrorUnion`). |
 | [`gurafi-relay`](crates/gurafi-relay) | Typed global IDs, `Node`, connections and mutation payloads. |
-| [`suku`](crates/suku) | A production GraphQL-over-HTTP server for a `gql::Schema`, with batching, SSE subscriptions, error masking and pluggable authentication. |
+| [`suku`](crates/suku) | A GraphQL over HTTP specification server for a `gql::Schema`, with error masking and pluggable authentication. SSE, WebSocket and multipart uploads are opt-in extensions. |
 
 The layers are deliberately independent: `gql` knows nothing about HTTP or Rust models, `gurafi`
 builds only on the public `gql` API, and `suku` only needs a `gql::Schema`. Use the whole stack, or

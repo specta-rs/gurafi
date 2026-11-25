@@ -1,25 +1,32 @@
 //! `Accept` header negotiation.
 //!
-//! GraphQL-over-HTTP has four relevant media types: the legacy `application/json` response,
-//! `application/graphql-response+json`, `text/event-stream` for subscriptions and `text/html` for
-//! GraphiQL. The parser only needs quality values, so it intentionally ignores every other
-//! media-range parameter.
+//! GraphQL-over-HTTP defines two JSON media types: `application/graphql-response+json` for
+//! responses and `application/json` for requests. A server must support the former; the latter is
+//! kept for clients written before the specification existed ("legacy clients" in the
+//! specification's terms).
+//!
+//! `text/html` (GraphiQL) and `text/event-stream` (subscriptions) are extensions this crate
+//! offers on top of the specification, so they are only selected when a client explicitly asks
+//! for them.
+//!
+//! The parser only needs quality values, so it intentionally ignores every other media-range
+//! parameter.
 
 use ::http::{HeaderMap, header};
 
 /// Which JSON media type a response should use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JsonMedia {
-    /// `application/json`; request errors are still returned with status 200.
-    Legacy,
-    /// `application/graphql-response+json`; request errors may use status 400.
+    /// `application/json`, used for successful responses to a legacy client.
+    Json,
+    /// `application/graphql-response+json`, the media type from the specification.
     GraphQLResponse,
 }
 
 impl JsonMedia {
     pub(crate) const fn content_type(self) -> &'static str {
         match self {
-            Self::Legacy => "application/json; charset=utf-8",
+            Self::Json => "application/json; charset=utf-8",
             Self::GraphQLResponse => "application/graphql-response+json; charset=utf-8",
         }
     }
@@ -30,17 +37,35 @@ impl JsonMedia {
 pub(crate) struct Accept {
     /// The preferred JSON media type, when JSON is acceptable.
     pub(crate) json: Option<JsonMedia>,
+    /// The quality of the best acceptable JSON media type. Zero when JSON is not acceptable.
+    pub(crate) json_quality: f32,
     /// Whether `text/event-stream` is acceptable.
     pub(crate) event_stream: bool,
-    /// Whether `text/html` is acceptable.
-    pub(crate) html: bool,
+    /// The quality of `text/html`, when it is acceptable.
+    pub(crate) html_quality: f32,
+    /// Whether the request listed at least one media type this server can produce.
+    pub(crate) acceptable: bool,
 }
 
 impl Accept {
-    pub(crate) const fn json_or_legacy(self) -> JsonMedia {
-        match self.json {
-            Some(media) => media,
-            None => JsonMedia::Legacy,
+    /// Whether HTML is strictly preferred over every JSON media type.
+    ///
+    /// A tie keeps JSON: a browser navigation sends only `text/html`, so an API client that
+    /// explicitly lists both is asking for the machine-readable representation.
+    pub(crate) fn prefers_html(self) -> bool {
+        self.html_quality > 0.0 && self.html_quality > self.json_quality
+    }
+
+    /// The content type for a JSON response with `status`.
+    ///
+    /// The specification recommends that a legacy client (one that only accepts
+    /// `application/json`) still receives the full range of status codes, but that successful
+    /// responses use the legacy media type. Responses with a non-2xx status keep
+    /// `application/graphql-response+json`, which is what makes the status code meaningful.
+    pub(crate) fn json_content_type(self, status: ::http::StatusCode) -> &'static str {
+        match (self.json, status.is_success()) {
+            (Some(JsonMedia::Json), true) => JsonMedia::Json.content_type(),
+            _ => JsonMedia::GraphQLResponse.content_type(),
         }
     }
 }
@@ -49,19 +74,24 @@ impl Accept {
 pub(crate) fn parse(headers: &HeaderMap) -> Accept {
     let mut values = headers.get_all(header::ACCEPT).iter().peekable();
     if values.peek().is_none() {
+        // The specification permits any representation when `Accept` is absent. This server
+        // chooses the specification's media type.
         return Accept {
-            json: Some(JsonMedia::Legacy),
+            json: Some(JsonMedia::GraphQLResponse),
+            json_quality: 1.0,
             event_stream: false,
-            html: false,
+            html_quality: 0.0,
+            acceptable: true,
         };
     }
 
     let mut graphql_q: Option<f32> = None;
     let mut json_q: Option<f32> = None;
-    let mut wildcard_q: Option<f32> = None;
+    let mut application_q: Option<f32> = None;
+    let mut any_q: Option<f32> = None;
     let mut event_q: Option<f32> = None;
     let mut html_q: Option<f32> = None;
-    let mut text_wildcard_q: Option<f32> = None;
+    let mut text_q: Option<f32> = None;
 
     for value in values {
         let Ok(value) = value.to_str() else {
@@ -85,57 +115,44 @@ pub(crate) fn parse(headers: &HeaderMap) -> Accept {
                 }
             }
 
-            match range.as_str() {
-                "application/graphql-response+json" => {
-                    graphql_q = Some(graphql_q.map_or(quality, |current| current.max(quality)));
-                }
-                "application/json" => {
-                    json_q = Some(json_q.map_or(quality, |current| current.max(quality)));
-                }
-                "application/*" | "*/*" => {
-                    wildcard_q = Some(wildcard_q.map_or(quality, |current| current.max(quality)));
-                }
-                "text/event-stream" => {
-                    event_q = Some(event_q.map_or(quality, |current| current.max(quality)));
-                }
-                "text/html" => {
-                    html_q = Some(html_q.map_or(quality, |current| current.max(quality)));
-                }
-                "text/*" => {
-                    text_wildcard_q =
-                        Some(text_wildcard_q.map_or(quality, |current| current.max(quality)));
-                }
-                _ => {}
-            }
+            let slot = match range.as_str() {
+                "application/graphql-response+json" => &mut graphql_q,
+                "application/json" => &mut json_q,
+                "application/*" => &mut application_q,
+                "*/*" => &mut any_q,
+                "text/event-stream" => &mut event_q,
+                "text/html" => &mut html_q,
+                "text/*" => &mut text_q,
+                _ => continue,
+            };
+            *slot = Some(slot.map_or(quality, |current| current.max(quality)));
         }
     }
 
     // A specific range wins over a wildcard, including when its quality is zero (an explicit
-    // rejection). A wildcard that is not overridden also makes the modern JSON type acceptable,
-    // which matters when a client explicitly rejects only `application/json`.
-    let wildcard_quality = wildcard_q.unwrap_or(0.0);
-    let legacy_quality = json_q.unwrap_or(wildcard_quality);
-    let graphql_quality = graphql_q.unwrap_or(wildcard_quality);
-    let json = if graphql_quality > 0.0
-        && (graphql_quality > legacy_quality
-            || (graphql_quality == legacy_quality && graphql_q.is_some()))
-    {
+    // rejection). `application/*` and `*/*` both cover the two JSON types; `text/*` covers the
+    // two text extensions.
+    let application_q = application_q.or(any_q);
+    let graphql_quality = graphql_q.or(application_q).unwrap_or(0.0);
+    let json_quality = json_q.or(application_q).unwrap_or(0.0);
+    let event_stream = event_q.or(text_q).unwrap_or(0.0) > 0.0;
+    let html_quality = html_q.or(text_q).unwrap_or(0.0);
+
+    let json = if graphql_quality > 0.0 && graphql_quality >= json_quality {
         Some(JsonMedia::GraphQLResponse)
-    } else if legacy_quality > 0.0 {
-        Some(JsonMedia::Legacy)
+    } else if json_quality > 0.0 {
+        Some(JsonMedia::Json)
     } else {
         None
     };
-
-    let event_stream = event_q.or(text_wildcard_q).unwrap_or(0.0) > 0.0;
-    // `*/*` also matches HTML, but a browser that wants GraphiQL always lists `text/html`
-    // explicitly. Requiring it prevents `curl` (no Accept header) from getting a web page.
-    let html = html_q.unwrap_or(0.0) > 0.0;
+    let json_quality = json.map_or(0.0, |_| graphql_quality.max(json_quality));
 
     Accept {
         json,
+        json_quality,
         event_stream,
-        html,
+        html_quality,
+        acceptable: json.is_some() || event_stream || html_quality > 0.0,
     }
 }
 
@@ -151,23 +168,25 @@ mod tests {
     }
 
     #[test]
-    fn missing_header_defaults_to_legacy_json() {
+    fn missing_header_defaults_to_the_specification_type() {
         let accept = parse(&HeaderMap::new());
-        assert_eq!(accept.json, Some(JsonMedia::Legacy));
+        assert_eq!(accept.json, Some(JsonMedia::GraphQLResponse));
         assert!(!accept.event_stream);
-        assert!(!accept.html);
+        assert!(!accept.prefers_html());
+        assert!(accept.acceptable);
     }
 
     #[test]
-    fn wildcard_defaults_to_legacy_json() {
-        assert_eq!(accept("*/*").json, Some(JsonMedia::Legacy));
-        assert!(!accept("*/*").html);
+    fn wildcard_selects_the_specification_type() {
+        assert_eq!(accept("*/*").json, Some(JsonMedia::GraphQLResponse));
+        assert!(!accept("*/*").prefers_html());
     }
 
     #[test]
-    fn explicit_modern_type_wins_a_tie() {
+    fn application_json_is_the_legacy_fallback() {
+        assert_eq!(accept("application/json").json, Some(JsonMedia::Json));
         assert_eq!(
-            accept("application/json, application/graphql-response+json").json,
+            accept("application/graphql-response+json, application/json").json,
             Some(JsonMedia::GraphQLResponse)
         );
     }
@@ -176,7 +195,7 @@ mod tests {
     fn quality_values_select_the_higher_type() {
         assert_eq!(
             accept("application/json;q=1, application/graphql-response+json;q=0.5").json,
-            Some(JsonMedia::Legacy)
+            Some(JsonMedia::Json)
         );
         assert_eq!(
             accept("application/json;q=0.5, application/graphql-response+json;q=0.9").json,
@@ -185,27 +204,46 @@ mod tests {
     }
 
     #[test]
-    fn rejecting_legacy_json_keeps_the_modern_type_from_a_wildcard() {
+    fn explicit_rejection_beats_a_wildcard() {
         assert_eq!(
             accept("application/json;q=0, */*;q=1").json,
             Some(JsonMedia::GraphQLResponse)
         );
+        assert_eq!(accept("application/*;q=0, */*;q=1").json, None);
     }
 
     #[test]
     fn unsupported_types_are_not_acceptable() {
-        assert_eq!(accept("text/plain").json, None);
-        assert_eq!(
-            accept("application/json;q=0, application/graphql-response+json;q=0").json,
-            None
-        );
+        assert!(!accept("text/plain").acceptable);
+        assert!(!accept("application/json;q=0, application/graphql-response+json;q=0").acceptable);
     }
 
     #[test]
     fn event_stream_and_html_are_detected() {
         let accept = accept("text/event-stream, text/html");
         assert!(accept.event_stream);
-        assert!(accept.html);
+        assert!(accept.prefers_html());
         assert_eq!(accept.json, None);
+        assert!(accept.acceptable);
+    }
+
+    #[test]
+    fn json_is_preferred_over_html_on_a_tie() {
+        let accept = accept("text/html, application/graphql-response+json");
+        assert_eq!(accept.json, Some(JsonMedia::GraphQLResponse));
+        assert!(!accept.prefers_html());
+    }
+
+    #[test]
+    fn legacy_successes_use_application_json() {
+        let accept = accept("application/json");
+        assert_eq!(
+            accept.json_content_type(::http::StatusCode::OK),
+            "application/json; charset=utf-8"
+        );
+        assert_eq!(
+            accept.json_content_type(::http::StatusCode::NOT_FOUND),
+            "application/graphql-response+json; charset=utf-8"
+        );
     }
 }

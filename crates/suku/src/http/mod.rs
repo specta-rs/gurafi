@@ -1,14 +1,24 @@
-//! Transport-agnostic GraphQL-over-HTTP handling.
+//! GraphQL over HTTP.
 //!
-//! [`handle`] implements the [GraphQL over HTTP](https://graphql.github.io/graphql-over-http/)
-//! draft for one request: content negotiation, GET and POST parameters, request body limits,
-//! status codes, GraphiQL, server-sent event subscriptions and GraphQL multipart requests for
-//! file uploads (with the default `multipart` feature). It never touches a socket, so the same
-//! logic backs the Axum integration and can be embedded in any HTTP framework.
+//! [`handle`] implements the [GraphQL over HTTP specification](https://http-spec.graphql.org)
+//! (September 2026 edition) for one request: `Accept` negotiation, `GET` and `POST` parameters,
+//! request body limits, the specification's status codes, and GraphiQL.
+//!
+//! Everything beyond the specification is opt-in and lives behind a feature:
+//!
+//! * `sse` adds subscription responses as `text/event-stream`.
+//! * `multipart` adds GraphQL multipart requests for file uploads.
+//!
+//! Both are extensions: the specification defines neither subscriptions nor multipart, and says
+//! request batching is not standardised yet. This module therefore accepts exactly one
+//! GraphQL-over-HTTP request per HTTP request.
+//!
+//! It never touches a socket, so the same logic backs the Axum integration and can be embedded in
+//! any HTTP framework.
 //!
 //! The `Authorization` header (and every other request header) is never interpreted here. Pass an
-//! [`ExtractContext`] callback to authenticate a request and build the per-request
-//! [`Context`]. Multipart requests are authenticated before their parts are parsed.
+//! [`ExtractContext`] callback to authenticate a request and build the per-request [`Context`].
+//! Multipart requests are authenticated before their parts are parsed.
 
 mod accept;
 
@@ -17,23 +27,19 @@ use std::{fmt, future::Future};
 
 use ::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use bytes::Bytes;
-use futures::{
-    StreamExt as _,
-    future::BoxFuture,
-    stream::{self, BoxStream},
-};
+use futures::{future::BoxFuture, stream::BoxStream};
 use gql::{GraphQLError, Response};
-use serde::Deserialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::{
     Context, Server,
     error::{ErrorKind, ResponseMeta},
-    request::{GraphQLRequest, RequestError, RequestPayload},
+    request::GraphQLRequest,
     response::ResponseExt as _,
+    server::{ExecutionOutcome, FailureKind},
 };
 
-use self::accept::{Accept, JsonMedia};
+use self::accept::Accept;
 
 // The default page loads React and GraphiQL from unpkg. With `vendored-graphiql`, `build.rs`
 // assembles a self-contained page from the checked-in browser bundles so an offline or
@@ -204,14 +210,15 @@ pub struct HttpConfig {
     pub path: String,
     /// Whether to serve GraphiQL for `GET` requests that accept HTML. Defaults to `true`.
     pub graphiql: bool,
-    /// Override the server's request body limit.
+    /// The largest request body, or the largest `GET` query string, in bytes.
+    ///
+    /// `None` uses the server's limit. `0` disables the limit. This is a denial-of-service guard,
+    /// not part of the GraphQL over HTTP specification.
     pub max_body_bytes: Option<usize>,
-    /// Override the server's batch size limit.
-    pub max_batch_size: Option<usize>,
     /// Override the maximum number of multipart fields, including `operations` and `map`.
     ///
-    /// Defaults to `DEFAULT_MAX_MULTIPART_PARTS` (32) when the `multipart` feature is enabled.
-    /// `0` disables the limit.
+    /// Only meaningful with the `multipart` feature. Defaults to
+    /// `DEFAULT_MAX_MULTIPART_PARTS` (32). `0` disables the limit.
     pub max_multipart_parts: Option<usize>,
 }
 
@@ -221,7 +228,6 @@ impl Default for HttpConfig {
             path: "/graphql".to_owned(),
             graphiql: true,
             max_body_bytes: None,
-            max_batch_size: None,
             max_multipart_parts: None,
         }
     }
@@ -253,13 +259,6 @@ impl HttpConfig {
     #[must_use]
     pub const fn max_body_bytes(mut self, bytes: usize) -> Self {
         self.max_body_bytes = Some(bytes);
-        self
-    }
-
-    /// Override the batch size limit. `0` disables the limit.
-    #[must_use]
-    pub const fn max_batch_size(mut self, size: usize) -> Self {
-        self.max_batch_size = Some(size);
         self
     }
 
@@ -310,6 +309,8 @@ impl HttpResponse {
 }
 
 /// A streaming server-sent-events response.
+///
+/// Produced only by the opt-in `sse` feature.
 pub struct SseResponse {
     /// The status code, normally `200 OK`.
     pub status: StatusCode,
@@ -368,7 +369,6 @@ impl From<HttpResponse> for HttpResult {
             path = parts.uri.path(),
             body_bytes = body.len(),
             request_id = tracing::field::Empty,
-            batch_size = tracing::field::Empty,
             status = tracing::field::Empty,
         )
     )
@@ -384,23 +384,71 @@ where
     F: FnOnce(ContextRequest) -> Fut + Send,
     Fut: Future<Output = Result<Context, HttpError>> + Send,
 {
+    let result = dispatch(
+        server,
+        config,
+        parts,
+        HttpBody::Borrowed(body),
+        extract_context,
+    )
+    .await;
+    record_status(&result);
+    result
+}
+
+/// [`handle`] for a caller that already owns the body as [`Bytes`].
+///
+/// The Axum adapter reads the body into `Bytes`, so taking it here instead of a slice lets a
+/// multipart request hand the same buffer to the parser; a slice would have to be copied first.
+#[cfg(feature = "axum")]
+pub(crate) async fn handle_bytes<F, Fut>(
+    server: &Server,
+    config: &HttpConfig,
+    parts: &::http::request::Parts,
+    body: Bytes,
+    extract_context: F,
+) -> HttpResult
+where
+    F: FnOnce(ContextRequest) -> Fut + Send,
+    Fut: Future<Output = Result<Context, HttpError>> + Send,
+{
+    let result = dispatch(
+        server,
+        config,
+        parts,
+        HttpBody::Owned(body),
+        extract_context,
+    )
+    .await;
+    record_status(&result);
+    result
+}
+
+async fn dispatch<F, Fut>(
+    server: &Server,
+    config: &HttpConfig,
+    parts: &::http::request::Parts,
+    body: HttpBody<'_>,
+    extract_context: F,
+) -> HttpResult
+where
+    F: FnOnce(ContextRequest) -> Fut + Send,
+    Fut: Future<Output = Result<Context, HttpError>> + Send,
+{
     let accept = accept::parse(&parts.headers);
     let result = match parts.method {
-        Method::GET => handle_get(server, config, parts, &accept, extract_context).await,
-        Method::POST => {
-            handle_post(
-                server,
-                config,
-                parts,
-                HttpBody::Borrowed(body),
-                &accept,
-                extract_context,
-            )
-            .await
+        Method::GET | Method::HEAD => {
+            handle_get(server, config, parts, &accept, extract_context).await
         }
-        _ => HttpResult::Response(method_not_allowed(server)),
+        Method::POST => handle_post(server, config, parts, body, &accept, extract_context).await,
+        _ => method_not_allowed(server, &accept, "GET, HEAD, POST"),
     };
-    record_status(&result);
+
+    // `HEAD` must return the same headers as `GET` with no body. This still executes a query from
+    // the URI, which the specification requires to be safe.
+    if parts.method == Method::HEAD {
+        return without_body(result);
+    }
     result
 }
 
@@ -434,6 +482,20 @@ impl HttpBody<'_> {
     }
 }
 
+fn without_body(result: HttpResult) -> HttpResult {
+    match result {
+        HttpResult::Response(mut response) => {
+            response.body.clear();
+            HttpResult::Response(response)
+        }
+        HttpResult::Stream(stream) => HttpResult::Response(HttpResponse {
+            status: stream.status,
+            headers: stream.headers,
+            body: Vec::new(),
+        }),
+    }
+}
+
 #[cfg(feature = "tracing")]
 fn record_status(result: &HttpResult) {
     let span = tracing::Span::current();
@@ -449,57 +511,18 @@ fn record_status(result: &HttpResult) {
 #[cfg(not(feature = "tracing"))]
 fn record_status(_result: &HttpResult) {}
 
-/// [`handle`] for a caller that already owns the body as [`Bytes`].
-///
-/// The Axum adapter reads the body into `Bytes`, so taking it here instead of a slice lets a
-/// multipart request hand the same buffer to the parser; a slice would have to be copied first.
-#[cfg_attr(
-    feature = "tracing",
-    tracing::instrument(
-        skip_all,
-        level = "info",
-        name = "suku.request",
-        fields(
-            method = %parts.method,
-            path = parts.uri.path(),
-            body_bytes = body.len(),
-            request_id = tracing::field::Empty,
-            batch_size = tracing::field::Empty,
-            status = tracing::field::Empty,
-        )
-    )
-)]
-#[cfg(feature = "axum")]
-pub(crate) async fn handle_bytes<F, Fut>(
-    server: &Server,
-    config: &HttpConfig,
-    parts: &::http::request::Parts,
-    body: Bytes,
-    extract_context: F,
-) -> HttpResult
-where
-    F: FnOnce(ContextRequest) -> Fut + Send,
-    Fut: Future<Output = Result<Context, HttpError>> + Send,
-{
-    let accept = accept::parse(&parts.headers);
-    let result = match parts.method {
-        Method::GET => handle_get(server, config, parts, &accept, extract_context).await,
-        Method::POST => {
-            handle_post(
-                server,
-                config,
-                parts,
-                HttpBody::Owned(body),
-                &accept,
-                extract_context,
-            )
-            .await
+#[cfg(feature = "tracing")]
+fn record_request_id(request: &GraphQLRequest) {
+    if let Some(id) = request.prepared_id() {
+        let span = tracing::Span::current();
+        if !span.is_disabled() {
+            span.record("request_id", id);
         }
-        _ => HttpResult::Response(method_not_allowed(server)),
-    };
-    record_status(&result);
-    result
+    }
 }
+
+#[cfg(not(feature = "tracing"))]
+fn record_request_id(_request: &GraphQLRequest) {}
 
 async fn handle_get<F, Fut>(
     server: &Server,
@@ -512,8 +535,13 @@ where
     F: FnOnce(ContextRequest) -> Fut + Send,
     Fut: Future<Output = Result<Context, HttpError>> + Send,
 {
+    if !accept.acceptable {
+        return not_acceptable(server, accept);
+    }
+
     // GET parameters are a request body too. Without this check a client could put an arbitrarily
-    // large query in the URL and bypass `max_body_bytes`.
+    // large query in the URL and bypass `max_body_bytes`. The specification recommends `414 URI
+    // Too Long` when the URI is too large and suggests using `POST` instead.
     let max_query_bytes = config
         .max_body_bytes
         .unwrap_or_else(|| server.max_body_bytes_limit());
@@ -521,8 +549,10 @@ where
         return request_error(
             server,
             accept,
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!("Request query string exceeds the {max_query_bytes} byte limit."),
+            StatusCode::URI_TOO_LONG,
+            format!(
+                "Request URI exceeds the {max_query_bytes} byte limit; use POST for large documents."
+            ),
             None,
         );
     }
@@ -535,73 +565,59 @@ where
         Err(error) => return context_error_response(server, accept, error),
     };
 
-    if config.graphiql && accept.html {
+    if config.graphiql && accept.prefers_html() {
         return HttpResult::Response(graphiql_response());
     }
 
-    let parameters =
-        match serde_urlencoded::from_str::<GetParameters>(parts.uri.query().unwrap_or_default()) {
-            Ok(parameters) => parameters,
-            Err(error) => {
-                return request_error(
-                    server,
-                    accept,
-                    StatusCode::BAD_REQUEST,
-                    format!("Invalid query string: {error}"),
-                    None,
-                );
-            }
-        };
+    // Only HTML was acceptable, but GraphiQL is disabled. There is no representation left.
+    if accept.json.is_none() && !accept.event_stream {
+        return not_acceptable(server, accept);
+    }
 
-    let GetParameters {
-        query,
-        id,
-        variables,
-        operation_name,
-        extensions,
-    } = parameters;
-
-    let mut request = match get_request(query, id, variables, operation_name, extensions) {
-        Ok(request) => request,
-        Err(error) => {
-            return request_error(
-                server,
-                accept,
-                StatusCode::BAD_REQUEST,
-                error.message(),
-                None,
-            );
+    let parameters = match GetParameters::parse(parts.uri.query()) {
+        Ok(parameters) => parameters,
+        Err(problem) => {
+            return request_error(server, accept, problem.status, problem.message, None);
         }
     };
-    apply_header_id(&mut request, &parts.headers);
+    let request = match parameters.into_request() {
+        Ok(request) => request,
+        Err(problem) => {
+            return request_error(server, accept, problem.status, problem.message, None);
+        }
+    };
 
-    // The gate runs on the constructed request, not on the raw parameters: an Apollo automatic
-    // persisted-query GET carries its identifier only inside `extensions.persistedQuery`, and a
-    // header can supply it too. Both are visible through `prepared_id()`.
     if request.query.trim().is_empty() && request.prepared_id().is_none() {
         return request_error(
             server,
             accept,
-            StatusCode::BAD_REQUEST,
+            StatusCode::UNPROCESSABLE_ENTITY,
             "Missing required `query` parameter.",
             Some(&request),
         );
     }
+    record_request_id(&request);
 
     // GraphQL over HTTP: GET may only execute queries. Allowing mutations here turns every
-    // cookie-authenticated endpoint into a CSRF target; subscriptions also open long-lived
-    // streams that should require an explicit POST. A persisted identifier is resolved without
-    // parsing supplied text; an unknown identifier falls through and becomes an error response.
-    if matches!(
-        server.operation_kind(&request),
-        Ok(Some(
+    // cookie-authenticated endpoint into a CSRF target. Subscriptions are a transport extension
+    // that only this crate's `POST` + `text/event-stream` path supports.
+    if let Ok(Some(kind)) = server.operation_kind(&request) {
+        if matches!(
+            kind,
             gql::ast::OperationKind::Mutation | gql::ast::OperationKind::Subscription
-        ))
-    ) {
-        return HttpResult::Response(method_not_allowed(server));
+        ) {
+            return method_not_allowed(server, accept, "POST");
+        }
     }
 
-    process_payload(server, accept, RequestPayload::Single(request), context).await
+    // `text/event-stream` is a POST-only extension.
+    if accept.json.is_none() {
+        return not_acceptable(server, accept);
+    }
+
+    let outcome = server.execute_outcome(&request, context).await;
+    let status = outcome_status(&outcome);
+    HttpResult::Response(json_response(status, accept, &outcome.response))
 }
 
 async fn handle_post<F, Fut>(
@@ -617,8 +633,15 @@ where
     Fut: Future<Output = Result<Context, HttpError>> + Send,
 {
     let content_type = parts.headers.get(header::CONTENT_TYPE);
-    let multipart = is_multipart_content_type(content_type);
-    if !is_json_content_type(content_type) && !multipart {
+    let media = request_media(content_type);
+
+    #[cfg(feature = "multipart")]
+    let multipart = media == RequestMedia::Multipart;
+    #[cfg(not(feature = "multipart"))]
+    #[allow(unused_variables)]
+    let multipart = false;
+
+    if media == RequestMedia::Unsupported {
         #[cfg(feature = "multipart")]
         let message =
             "POST requests must use `Content-Type: application/json` or `multipart/form-data`.";
@@ -651,159 +674,135 @@ where
         Err(error) => return context_error_response(server, accept, error),
     };
 
-    let max_batch_size = config
-        .max_batch_size
-        .unwrap_or_else(|| server.max_batch_size_limit());
     #[cfg(feature = "multipart")]
-    let payload = if multipart {
+    let request = if multipart {
         let max_parts = config
             .max_multipart_parts
             .unwrap_or(crate::multipart::DEFAULT_MAX_MULTIPART_PARTS);
         let content_type = content_type
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
-        crate::multipart::parse_bytes(content_type, body.into_bytes(), max_parts, max_batch_size)
-            .await
-    } else {
-        RequestPayload::from_json_slice(body.as_slice(), max_batch_size)
-    };
-    #[cfg(not(feature = "multipart"))]
-    let payload = RequestPayload::from_json_slice(body.as_slice(), max_batch_size);
-
-    let mut payload = match payload {
-        Ok(payload) => payload,
-        Err(error) => {
-            return request_error(
-                server,
-                accept,
-                StatusCode::BAD_REQUEST,
-                error.message(),
-                None,
-            );
-        }
-    };
-    apply_header_id_to_payload(&mut payload, &parts.headers);
-
-    process_payload(server, accept, payload, context).await
-}
-
-#[cfg_attr(
-    feature = "tracing",
-    tracing::instrument(
-        skip_all,
-        level = "debug",
-        name = "suku.process",
-        fields(
-            batch_size = match &payload {
-                RequestPayload::Single(_) => 1usize,
-                RequestPayload::Batch(requests) => requests.len(),
-            },
-            operation = match &payload {
-                RequestPayload::Single(request) => request.operation_name.as_deref().unwrap_or("<anonymous>"),
-                RequestPayload::Batch(_) => "<batch>",
-            },
-            request_id = match &payload {
-                RequestPayload::Single(request) => request.prepared_id().unwrap_or(""),
-                RequestPayload::Batch(_) => "",
-            },
-        )
-    )
-)]
-async fn process_payload(
-    server: &Server,
-    accept: &Accept,
-    payload: RequestPayload,
-    context: Context,
-) -> HttpResult {
-    match payload {
-        RequestPayload::Single(request) => {
-            let kind = server.operation_kind(&request);
-            if accept.event_stream {
-                if matches!(&kind, Ok(Some(gql::ast::OperationKind::Subscription))) {
-                    return start_subscription(server, accept, &request, context).await;
-                }
-                if let (Err(error), None) = (&kind, accept.json) {
-                    // `text/event-stream` is the only acceptable type. A malformed document or an
-                    // unknown persisted identifier is still a request error, returned as JSON
-                    // before any stream is opened.
-                    let mut response = Response::error(error.clone());
-                    server.format_response(
-                        &mut response,
-                        ResponseMeta::from_request(&request),
-                        ErrorKind::Request,
-                    );
-                    return HttpResult::Response(json_response(
-                        StatusCode::BAD_REQUEST,
-                        accept,
-                        &response,
-                    ));
-                }
-            }
-
-            if matches!(&kind, Ok(Some(gql::ast::OperationKind::Subscription))) {
-                let mut response = crate::response::error_response(
-                    "Subscriptions require `Accept: text/event-stream`.",
-                );
-                server.format_response(
-                    &mut response,
-                    ResponseMeta::from_request(&request),
-                    ErrorKind::Request,
-                );
-                let status = execution_status(&response, accept.json_or_legacy());
-                return HttpResult::Response(json_response(status, accept, &response));
-            }
-
-            if accept.json.is_none() {
-                return not_acceptable(server);
-            }
-
-            let response = server.execute(&request, context).await;
-            let status = execution_status(&response, accept.json_or_legacy());
-            HttpResult::Response(json_response(status, accept, &response))
-        }
-        RequestPayload::Batch(requests) => {
-            if accept.event_stream
-                && requests.iter().any(|request| {
-                    matches!(
-                        server.operation_kind(request),
-                        Ok(Some(gql::ast::OperationKind::Subscription))
-                    )
-                })
-            {
+        match crate::multipart::parse_bytes(content_type, body.into_bytes(), max_parts).await {
+            Ok(request) => request,
+            Err(error) => {
                 return request_error(
                     server,
                     accept,
                     StatusCode::BAD_REQUEST,
-                    "Subscriptions cannot be batched.",
+                    error.message(),
                     None,
                 );
             }
-
-            if accept.json.is_none() {
-                return not_acceptable(server);
+        }
+    } else {
+        match parse_json_request(body.as_slice()) {
+            Ok(request) => request,
+            Err(problem) => {
+                return request_error(server, accept, problem.status, problem.message, None);
             }
-
-            let responses = server.execute_batch(&requests, context).await;
-            HttpResult::Response(json_batch_response(accept, &responses))
         }
+    };
+    #[cfg(not(feature = "multipart"))]
+    let request = match parse_json_request(body.as_slice()) {
+        Ok(request) => request,
+        Err(problem) => {
+            return request_error(server, accept, problem.status, problem.message, None);
+        }
+    };
+
+    if request.query.trim().is_empty() && request.prepared_id().is_none() {
+        return request_error(
+            server,
+            accept,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Missing required `query` parameter.",
+            Some(&request),
+        );
+    }
+    record_request_id(&request);
+
+    let kind = server.operation_kind(&request);
+    let subscription = matches!(&kind, Ok(Some(gql::ast::OperationKind::Subscription)));
+
+    // A client that accepts only `text/event-stream` still gets a JSON request error when the
+    // document cannot be parsed or validated: no stream is opened for an invalid request.
+    #[cfg(feature = "sse")]
+    if kind.is_err() && accept.event_stream {
+        let outcome = server.execute_outcome(&request, context).await;
+        let status = outcome_status(&outcome);
+        return HttpResult::Response(json_response(status, accept, &outcome.response));
+    }
+
+    #[cfg(feature = "sse")]
+    if subscription && accept.event_stream {
+        return match server.subscribe_outcome(&request, context).await {
+            Ok(subscription) => sse_response(subscription),
+            Err(outcome) => {
+                let status = outcome_status(&outcome);
+                HttpResult::Response(json_response(status, accept, &outcome.response))
+            }
+        };
+    }
+
+    if subscription {
+        #[cfg(feature = "sse")]
+        let message = "Subscriptions require `Accept: text/event-stream`.";
+        #[cfg(not(feature = "sse"))]
+        let message =
+            "Subscriptions are not supported over HTTP; enable the `sse` feature to serve them.";
+
+        if accept.json.is_none() {
+            return not_acceptable(server, accept);
+        }
+        return request_error(
+            server,
+            accept,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            message,
+            Some(&request),
+        );
+    }
+
+    if accept.json.is_none() {
+        return not_acceptable(server, accept);
+    }
+
+    let outcome = server.execute_outcome(&request, context).await;
+    let status = outcome_status(&outcome);
+    HttpResult::Response(json_response(status, accept, &outcome.response))
+}
+
+/// Map an execution outcome to the status code the specification recommends.
+fn outcome_status(outcome: &ExecutionOutcome) -> StatusCode {
+    let Some(failure) = outcome.failure else {
+        return match outcome.response.data {
+            Some(_) if outcome.response.has_errors() => partial_success_status(),
+            Some(_) => StatusCode::OK,
+            // A response with neither data nor a classified failure is a server bug; never
+            // present it as success.
+            None => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+    };
+    match failure {
+        FailureKind::Parse => StatusCode::BAD_REQUEST,
+        FailureKind::Request => StatusCode::UNPROCESSABLE_ENTITY,
+        FailureKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        FailureKind::Server => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
-async fn start_subscription(
-    server: &Server,
-    accept: &Accept,
-    request: &GraphQLRequest,
-    context: Context,
-) -> HttpResult {
-    match server.subscribe(request, context).await {
-        Ok(subscription) => sse_response(subscription),
-        Err(response) => {
-            HttpResult::Response(json_response(StatusCode::BAD_REQUEST, accept, &response))
-        }
-    }
+/// `294 Partial Success`, recommended when a response has both `data` and `errors`.
+///
+/// The specification notes that clients which do not recognise this code must treat it as the
+/// `x00` of its class, i.e. like `200 OK`.
+fn partial_success_status() -> StatusCode {
+    StatusCode::from_u16(294).unwrap_or(StatusCode::OK)
 }
 
+#[cfg(feature = "sse")]
 fn sse_response(subscription: gql::SubscriptionResponse) -> HttpResult {
+    use futures::{StreamExt as _, stream};
+
     let events = subscription
         .stream
         .map(|response| -> Result<Bytes, Infallible> {
@@ -830,21 +829,6 @@ fn sse_response(subscription: gql::SubscriptionResponse) -> HttpResult {
     })
 }
 
-fn execution_status(response: &Response, media: JsonMedia) -> StatusCode {
-    // Request errors (parse, validation, variable coercion) have no response path. Field errors
-    // always do, even when non-null propagation nulls the entire `data` object; those are
-    // execution results and keep status 200.
-    if media == JsonMedia::GraphQLResponse
-        && response.data.is_none()
-        && response.has_errors()
-        && response.errors.iter().all(|error| error.path().is_none())
-    {
-        StatusCode::BAD_REQUEST
-    } else {
-        StatusCode::OK
-    }
-}
-
 #[cfg_attr(
     feature = "tracing",
     tracing::instrument(
@@ -858,7 +842,7 @@ fn json_response(status: StatusCode, accept: &Accept, response: &Response) -> Ht
     let mut http = HttpResponse::new(status);
     http.headers.insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static(accept.json_or_legacy().content_type()),
+        HeaderValue::from_static(accept.json_content_type(status)),
     );
     http.headers
         .insert(header::VARY, HeaderValue::from_static("Accept"));
@@ -872,40 +856,6 @@ fn json_response(status: StatusCode, accept: &Accept, response: &Response) -> Ht
             span.record("body_bytes", http.body.len());
         }
     }
-    http
-}
-
-#[cfg_attr(
-    feature = "tracing",
-    tracing::instrument(
-        skip_all,
-        level = "debug",
-        name = "suku.serialize_batch",
-        fields(responses = responses.len(), body_bytes = tracing::field::Empty)
-    )
-)]
-fn json_batch_response(accept: &Accept, responses: &[Response]) -> HttpResponse {
-    // Serialize the slice directly: building a `serde_json::Value` per response first would
-    // allocate a map, its keys and the whole value tree only to serialize it again. A response
-    // that cannot be serialized (an opaque model value reached the response) still replaces the
-    // body with the fallback error instead of producing a partial batch.
-    let body = match serde_json::to_vec(&responses) {
-        Ok(body) => body,
-        Err(error) => crate::response::error_json_bytes(format!(
-            "Failed to serialize the GraphQL batch response: {error}"
-        )),
-    };
-
-    let mut http = HttpResponse::new(StatusCode::OK);
-    http.headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(accept.json_or_legacy().content_type()),
-    );
-    http.headers
-        .insert(header::VARY, HeaderValue::from_static("Accept"));
-    http.headers
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    http.body = body;
     http
 }
 
@@ -947,7 +897,7 @@ fn context_error_response(server: &Server, accept: &Accept, mut error: HttpError
     HttpResult::Response(http)
 }
 
-fn method_not_allowed(server: &Server) -> HttpResponse {
+fn method_not_allowed(server: &Server, accept: &Accept, allow: &'static str) -> HttpResult {
     #[cfg(feature = "tracing")]
     tracing::warn!(
         target: "suku::http",
@@ -955,19 +905,16 @@ fn method_not_allowed(server: &Server) -> HttpResponse {
         code = "METHOD",
         "suku.request.error"
     );
-    let mut response = crate::response::error_response("Only GET and POST are supported.");
+    let mut response =
+        crate::response::error_response(format!("Method not allowed. Supported methods: {allow}."));
     server.format_response(&mut response, ResponseMeta::none(), ErrorKind::Request);
-    let mut http = HttpResponse::with_body(
-        StatusCode::METHOD_NOT_ALLOWED,
-        "application/json; charset=utf-8",
-        response.to_json_bytes(),
-    );
+    let mut http = json_response(StatusCode::METHOD_NOT_ALLOWED, accept, &response);
     http.headers
-        .insert(header::ALLOW, HeaderValue::from_static("GET, POST"));
-    http
+        .insert(header::ALLOW, HeaderValue::from_static(allow));
+    HttpResult::Response(http)
 }
 
-fn not_acceptable(server: &Server) -> HttpResult {
+fn not_acceptable(server: &Server, accept: &Accept) -> HttpResult {
     #[cfg(feature = "tracing")]
     tracing::warn!(
         target: "suku::http",
@@ -976,24 +923,23 @@ fn not_acceptable(server: &Server) -> HttpResult {
         "suku.request.error"
     );
     let mut response = crate::response::error_response(
-        "No acceptable response type; use `application/json` or `application/graphql-response+json`.",
+        "No acceptable response type; use `application/graphql-response+json` or `application/json`.",
     );
     server.format_response(&mut response, ResponseMeta::none(), ErrorKind::Request);
-    HttpResult::Response(HttpResponse::with_body(
-        StatusCode::NOT_ACCEPTABLE,
-        "application/json; charset=utf-8",
-        response.to_json_bytes(),
-    ))
+    HttpResult::Response(json_response(StatusCode::NOT_ACCEPTABLE, accept, &response))
 }
 
 fn graphiql_response() -> HttpResponse {
     let mut http =
         HttpResponse::with_body(StatusCode::OK, "text/html; charset=utf-8", graphiql_html());
     http.headers
+        .insert(header::VARY, HeaderValue::from_static("Accept"));
+    http.headers
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     http
 }
 
+#[cfg(feature = "sse")]
 fn sse_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -1009,132 +955,147 @@ fn sse_headers() -> HeaderMap {
     headers
 }
 
-fn is_json_content_type(value: Option<&HeaderValue>) -> bool {
-    let Some(value) = value else {
-        return false;
-    };
-    let Ok(value) = value.to_str() else {
-        return false;
-    };
-    let media = value.split(';').next().unwrap_or_default().trim();
-    media.eq_ignore_ascii_case("application/json")
-        || media.eq_ignore_ascii_case("application/graphql-response+json")
-}
-
-fn is_multipart_content_type(value: Option<&HeaderValue>) -> bool {
-    #[cfg(not(feature = "multipart"))]
-    {
-        let _ = value;
-        false
-    }
+/// The media type of a `POST` body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestMedia {
+    Json,
     #[cfg(feature = "multipart")]
-    {
-        let Some(value) = value else {
-            return false;
+    Multipart,
+    Unsupported,
+}
+
+/// Parse the `Content-Type` header of a `POST` request.
+///
+/// The specification requires `application/json`; `application/graphql-response+json` is a
+/// *response* media type and is not accepted as a request type. A missing header is unsupported
+/// (the specification recommends rejecting it rather than guessing).
+fn request_media(value: Option<&HeaderValue>) -> RequestMedia {
+    let Some(value) = value.and_then(|value| value.to_str().ok()) else {
+        return RequestMedia::Unsupported;
+    };
+    let mut parts = value.split(';');
+    let media = parts.next().unwrap_or_default().trim();
+
+    // An officially recognised GraphQL media type without an encoding is UTF-8. An explicit
+    // non-UTF-8 charset is not something this server can decode.
+    let mut utf8 = true;
+    for parameter in parts {
+        let Some((name, value)) = parameter.split_once('=') else {
+            continue;
         };
-        let Ok(value) = value.to_str() else {
-            return false;
-        };
-        value
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .eq_ignore_ascii_case("multipart/form-data")
+        if name.trim().eq_ignore_ascii_case("charset") {
+            let charset = value.trim().trim_matches('"');
+            utf8 = charset.eq_ignore_ascii_case("utf-8")
+                || charset.eq_ignore_ascii_case("utf8")
+                || charset.eq_ignore_ascii_case("us-ascii");
+        }
+    }
+    if !utf8 {
+        return RequestMedia::Unsupported;
+    }
+
+    if media.eq_ignore_ascii_case("application/json") {
+        RequestMedia::Json
+    } else {
+        #[cfg(feature = "multipart")]
+        if media.eq_ignore_ascii_case("multipart/form-data") {
+            return RequestMedia::Multipart;
+        }
+        RequestMedia::Unsupported
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        skip_all,
+        level = "debug",
+        name = "suku.parse",
+        fields(body_bytes = body.len(), status = tracing::field::Empty)
+    )
+)]
+fn parse_json_request(body: &[u8]) -> Result<GraphQLRequest, Problem> {
+    serde_json::from_slice(body).map_err(|error| {
+        // Malformed JSON is a `400`; valid JSON whose shape is not a GraphQL-over-HTTP request is
+        // a `422`. This also rejects a top-level array: batching is not part of the specification.
+        let status = match error.classify() {
+            serde_json::error::Category::Data => StatusCode::UNPROCESSABLE_ENTITY,
+            _ => StatusCode::BAD_REQUEST,
+        };
+        Problem {
+            status,
+            message: format!("Invalid GraphQL request: {error}"),
+        }
+    })
+}
+
+/// The `GET` parameters defined by the specification.
+#[derive(Debug, Default)]
 struct GetParameters {
     query: Option<String>,
-    #[serde(default, alias = "doc_id", alias = "documentId", alias = "queryId")]
-    id: Option<String>,
-    variables: Option<String>,
-    #[serde(rename = "operationName")]
     operation_name: Option<String>,
+    variables: Option<String>,
     extensions: Option<String>,
 }
 
-fn get_request(
-    query: Option<String>,
-    id: Option<String>,
-    variables: Option<String>,
-    operation_name: Option<String>,
-    extensions: Option<String>,
-) -> Result<GraphQLRequest, RequestError> {
-    Ok(GraphQLRequest {
-        query: query.unwrap_or_default(),
-        id,
-        operation_name,
-        variables: parse_json_object(variables, "variables")?,
-        extensions: parse_json_object(extensions, "extensions")?,
-        uploads: Vec::new(),
-    })
-}
-
-/// Headers some persisted-query clients use instead of a body field.
-const PERSISTED_QUERY_HEADERS: [&str; 2] = ["x-persisted-query-id", "x-query-id"];
-
-fn header_persisted_id(headers: &HeaderMap) -> Option<String> {
-    PERSISTED_QUERY_HEADERS.iter().find_map(|name| {
-        headers
-            .get(*name)
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-    })
-}
-
-/// Apply a persisted-query header when the request did not carry an identifier anywhere.
-///
-/// The body's `id` and the extension shapes (`extensions.id`,
-/// `extensions.persistedQuery.sha256Hash`, …) both take precedence: the header is a fallback, not
-/// an override. Applying it only when [`GraphQLRequest::prepared_id`] is `None` is what prevents a
-/// stale or shared header from silently changing which operation a request executes.
-fn apply_header_id(request: &mut GraphQLRequest, headers: &HeaderMap) {
-    if request.prepared_id().is_none() {
-        if let Some(id) = header_persisted_id(headers) {
-            request.id = Some(id);
+impl GetParameters {
+    /// Parse the query component as `application/x-www-form-urlencoded`.
+    ///
+    /// Unknown parameters are ignored, matching the rule that servers must ignore members they
+    /// do not understand. Duplicate parameters keep the first value, like `URLSearchParams.get`.
+    fn parse(query: Option<&str>) -> Result<Self, Problem> {
+        let mut parameters = Self::default();
+        for (key, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+            let slot = match &*key {
+                "query" => &mut parameters.query,
+                "operationName" => &mut parameters.operation_name,
+                "variables" => &mut parameters.variables,
+                "extensions" => &mut parameters.extensions,
+                _ => continue,
+            };
+            slot.get_or_insert_with(|| value.into_owned());
         }
+        Ok(parameters)
+    }
+
+    fn into_request(self) -> Result<GraphQLRequest, Problem> {
+        Ok(GraphQLRequest {
+            query: self.query.unwrap_or_default(),
+            operation_name: self.operation_name.filter(|name| !name.is_empty()),
+            variables: parse_json_map(self.variables.as_deref(), "variables")?,
+            extensions: parse_json_map(self.extensions.as_deref(), "extensions")?,
+            uploads: Vec::new(),
+        })
     }
 }
 
-fn apply_header_id_to_payload(payload: &mut RequestPayload, headers: &HeaderMap) {
-    let Some(id) = header_persisted_id(headers) else {
-        return;
-    };
-    match payload {
-        RequestPayload::Single(request) => {
-            if request.prepared_id().is_none() {
-                request.id = Some(id);
-            }
-        }
-        RequestPayload::Batch(requests) => {
-            // A header is shared by the whole batch, so it applies to every item that does not
-            // already name its own operation. Batch size is capped by `max_batch_size`, and each
-            // item is executed with its own limits, so this fans one identifier out to at most
-            // that many operations; send per-item identifiers if that is not desired.
-            for request in requests {
-                if request.prepared_id().is_none() {
-                    request.id = Some(id.clone());
-                }
-            }
-        }
-    }
-}
-
-fn parse_json_object(
-    raw: Option<String>,
+fn parse_json_map(
+    raw: Option<&str>,
     name: &str,
-) -> Result<Option<JsonMap<String, JsonValue>>, RequestError> {
+) -> Result<Option<JsonMap<String, JsonValue>>, Problem> {
     let Some(raw) = raw else {
         return Ok(None);
     };
-    if raw.trim().is_empty() {
+    // The specification says an empty optional parameter is equivalent to omitting it.
+    if raw.is_empty() {
         return Ok(None);
     }
-    let parsed: Option<JsonMap<String, JsonValue>> = serde_json::from_str(&raw)
-        .map_err(|error| RequestError::new(format!("Invalid `{name}` parameter: {error}")))?;
-    Ok(parsed)
+    let value: JsonValue = serde_json::from_str(raw).map_err(|error| Problem {
+        status: StatusCode::BAD_REQUEST,
+        message: format!("Invalid `{name}` parameter: {error}"),
+    })?;
+    match value {
+        JsonValue::Null => Ok(None),
+        JsonValue::Object(map) => Ok(Some(map)),
+        _ => Err(Problem {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: format!("`{name}` must be a JSON object."),
+        }),
+    }
+}
+
+/// A request problem with the status code the specification recommends for it.
+struct Problem {
+    status: StatusCode,
+    message: String,
 }

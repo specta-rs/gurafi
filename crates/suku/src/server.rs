@@ -26,9 +26,6 @@ use crate::{
 /// Default maximum request body size: 1 MiB.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 
-/// Default maximum number of operations in a batch.
-pub const DEFAULT_MAX_BATCH_SIZE: usize = 16;
-
 /// Default number of batch operations executed concurrently.
 pub const DEFAULT_BATCH_CONCURRENCY: usize = 16;
 
@@ -127,7 +124,6 @@ struct ServerInner {
     max_concurrency: usize,
     max_body_bytes: usize,
     timeout: Option<Duration>,
-    max_batch_size: usize,
     batch_concurrency: usize,
     authorizer: Option<Arc<dyn Authorizer>>,
     prepared: Option<PreparedQueryRegistry>,
@@ -156,7 +152,6 @@ impl fmt::Debug for Server {
             .field("max_concurrency", &self.inner.max_concurrency)
             .field("max_body_bytes", &self.inner.max_body_bytes)
             .field("timeout", &self.inner.timeout)
-            .field("max_batch_size", &self.inner.max_batch_size)
             .field("batch_concurrency", &self.inner.batch_concurrency)
             .field("authorizer", &self.inner.authorizer.is_some())
             .field(
@@ -189,7 +184,6 @@ impl Server {
                 max_concurrency: 16,
                 max_body_bytes: DEFAULT_MAX_BODY_BYTES,
                 timeout: Some(Duration::from_secs(30)),
-                max_batch_size: DEFAULT_MAX_BATCH_SIZE,
                 batch_concurrency: DEFAULT_BATCH_CONCURRENCY,
                 authorizer: None,
                 prepared: None,
@@ -269,15 +263,11 @@ impl Server {
         self
     }
 
-    /// Limit the number of operations accepted in one batch. `0` disables the limit.
-    #[must_use]
-    pub fn max_batch_size(mut self, size: usize) -> Self {
-        self.inner_mut().max_batch_size = size;
-        self
-    }
-
-    /// Limit how many operations in a batch run concurrently. Values below one are treated as
-    /// one.
+    /// Limit how many operations run concurrently in [`Server::execute_batch`]. Values below one
+    /// are treated as one.
+    ///
+    /// Batching is not part of the GraphQL over HTTP specification; this setting only affects
+    /// callers of [`Server::execute_batch`], not the HTTP endpoint.
     #[must_use]
     pub fn batch_concurrency(mut self, concurrency: usize) -> Self {
         self.inner_mut().batch_concurrency = concurrency.max(1);
@@ -453,17 +443,20 @@ impl Server {
         self.inner.max_body_bytes
     }
 
-    /// The configured maximum batch size.
-    #[must_use]
-    pub fn max_batch_size_limit(&self) -> usize {
-        self.inner.max_batch_size
-    }
-
     /// Execute a query or mutation.
     ///
     /// Parse, validation, variable coercion and resolver errors all come back inside the returned
     /// response, exactly as the GraphQL specification requires. If an error formatter is
     /// installed, every error in the response has already passed through it.
+    pub async fn execute(&self, request: &GraphQLRequest, context: Context) -> gql::Response {
+        self.execute_outcome(request, context).await.response
+    }
+
+    /// Execute a query or mutation and report which phase failed, if any.
+    ///
+    /// The HTTP layer needs this to choose the status code the GraphQL over HTTP specification
+    /// recommends: a document that cannot be parsed is `400`, while a validation, operation
+    /// selection or variable-coercion failure is `422`.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -479,10 +472,18 @@ impl Server {
             )
         )
     )]
-    pub async fn execute(&self, request: &GraphQLRequest, context: Context) -> gql::Response {
+    pub(crate) async fn execute_outcome(
+        &self,
+        request: &GraphQLRequest,
+        context: Context,
+    ) -> ExecutionOutcome {
         let variables = match request.variables_object() {
             Ok(variables) => variables,
-            Err(error) => return self.request_response(request, error.into_response()),
+            Err(error) => {
+                return ExecutionOutcome::request(
+                    self.request_response(request, error.into_response()),
+                );
+            }
         };
         let options = self.execution_options(context);
 
@@ -492,31 +493,45 @@ impl Server {
                     if let Some(error) =
                         prepared_operation_name_error(prepared, request.operation_name.as_deref())
                     {
-                        return self.request_response(request, Response::error(error));
+                        return ExecutionOutcome::request(
+                            self.request_response(request, Response::error(error)),
+                        );
                     }
                     let meta = ResponseMeta::from_request(request)
                         .with_operation_name(prepared.operation_name());
                     let future = prepared.execute(variables.as_ref(), &options);
-                    return self.await_execute(meta, options.timeout, future).await;
+                    let (response, timed_out) =
+                        self.await_execute(meta, options.timeout, future).await;
+                    return ExecutionOutcome::after_execution(response, timed_out, None);
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    return self.request_response(request, Response::error(error));
+                    return ExecutionOutcome::server(
+                        self.request_response(request, Response::error(error)),
+                    );
                 }
             }
             if self.inner.require_prepared || request.query.trim().is_empty() {
-                return self.request_response(request, persisted_query_not_found(id));
+                return ExecutionOutcome::request(
+                    self.request_response(request, persisted_query_not_found(id)),
+                );
             }
         } else if self.inner.require_prepared {
-            return self.request_response(request, persisted_query_not_found(""));
+            return ExecutionOutcome::request(
+                self.request_response(request, persisted_query_not_found("")),
+            );
         } else if request.query.trim().is_empty() {
-            return self.request_response(request, missing_query_response());
+            return ExecutionOutcome::request(
+                self.request_response(request, missing_query_response()),
+            );
         }
 
         let gql_request = request.as_gql(variables.as_ref());
         let future = gql::execute(&self.inner.schema, gql_request, &options);
-        self.await_execute(ResponseMeta::from_request(request), options.timeout, future)
-            .await
+        let (response, timed_out) = self
+            .await_execute(ResponseMeta::from_request(request), options.timeout, future)
+            .await;
+        ExecutionOutcome::after_execution(response, timed_out, Some(request))
     }
 
     /// Execute an array of requests concurrently, preserving their order.
@@ -561,6 +576,18 @@ impl Server {
     ///
     /// Returns a fully formed error response when the request is not a valid subscription or the
     /// source stream could not be created.
+    #[allow(clippy::result_large_err)]
+    pub async fn subscribe(
+        &self,
+        request: &GraphQLRequest,
+        context: Context,
+    ) -> Result<SubscriptionResponse, gql::Response> {
+        self.subscribe_outcome(request, context)
+            .await
+            .map_err(|outcome| outcome.response)
+    }
+
+    /// Start a subscription and report which phase failed during setup, if any.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -573,14 +600,19 @@ impl Server {
             )
         )
     )]
-    pub async fn subscribe(
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn subscribe_outcome(
         &self,
         request: &GraphQLRequest,
         context: Context,
-    ) -> Result<SubscriptionResponse, gql::Response> {
+    ) -> Result<SubscriptionResponse, ExecutionOutcome> {
         let variables = match request.variables_object() {
             Ok(variables) => variables,
-            Err(error) => return Err(self.request_response(request, error.into_response())),
+            Err(error) => {
+                return Err(ExecutionOutcome::request(
+                    self.request_response(request, error.into_response()),
+                ));
+            }
         };
         let options = self.execution_options(context);
 
@@ -590,31 +622,55 @@ impl Server {
                     if let Some(error) =
                         prepared_operation_name_error(prepared, request.operation_name.as_deref())
                     {
-                        return Err(self.request_response(request, Response::error(error)));
+                        return Err(ExecutionOutcome::request(
+                            self.request_response(request, Response::error(error)),
+                        ));
                     }
                     let meta = ResponseMeta::from_request(request)
                         .with_operation_name(prepared.operation_name());
                     let future = prepared.subscribe(variables.as_ref(), &options);
-                    return self.await_subscribe(meta, options.timeout, future).await;
+                    return match self.await_subscribe(meta, options.timeout, future).await {
+                        Ok(subscription) => Ok(subscription),
+                        Err((response, timed_out)) => {
+                            Err(ExecutionOutcome::after_execution(response, timed_out, None))
+                        }
+                    };
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    return Err(self.request_response(request, Response::error(error)));
+                    return Err(ExecutionOutcome::server(
+                        self.request_response(request, Response::error(error)),
+                    ));
                 }
             }
             if self.inner.require_prepared || request.query.trim().is_empty() {
-                return Err(self.request_response(request, persisted_query_not_found(id)));
+                return Err(ExecutionOutcome::request(
+                    self.request_response(request, persisted_query_not_found(id)),
+                ));
             }
         } else if self.inner.require_prepared {
-            return Err(self.request_response(request, persisted_query_not_found("")));
+            return Err(ExecutionOutcome::request(
+                self.request_response(request, persisted_query_not_found("")),
+            ));
         } else if request.query.trim().is_empty() {
-            return Err(self.request_response(request, missing_query_response()));
+            return Err(ExecutionOutcome::request(
+                self.request_response(request, missing_query_response()),
+            ));
         }
 
         let gql_request = request.as_gql(variables.as_ref());
         let future = gql::subscribe(&self.inner.schema, gql_request, &options);
-        self.await_subscribe(ResponseMeta::from_request(request), options.timeout, future)
+        match self
+            .await_subscribe(ResponseMeta::from_request(request), options.timeout, future)
             .await
+        {
+            Ok(subscription) => Ok(subscription),
+            Err((response, timed_out)) => Err(ExecutionOutcome::after_execution(
+                response,
+                timed_out,
+                Some(request),
+            )),
+        }
     }
 
     /// Determine the operation kind a request will execute.
@@ -703,24 +759,31 @@ impl Server {
     /// execution errors. [`format_response`] classifies each error by its response path, so a
     /// no-path error defaults to a request error. A wall-clock timeout is constructed here and
     /// explicitly classified as an execution error.
+    ///
+    /// The returned flag reports whether the server's own deadline expired, which the HTTP layer
+    /// turns into a `5xx` status rather than mistaking it for a bad request.
     async fn await_execute<F>(
         &self,
         meta: ResponseMeta<'_>,
         timeout: Option<Duration>,
         future: F,
-    ) -> gql::Response
+    ) -> (gql::Response, bool)
     where
         F: Future<Output = gql::Response>,
     {
-        let (mut response, kind) = match timeout {
+        let (mut response, kind, timed_out) = match timeout {
             Some(timeout) => match timed(timeout, future).await {
-                Some(response) => (response, ErrorKind::Request),
-                None => (operation_timeout_response(timeout), ErrorKind::Execution),
+                Some(response) => (response, ErrorKind::Request, false),
+                None => (
+                    operation_timeout_response(timeout),
+                    ErrorKind::Execution,
+                    true,
+                ),
             },
-            None => (future.await, ErrorKind::Request),
+            None => (future.await, ErrorKind::Request, false),
         };
         self.format_response(&mut response, meta, kind);
-        response
+        (response, timed_out)
     }
 
     /// Await subscription setup, format failures and wrap the event stream.
@@ -730,7 +793,7 @@ impl Server {
         meta: ResponseMeta<'_>,
         timeout: Option<Duration>,
         future: F,
-    ) -> Result<SubscriptionResponse, gql::Response>
+    ) -> Result<SubscriptionResponse, (gql::Response, bool)>
     where
         F: Future<Output = Result<SubscriptionResponse, gql::Response>>,
     {
@@ -738,13 +801,13 @@ impl Server {
             Some(timeout) => timed_subscribe(timeout, future).await,
             None => future
                 .await
-                .map_err(|response| (response, ErrorKind::Request)),
+                .map_err(|response| (response, ErrorKind::Request, false)),
         };
         match outcome {
             Ok(subscription) => Ok(self.format_subscription(subscription, meta)),
-            Err((mut response, kind)) => {
+            Err((mut response, kind, timed_out)) => {
                 self.format_response(&mut response, meta, kind);
-                Err(response)
+                Err((response, timed_out))
             }
         }
     }
@@ -775,6 +838,65 @@ impl Server {
             })
             .boxed();
         SubscriptionResponse { stream }
+    }
+}
+
+/// The phase that prevented a request from executing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FailureKind {
+    /// The GraphQL document could not be parsed (`400`).
+    Parse,
+    /// The request was well-formed but invalid (`422`).
+    Request,
+    /// The server's own deadline expired (`5xx`).
+    Timeout,
+    /// The server was misconfigured or failed internally (`500`).
+    Server,
+}
+
+/// A response plus the phase that failed, for transport status-code selection.
+pub(crate) struct ExecutionOutcome {
+    pub(crate) response: gql::Response,
+    pub(crate) failure: Option<FailureKind>,
+}
+
+impl ExecutionOutcome {
+    const fn request(response: gql::Response) -> Self {
+        Self {
+            response,
+            failure: Some(FailureKind::Request),
+        }
+    }
+
+    const fn server(response: gql::Response) -> Self {
+        Self {
+            response,
+            failure: Some(FailureKind::Server),
+        }
+    }
+
+    /// Classify a response that came back from the execution engine.
+    ///
+    /// A response with a `data` entry executed successfully (possibly partially); a response
+    /// without one failed before execution. `request` is `None` for the prepared-query path,
+    /// where the document was already parsed and every failure is a request error.
+    fn after_execution(
+        response: gql::Response,
+        timed_out: bool,
+        request: Option<&GraphQLRequest>,
+    ) -> Self {
+        let failure = if timed_out {
+            Some(FailureKind::Timeout)
+        } else if response.data.is_some() {
+            None
+        } else if request.is_some_and(|request| {
+            !request.query.trim().is_empty() && gql::parser::parse_query(&request.query).is_err()
+        }) {
+            Some(FailureKind::Parse)
+        } else {
+            Some(FailureKind::Request)
+        };
+        Self { response, failure }
     }
 }
 
@@ -843,7 +965,7 @@ fn operation_kind_from_text(
 async fn timed_subscribe<F>(
     timeout: Duration,
     future: F,
-) -> Result<gql::SubscriptionResponse, (gql::Response, ErrorKind)>
+) -> Result<gql::SubscriptionResponse, (gql::Response, ErrorKind, bool)>
 where
     F: std::future::Future<Output = Result<gql::SubscriptionResponse, gql::Response>>,
 {
@@ -852,11 +974,15 @@ where
     if tokio::runtime::Handle::try_current().is_err() {
         return future
             .await
-            .map_err(|response| (response, ErrorKind::Request));
+            .map_err(|response| (response, ErrorKind::Request, false));
     }
     match tokio::time::timeout(timeout, future).await {
-        Ok(response) => response.map_err(|response| (response, ErrorKind::Request)),
-        Err(_) => Err((subscribe_timeout_response(timeout), ErrorKind::Execution)),
+        Ok(response) => response.map_err(|response| (response, ErrorKind::Request, false)),
+        Err(_) => Err((
+            subscribe_timeout_response(timeout),
+            ErrorKind::Execution,
+            true,
+        )),
     }
 }
 
@@ -865,13 +991,13 @@ where
 async fn timed_subscribe<F>(
     _timeout: Duration,
     future: F,
-) -> Result<gql::SubscriptionResponse, (gql::Response, ErrorKind)>
+) -> Result<gql::SubscriptionResponse, (gql::Response, ErrorKind, bool)>
 where
     F: std::future::Future<Output = Result<gql::SubscriptionResponse, gql::Response>>,
 {
     future
         .await
-        .map_err(|response| (response, ErrorKind::Request))
+        .map_err(|response| (response, ErrorKind::Request, false))
 }
 
 #[cfg(feature = "axum")]

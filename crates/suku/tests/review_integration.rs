@@ -774,7 +774,11 @@ mod axum_probes {
             )
             .await
             .expect("response");
+        #[cfg(feature = "sse")]
         assert_eq!(response.status(), StatusCode::OK);
+        #[cfg(not(feature = "sse"))]
+        assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+        #[cfg(feature = "sse")]
         assert_eq!(
             response
                 .headers()
@@ -896,7 +900,7 @@ mod axum_probes {
                 .headers()
                 .get(header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok()),
-            Some("application/json; charset=utf-8")
+            Some("application/graphql-response+json; charset=utf-8")
         );
     }
 }
@@ -1285,69 +1289,23 @@ mod multipart_probes {
         assert_eq!(response.status, StatusCode::BAD_REQUEST);
     }
 
-    // -----------------------------------------------------------------------
-    // batches
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
-    async fn a_batch_index_out_of_range_is_rejected() {
+    async fn multipart_batches_are_rejected() {
         let server = Server::new(fixtures::schema());
         let body = body(&[
             text(
                 "operations",
                 r#"[{"query":"mutation($f: Upload!){ upload(file:$f) }","variables":{"f":null}}]"#,
             ),
-            text("map", r#"{"0":["1.variables.f"]}"#),
+            text("map", r#"{"0":["0.variables.f"]}"#),
             file("0", "a.txt", b"a"),
         ]);
         let response = post(&server, &HttpConfig::default(), &body).await;
         assert_eq!(response.status, StatusCode::BAD_REQUEST);
         assert!(
-            error_text(&response).contains("batch"),
+            error_text(&response).contains("single GraphQL request object"),
             "{}",
             error_text(&response)
-        );
-    }
-
-    /// A batch path without a leading index is a request error, not a silent default to 0.
-    #[tokio::test]
-    async fn a_batch_path_must_start_with_an_index() {
-        let server = Server::new(fixtures::schema());
-        let body = body(&[
-            text(
-                "operations",
-                r#"[{"query":"mutation($f: Upload!){ upload(file:$f) }","variables":{"f":null}}]"#,
-            ),
-            text("map", r#"{"0":["variables.f"]}"#),
-            file("0", "a.txt", b"a"),
-        ]);
-        let response = post(&server, &HttpConfig::default(), &body).await;
-        assert_eq!(response.status, StatusCode::BAD_REQUEST);
-    }
-
-    /// One file may serve two requests in a batch.
-    #[tokio::test]
-    async fn a_file_can_be_shared_across_batch_requests() {
-        let server = Server::new(fixtures::schema());
-        let body = body(&[
-            text(
-                "operations",
-                r#"[{"query":"mutation($f: Upload!){ upload(file:$f) }","variables":{"f":null}},
-                    {"query":"mutation($f: Upload!){ upload(file:$f) }","variables":{"f":null}}]"#,
-            ),
-            text("map", r#"{"0":["0.variables.f","1.variables.f"]}"#),
-            file("0", "a.txt", b"shared"),
-        ]);
-        let response = post(&server, &HttpConfig::default(), &body).await;
-        assert_eq!(response.status, StatusCode::OK, "{}", error_text(&response));
-        let body_json = json_body(&response);
-        assert_eq!(
-            body_json[0]["data"]["upload"],
-            "a.txt:application/octet-stream:shared"
-        );
-        assert_eq!(
-            body_json[1]["data"]["upload"],
-            "a.txt:application/octet-stream:shared"
         );
     }
 
@@ -2136,48 +2094,6 @@ mod multipart_edge_probes {
         // The whole body is already in memory, so the parser cannot stall; it must still report a
         // client error rather than a panic or a 500.
         let response = post(&body).await;
-        assert_eq!(response.status, StatusCode::BAD_REQUEST);
-    }
-
-    /// `max_batch_size` applies to a multipart batch too.
-    #[tokio::test]
-    async fn multipart_batches_respect_max_batch_size() {
-        let server = Server::new(fixtures::schema());
-        let config = HttpConfig::default().max_batch_size(1);
-        let mut body = Vec::new();
-        field(
-            &mut body,
-            "operations",
-            None,
-            br#"[{"query":"mutation($f: Upload!){ upload(file:$f) }","variables":{"f":null}},
-                 {"query":"mutation($f: Upload!){ upload(file:$f) }","variables":{"f":null}}]"#,
-        );
-        field(
-            &mut body,
-            "map",
-            None,
-            br#"{"0":["0.variables.f","1.variables.f"]}"#,
-        );
-        field(&mut body, "0", Some("a.txt"), b"x");
-        body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
-
-        let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
-        let parts = ::http::Request::builder()
-            .method(Method::POST)
-            .uri("/graphql")
-            .header(header::CONTENT_TYPE, content_type)
-            .header(header::ACCEPT, "application/json")
-            .body(())
-            .expect("request")
-            .into_parts()
-            .0;
-        async fn empty(_: ContextRequest) -> Result<Context, HttpError> {
-            Ok(Context::empty())
-        }
-        let response = match handle(&server, &config, &parts, &body, empty).await {
-            HttpResult::Response(response) => response,
-            HttpResult::Stream(_) => panic!("expected a buffered response"),
-        };
         assert_eq!(response.status, StatusCode::BAD_REQUEST);
     }
 

@@ -1,8 +1,8 @@
 # suku
 
 `suku` is the HTTP server crate for [gurafi](../../README.md). It takes a `gql::Schema` and exposes
-it over HTTP according to the [GraphQL over HTTP](https://graphql.github.io/graphql-over-http/)
-draft, without depending on `gurafi` or any high-level schema builder.
+it over HTTP according to the [GraphQL over HTTP specification](https://http-spec.graphql.org/September2026/)
+(September 2026 edition), without depending on `gurafi` or any high-level schema builder.
 
 ## Design
 
@@ -14,8 +14,8 @@ The crate is split into three layers so that HTTP frameworks never leak into exe
    bytes and a context extractor. It produces either a buffered `HttpResponse` or an `SseResponse`
    with a byte stream. It has no dependency on Axum, Tokio or a socket.
 3. **`suku::axum`** — a builder that turns a `Server` into an `axum::Router`, reads the body with a
-   limit and adapts `HttpResult` to an Axum response. The same route also accepts
-   `graphql-transport-ws` upgrades.
+   limit and adapts `HttpResult` to an Axum response. With the `ws` feature the same route also
+   accepts `graphql-transport-ws` upgrades.
 4. **`suku::ws`** — a framework-neutral protocol driver over a text-message stream, so the
    WebSocket state machine is tested without a socket.
 
@@ -25,25 +25,31 @@ directly, the protocol tests drive `ws::serve` over channels, and the Axum tests
 
 ## Feature flags
 
+The GraphQL over HTTP specification is always implemented. Everything beyond it is opt-in.
+
 | Feature | Default | Purpose |
 | --- | --- | --- |
 | `axum` | yes | Axum router and authentication helper. |
-| `ws` | yes | WebSocket subscriptions via `graphql-transport-ws`; implies `axum`. |
-| `multipart` | yes | Multipart file uploads; uses `multer`. |
+| `sse` | no | Server-sent-event subscriptions (`text/event-stream`). A transport extension. |
+| `ws` | no | WebSocket subscriptions via `graphql-transport-ws`; implies `axum`. |
+| `multipart` | no | Multipart file uploads; uses `multer`. A community specification. |
 | `vendored-graphiql` | no | Self-contained GraphiQL page with pinned browser assets. |
 | `tracing` | no | Request spans, and `gql/tracing`. |
 
 ```toml
-# Axum and uploads, no WebSocket.
-suku = { version = "0.1.2", default-features = false, features = ["axum", "multipart"] }
+# The specification's HTTP endpoint.
+suku = { version = "0.1.2" }
 
-# Axum and WebSocket, no uploads.
-suku = { version = "0.1.2", default-features = false, features = ["axum", "ws"] }
+# Add subscription streaming over server-sent events.
+suku = { version = "0.1.2", features = ["sse"] }
+
+# Add uploads and WebSocket subscriptions.
+suku = { version = "0.1.2", features = ["multipart", "ws"] }
 ```
 
 `GraphQL::websocket(false)` is a runtime switch for one mount. When WebSocket support is absent (or
-switched off), an upgrade request falls through to ordinary `GET` handling rather than being
-misinterpreted.
+switched off), an upgrade request falls through to ordinary `GET` handling (usually GraphiQL or a `422`
+request error) rather than being misinterpreted.
 
 ## Building a server
 
@@ -57,7 +63,6 @@ let server = Server::new(schema)
     .max_complexity(1_000)
     .max_errors(50)
     .max_body_bytes(512 * 1024)
-    .max_batch_size(10)
     .batch_concurrency(8);
 # let _ = server;
 # }
@@ -70,11 +75,10 @@ let server = Server::new(schema)
 | `max_complexity` | `100_000` | Maximum estimated operation cost. |
 | `max_breadth` | `1_000` | Maximum distinct response keys in one selection set. |
 | `max_errors` | `100` | Errors reported before execution stops adding them. |
-| `max_body_bytes` | 1 MiB | HTTP body limit; `0` disables it. |
+| `max_body_bytes` | 1 MiB | HTTP body and `GET` query-string limit; `0` disables it. |
 | `timeout` | `30s` | Wall-clock timeout for one operation or subscription setup. |
 | `max_concurrency` | `16` | Sibling fields resolved concurrently per operation; `0` is unlimited. Mutations stay serial. |
-| `max_batch_size` | `16` | Maximum operations in a batch; `0` disables it. |
-| `batch_concurrency` | `16` | Operations executed concurrently in a batch. |
+| `batch_concurrency` | `16` | Operations executed concurrently by the in-process `execute_batch` helper. |
 
 `Server` clones cheaply (one `Arc`), so it can be mounted in several routers or shared with
 `Arc<Server>` without changing behaviour.
@@ -140,7 +144,7 @@ trait object when the formatter is a named type.
 
 Coverage is deliberately complete:
 
-* single operations and every response in a batch (in request order);
+* single operations, and every response from `execute_batch` (in request order);
 * persisted operations, including errors from resolving an identifier;
 * subscription setup errors and every event in the stream;
 * request errors produced by the HTTP layer: malformed JSON, invalid parameters, missing queries,
@@ -206,27 +210,24 @@ object keys in `from_json_str`/`from_json_slice` are rejected rather than silent
 value; a pre-parsed `serde_json::Value` cannot represent duplicates, so only the text and slice
 loaders can detect them.
 
-Requests may send only an identifier:
+Requests may send only an identifier. The specification reserves `extensions` for implementer data,
+so the identifier lives there rather than in a non-standard top-level field:
 
 ```json
-{ "id": "hello" }
+{ "extensions": { "persistedQuery": { "id": "hello" } } }
 { "extensions": { "persistedQuery": { "version": 1, "sha256Hash": "hello" } } }
 ```
 
-`doc_id`, `documentId`, `queryId`, `extensions.id` and `extensions.hash` are also accepted. GET
-requests may omit `query` when they carry an identifier, including an APQ-style hash in the
-`extensions` query-string parameter:
+`extensions.persistedQuery.id` is this crate's shape; `sha256Hash` is Apollo's automatic persisted
+query spelling. Both are opaque keys. GET requests may omit `query` when they carry an identifier
+in the `extensions` query-string parameter:
 
 ```text
 GET /graphql?extensions={"persistedQuery":{"version":1,"sha256Hash":"hello"}}
 ```
 
-The `X-Persisted-Query-Id` and `X-Query-Id` headers are a fallback: they apply only when the
-request itself carries no identifier, whether as a top-level `id`/`doc_id`/`documentId`/`queryId`
-or in `extensions`. They never override an identifier from the request. For a batch the header
-fills in every item that has no identifier of its own; the batch size limit bounds how many
-operations one header can select, and each item still runs with its own variables and limits. Send
-per-item identifiers when one header should not fan out.
+There is no custom header fallback. Send the identifier in `extensions`, where the specification
+puts implementer-defined data.
 
 If an identifier matches, the registered text wins and any request `query` text is ignored. An
 `operationName` on the request must name the prepared operation (or match an unnamed prepared
@@ -237,8 +238,8 @@ supplied operation: Apollo APQ's "hash miss then send the query" flow only works
 and a later request with the same hash still needs the query text unless the operation was loaded
 into the manifest at startup. In allowlist mode every request must resolve to a registered query;
 otherwise the response contains `PersistedQueryNotFound` with
-`extensions.code = "PERSISTED_QUERY_NOT_FOUND"`. The HTTP status follows normal request-error
-handling: 400 for `application/graphql-response+json`, 200 for legacy `application/json`.
+`extensions.code = "PERSISTED_QUERY_NOT_FOUND"`. An unresolved identifier is a request error and
+uses status `422 Unprocessable Content`.
 
 Prepared queries hold the exact [`gql::Schema`] instance they were prepared against. Installing a
 registry built for schema A on a `Server` for schema B is rejected at execution with a GraphQL
@@ -247,32 +248,65 @@ Prepare against the clone the server owns (for example `server.schema().clone()`
 built schema that merely has the same types.
 
 Prepared subscriptions are supported. Setup and every source event reuse the prepared document,
-and the HTTP layer emits them over server-sent events (`Accept: text/event-stream`) exactly as it
-does for normal subscriptions.
+and, with the `sse` feature, the HTTP layer emits them over server-sent events
+(`Accept: text/event-stream`) exactly as it does for normal subscriptions.
 
 ## HTTP behaviour
 
 ### Methods and content types
 
-- `GET` reads `query`, `variables`, `operationName` and `extensions` from the query string.
-  `variables` and `extensions` are JSON-encoded objects.
-- `POST` requires `Content-Type: application/json` (the `charset` parameter is ignored), or
-  `multipart/form-data` for a GraphQL multipart request when the `multipart` feature is enabled.
-  The JSON body is either one request object or a non-empty JSON array for a batch.
+- `GET` reads `query`, `variables`, `operationName` and `extensions` from the query string using
+  `application/x-www-form-urlencoded` (WHATWG `URLSearchParams`). `variables` and `extensions` are
+  JSON-encoded objects. Unknown parameters are ignored.
+- `HEAD` is handled like `GET` and returns the same headers with no body, as RFC 9110 requires of
+  a general-purpose server.
+- `POST` requires `Content-Type: application/json`, optionally with `charset=utf-8`. The body is
+  one GraphQL-over-HTTP request object. JSON arrays are rejected (`422`): batching is not part of
+  the specification.
+- `application/graphql-response+json` is a response media type and is **not** accepted as a
+  request `Content-Type`.
+- `multipart/form-data` is accepted only with the `multipart` feature; see below.
 - `GET` with `Upgrade: websocket` and `Sec-WebSocket-Protocol: graphql-transport-ws` is handled as
   a WebSocket connection when the `ws` feature is enabled; see below.
-- Any other method returns `405 Method Not Allowed` with `Allow: GET, POST`.
+- Any other method returns `405 Method Not Allowed` with `Allow: GET, HEAD, POST`.
 - A missing or unsupported `Content-Type` returns `415 Unsupported Media Type`.
+
+### Status codes
+
+The status follows the GraphQL result, not the other way around:
+
+| Result | Status |
+| --- | --- |
+| `data` present, no `errors` | `200 OK` |
+| `data` present, with `errors` | `294 Partial Success` |
+| document cannot be parsed | `400 Bad Request` |
+| validation, operation selection or variable coercion failed | `422 Unprocessable Content` |
+| not a well-formed GraphQL-over-HTTP request (including a batch array) | `422 Unprocessable Content` |
+| malformed JSON body | `400 Bad Request` |
+| mutation or subscription over `GET` | `405 Method Not Allowed` (`Allow: POST`) |
+| unsupported method | `405 Method Not Allowed` (`Allow: GET, HEAD, POST`) |
+| unsupported request media type | `415 Unsupported Media Type` |
+| no acceptable response media type | `406 Not Acceptable` |
+| request body too large | `413 Payload Too Large` |
+| URI (query string) too large | `414 URI Too Long` |
+| server-side operation timeout | `504 Gateway Timeout` |
+| authentication denial | the extractor's status, normally `401`/`403` |
+
+`294` is the specification's recommended code for partial success. Clients that do not recognise
+it must treat it as the `x00` of its class, i.e. like `200 OK`. Intermediaries can still log the
+request as not fully successful.
 
 ### Content negotiation
 
-- `application/json` is the legacy response type: execution and request errors both use status
-  200, except malformed requests (JSON, parameters, batches), which are 400.
-- `application/graphql-response+json` is the modern response type. A response with `errors` and no
-  `data` is a request error and gets status 400.
+- `application/graphql-response+json` is the specification's response type and the default when
+  `Accept` is absent.
+- `application/json` is the legacy response type. A request that accepts only `application/json`
+  is processed with the same status codes, but a 2xx response uses
+  `Content-Type: application/json`. Non-2xx responses keep `application/graphql-response+json`,
+  as the specification recommends.
 - If both are acceptable, the higher quality value wins; a tie prefers
   `application/graphql-response+json`.
-- If nothing acceptable is listed, the server returns 406 with a legacy JSON error body.
+- If nothing acceptable is listed, the server returns `406 Not Acceptable`.
 
 Every GraphQL response carries `Vary: Accept` and `Cache-Control: no-store`.
 
@@ -315,7 +349,8 @@ GraphiQL itself makes requests with `Accept: */*`, so the page and the API can s
 
 ### Subscriptions
 
-A subscription request with `Accept: text/event-stream` is executed with `gql::subscribe` and
+Subscriptions are outside the GraphQL over HTTP specification. With the `sse` feature, a
+subscription request with `Accept: text/event-stream` is executed with `gql::subscribe` and
 streamed as server-sent events:
 
 ```
@@ -328,9 +363,11 @@ data: {"data":{"countdown":2}}
 event: complete
 ```
 
-Validation or setup errors are returned as a JSON response before the stream starts (status 400),
-never as a broken stream. A subscription requested without `text/event-stream` receives a clear
-GraphQL error; subscriptions cannot be batched.
+Validation or setup errors are returned as a JSON response before the stream starts (`400` for a
+parse failure, `422` for a validation or coercion failure), never as a broken stream. A
+subscription requested without `text/event-stream` receives `422` with a clear GraphQL error when
+JSON is acceptable, or `406` when `text/event-stream` is the only acceptable type and the feature
+is disabled. Subscriptions are `POST`-only and cannot be batched.
 
 ### WebSocket (`graphql-transport-ws`)
 
@@ -397,12 +434,13 @@ results or limits.
 
 ### Multipart uploads
 
-With the default `multipart` feature, a `POST` with `Content-Type: multipart/form-data` implements
-the [GraphQL multipart request specification](https://github.com/jaydenseric/graphql-multipart-request-spec).
-The body contains three kinds of field, in this order:
+With the `multipart` feature, a `POST` with `Content-Type: multipart/form-data` implements the
+[GraphQL multipart request specification](https://github.com/jaydenseric/graphql-multipart-request-spec).
+Multipart requests are not part of GraphQL over HTTP; enable the feature explicitly. The body
+contains three kinds of field, in this order:
 
-1. `operations` — the JSON request object (or array for a batch), with each file replaced by
-   `null`;
+1. `operations` — one JSON request object, with each file replaced by `null`. Batching is not
+   supported;
 2. `map` — a JSON object from a file field name to an array of operations paths;
 3. one file part per map entry, named by its key.
 
@@ -414,8 +452,7 @@ curl http://localhost:3000/graphql \
 ```
 
 Files may be nested anywhere under `variables` (`variables.input.avatar`) and lists are indexed
-(`variables.files.0`). A batch prefixes every path with the request index
-(`0.variables.file`). One file may be mapped to several paths; the byte buffer is shared. Fields
+(`variables.files.0`). One file may be mapped to several paths; the byte buffer is shared. Fields
 must be ordered as above, and file field names must be listed in `map` — an unknown or duplicate
 file part is rejected rather than ignored.
 
@@ -499,10 +536,8 @@ structure but not streaming a file directly from the socket into a resolver; bou
 
 The transport enforces `max_body_bytes` before authentication and parsing. The Axum adapter also
 passes the limit to `to_bytes`, so an oversized body is rejected with 413 without being buffered in
-full.
-
-Batch execution runs in chunks of `batch_concurrency` with `futures::future::join_all`, preserving
-request order while bounding concurrency.
+full. `GET` query strings are bounded by the same setting and rejected with `414` when they exceed
+it.
 
 ## Authentication
 
@@ -553,21 +588,24 @@ and reports denied fields as GraphQL errors, so partial responses stay correct.
 
 ## Batches
 
-A batch is a JSON array of requests. Empty arrays are request errors, arrays larger than the
-configured limit are rejected, and each operation still gets its own response (including its own
-variable-conversion errors). Batching subscriptions is not supported.
+Batching is not part of the GraphQL over HTTP specification (the specification has a future
+proposal for it), so the HTTP endpoint accepts exactly one operation per request. `Server` still
+exposes `execute_batch` for applications that execute several operations in-process; it runs in
+chunks of `batch_concurrency` and preserves request order.
 
 ## Production notes
 
 - The crate forbids `unsafe` and its request paths avoid `unwrap`/`expect`/panics.
-- SSE is streamed chunk by chunk; the server never buffers an entire subscription.
-- WebSocket subscriptions multiplex operations per connection. Size, initialisation timeout and
+- With `sse`, subscriptions are streamed chunk by chunk; the server never buffers an entire
+  subscription.
+- With `ws`, subscriptions multiplex operations per connection. Size, initialisation timeout and
   active-operation count are bounded by `suku::ws::WsConfig`; execution limits are shared with
   HTTP. Proxies must forward `Upgrade`/`Connection` and allow idle sockets for as long as the
   longest subscription.
-- Uploads are buffered in memory up to `max_body_bytes`. Set the same limit on the reverse proxy
-  (`client_max_body_size` in nginx) and leave room for the JSON fields and multipart framing.
-  Files are never written to disk by the transport; a resolver decides where the bytes go.
+- With `multipart`, uploads are buffered in memory up to `max_body_bytes`. Set the same limit on
+  the reverse proxy (`client_max_body_size` in nginx) and leave room for the JSON fields and
+  multipart framing. Files are never written to disk by the transport; a resolver decides where
+  the bytes go.
 - Errors exposed to clients are GraphQL messages, not Rust error chains. Install
   `Server::format_error` (and consider `mask_internal`) to redact resolver details while keeping
   `extensions.code`, locations and response paths. The formatter applies to WebSocket `error`

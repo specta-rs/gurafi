@@ -129,11 +129,11 @@ code generation.
 
 `suku` turns a `gql::Schema` into an HTTP service:
 
-- POST/GET GraphQL over HTTP with correct content negotiation and status codes
-- JSON batching
-- Server-sent-event subscriptions
+- GraphQL over HTTP (September 2026 edition) with correct content negotiation and status codes
+- Opt-in server-sent-event subscriptions (`sse`), WebSocket subscriptions (`ws`) and multipart
+  uploads (`multipart`)
 - GraphiQL
-- Request limits (body, depth, complexity, errors, batch size)
+- Request limits (body, depth, complexity and errors)
 - A context extractor for authentication (Bearer tokens, cookies, headers)
 - Field authorization through `gql::Authorizer`
 

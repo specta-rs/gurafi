@@ -10,7 +10,7 @@
 use core::fmt;
 
 use gql::{GraphQLError, Object, Value};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value as JsonValue};
 
 /// A file attached to a path inside a request's variables.
@@ -43,6 +43,10 @@ impl UploadBinding {
 
 /// A GraphQL-over-HTTP request body.
 ///
+/// This mirrors the four parameters defined by the GraphQL over HTTP specification:
+/// `query`, `operationName`, `variables` and `extensions`. No other top-level members are
+/// interpreted; servers must ignore members they do not understand.
+///
 /// ```json
 /// {
 ///   "query": "query Greeting($name: String!) { hello(name: $name) }",
@@ -55,21 +59,14 @@ impl UploadBinding {
 pub struct GraphQLRequest {
     /// The GraphQL document to execute.
     ///
-    /// This may be omitted for a persisted request that supplies an identifier; see
-    /// [`GraphQLRequest::prepared_id`].
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub query: String,
-    /// A persisted-query identifier.
-    ///
-    /// Relay sends this as `id`; several other clients use `doc_id`, `documentId` or `queryId`.
+    /// This may be omitted for a persisted request that supplies an identifier in
+    /// `extensions.persistedQuery`; see [`GraphQLRequest::prepared_id`].
     #[serde(
         default,
-        alias = "doc_id",
-        alias = "documentId",
-        alias = "queryId",
-        skip_serializing_if = "Option::is_none"
+        deserialize_with = "deserialize_query",
+        skip_serializing_if = "String::is_empty"
     )]
-    pub id: Option<String>,
+    pub query: String,
     /// Selects one operation when the document contains several.
     #[serde(
         rename = "operationName",
@@ -80,17 +77,28 @@ pub struct GraphQLRequest {
     /// JSON variable values. Converted to [`gql::Object`] just before execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variables: Option<Map<String, JsonValue>>,
-    /// Free-form request extensions, reserved for things like persisted queries.
+    /// Free-form request extensions.
+    ///
+    /// Persisted-query identifiers live here, under `extensions.persistedQuery`, because the
+    /// specification reserves `extensions` for implementer-defined data and forbids additional
+    /// top-level members.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extensions: Option<Map<String, JsonValue>>,
     /// Files parsed from a multipart request, in the order they were mapped.
     ///
     /// Ordinary JSON requests leave this empty. Multipart requests populate it from the
-    /// specification's `map` field, and [`GraphQLRequest::variables_object`] substitutes each
-    /// [`gql::Upload`] for the `null` at its path. The field is transport state, not part of the
-    /// GraphQL-over-HTTP JSON body, so it is skipped during serialization.
+    /// multipart specification's `map` field, and [`GraphQLRequest::variables_object`]
+    /// substitutes each [`gql::Upload`] for the `null` at its path. The field is transport state,
+    /// not part of the GraphQL-over-HTTP JSON body, so it is skipped during serialization.
     #[serde(skip)]
     pub uploads: Vec<UploadBinding>,
+}
+
+fn deserialize_query<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl GraphQLRequest {
@@ -99,7 +107,6 @@ impl GraphQLRequest {
     pub fn new(query: impl Into<String>) -> Self {
         Self {
             query: query.into(),
-            id: None,
             operation_name: None,
             variables: None,
             extensions: None,
@@ -109,59 +116,54 @@ impl GraphQLRequest {
 
     /// Create a request that identifies a persisted operation instead of sending its text.
     ///
-    /// The request has no `query`; a server with prepared queries resolves `id` to the registered
-    /// document before execution.
+    /// The request has no `query`; a server with prepared queries resolves the identifier to the
+    /// registered document before execution.
     #[must_use]
     pub fn persisted(id: impl Into<String>) -> Self {
-        Self {
+        let mut request = Self {
             query: String::new(),
-            id: Some(id.into()),
             operation_name: None,
             variables: None,
             extensions: None,
             uploads: Vec::new(),
-        }
+        };
+        request.set_persisted_id(id);
+        request
     }
 
     /// Attach a persisted-query identifier.
     #[must_use]
     pub fn with_id(mut self, id: impl Into<String>) -> Self {
-        self.id = Some(id.into());
+        self.set_persisted_id(id);
         self
+    }
+
+    fn set_persisted_id(&mut self, id: impl Into<String>) {
+        let mut persisted = Map::new();
+        persisted.insert("id".to_owned(), JsonValue::String(id.into()));
+        self.extensions
+            .get_or_insert_with(Map::new)
+            .insert("persistedQuery".to_owned(), JsonValue::Object(persisted));
     }
 
     /// The persisted-query identifier carried by this request, if any.
     ///
-    /// Top-level `id` (and its `doc_id`/`documentId`/`queryId` aliases) wins. Otherwise common
-    /// extension shapes are checked: top-level extension ids and hashes, then Apollo's automatic
-    /// persisted queries extension (`extensions.persistedQuery.sha256Hash`, and the `hash`/`id`
-    /// spellings other clients use).
+    /// The identifier is read from `extensions.persistedQuery`, using `id` or Apollo's
+    /// `sha256Hash` spelling. Identifiers are opaque keys: an id spelled `sha256Hash` is looked up
+    /// as-is, with no hash verification.
     #[must_use]
     pub fn prepared_id(&self) -> Option<&str> {
-        if let Some(id) = self.id.as_deref().filter(|id| !id.is_empty()) {
-            return Some(id);
-        }
-        let extensions = self.extensions.as_ref()?;
-        for key in ["id", "doc_id", "documentId", "queryId", "hash"] {
-            if let Some(id) = extensions
-                .get(key)
+        let persisted = self
+            .extensions
+            .as_ref()?
+            .get("persistedQuery")?
+            .as_object()?;
+        ["sha256Hash", "id"].iter().find_map(|key| {
+            persisted
+                .get(*key)
                 .and_then(JsonValue::as_str)
                 .filter(|id| !id.is_empty())
-            {
-                return Some(id);
-            }
-        }
-        let persisted = extensions.get("persistedQuery")?.as_object()?;
-        for key in ["sha256Hash", "hash", "id", "queryId", "documentId"] {
-            if let Some(id) = persisted
-                .get(key)
-                .and_then(JsonValue::as_str)
-                .filter(|id| !id.is_empty())
-            {
-                return Some(id);
-            }
-        }
-        None
+        })
     }
 
     /// Parse one request from JSON bytes.
@@ -259,78 +261,6 @@ impl GraphQLRequest {
             operation_name: self.operation_name.as_deref(),
             variables,
         }
-    }
-}
-
-/// A request body, which is either a single operation or a batch.
-#[derive(Clone, Debug, PartialEq)]
-pub enum RequestPayload {
-    /// One GraphQL operation.
-    Single(GraphQLRequest),
-    /// A JSON array of operations, executed concurrently.
-    Batch(Vec<GraphQLRequest>),
-}
-
-impl RequestPayload {
-    /// Parse a JSON request body.
-    ///
-    /// A leading `[` selects batch parsing. Empty batches and batches larger than
-    /// `max_batch_size` are rejected. Passing `0` for `max_batch_size` disables the size limit.
-    ///
-    /// # Errors
-    ///
-    /// Returns a request error for malformed JSON, an invalid payload shape, or a batch that
-    /// violates the configured limits.
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(
-            skip_all,
-            level = "debug",
-            name = "suku.parse",
-            fields(body_bytes = body.len(), max_batch_size)
-        )
-    )]
-    pub fn from_json_slice(body: &[u8], max_batch_size: usize) -> Result<Self, RequestError> {
-        let is_batch = body
-            .iter()
-            .copied()
-            .find(|byte| !byte.is_ascii_whitespace())
-            .is_some_and(|byte| byte == b'[');
-
-        if is_batch {
-            let batch: Vec<GraphQLRequest> = serde_json::from_slice(body)
-                .map_err(|error| RequestError::new(format!("Invalid batch request: {error}")))?;
-            if batch.is_empty() {
-                return Err(RequestError::new(
-                    "A batch request must contain at least one operation.",
-                ));
-            }
-            if max_batch_size != 0 && batch.len() > max_batch_size {
-                return Err(RequestError::new(format!(
-                    "A batch request may contain at most {max_batch_size} operations."
-                )));
-            }
-            Ok(Self::Batch(batch))
-        } else {
-            let request: GraphQLRequest = serde_json::from_slice(body)
-                .map_err(|error| RequestError::new(format!("Invalid GraphQL request: {error}")))?;
-            Ok(Self::Single(request))
-        }
-    }
-
-    /// The requests in this payload.
-    #[must_use]
-    pub fn requests(&self) -> &[GraphQLRequest] {
-        match self {
-            Self::Single(request) => core::slice::from_ref(request),
-            Self::Batch(requests) => requests,
-        }
-    }
-
-    /// Whether this is a batch payload.
-    #[must_use]
-    pub const fn is_batch(&self) -> bool {
-        matches!(self, Self::Batch(_))
     }
 }
 
@@ -596,8 +526,34 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_batches() {
-        let error = RequestPayload::from_json_slice(b"[]", 10).expect_err("empty batch");
-        assert!(error.message().contains("at least one"));
+    fn persisted_ids_live_in_extensions() {
+        let request = GraphQLRequest::persisted("abc");
+        assert_eq!(request.prepared_id(), Some("abc"));
+        assert!(request.query.is_empty());
+
+        let apollo: GraphQLRequest = serde_json::from_str(
+            r#"{"extensions":{"persistedQuery":{"version":1,"sha256Hash":"def"}}}"#,
+        )
+        .expect("valid request");
+        assert_eq!(apollo.prepared_id(), Some("def"));
+    }
+
+    #[test]
+    fn top_level_identifiers_are_ignored() {
+        let request: GraphQLRequest =
+            serde_json::from_str(r#"{"id":"custom","query":"{ hello }"}"#).expect("valid request");
+        assert_eq!(request.prepared_id(), None);
+        assert_eq!(request.query, "{ hello }");
+    }
+
+    #[test]
+    fn null_optional_members_are_absent() {
+        let request: GraphQLRequest = serde_json::from_str(
+            r#"{"query":"{ hello }","operationName":null,"variables":null,"extensions":null}"#,
+        )
+        .expect("valid request");
+        assert_eq!(request.operation_name, None);
+        assert_eq!(request.variables, None);
+        assert_eq!(request.extensions, None);
     }
 }

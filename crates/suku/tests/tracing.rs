@@ -22,7 +22,6 @@ use tracing::{
 struct SpanData {
     name: String,
     fields: BTreeMap<String, String>,
-    parent: Option<usize>,
 }
 
 #[allow(dead_code)]
@@ -117,17 +116,12 @@ impl Subscriber for Capture {
     fn new_span(&self, attributes: &Attributes<'_>) -> Id {
         let mut fields = BTreeMap::new();
         attributes.record(&mut Collector(&mut fields));
-        let parent = attributes
-            .parent()
-            .and_then(|id| self.span_index(id))
-            .or_else(|| self.current().and_then(|id| self.span_index(&id)));
         let id = Id::from_u64(self.next_id.fetch_add(1, Ordering::Relaxed));
         let mut captured = self.captured.lock().expect("capture lock");
         let index = captured.spans.len();
         captured.spans.push(SpanData {
             name: attributes.metadata().name().to_owned(),
             fields,
-            parent,
         });
         captured.by_id.insert(id.clone(), index);
         captured.metadata.insert(id.clone(), attributes.metadata());
@@ -260,16 +254,14 @@ fn request_span_records_method_operation_and_status() {
         Some("200")
     );
 
-    let process = find_span(&captured, "suku.process");
-    assert_eq!(process.len(), 1);
+    let execute = find_span(&captured, "suku.execute");
+    assert_eq!(execute.len(), 1);
     assert_eq!(
-        process[0].fields.get("operation").map(String::as_str),
+        execute[0].fields.get("operation").map(String::as_str),
         Some("Hello")
     );
-    assert!(find_span(&captured, "suku.execute").len() == 1);
     assert!(find_span(&captured, "suku.parse").len() == 1);
     assert!(find_span(&captured, "suku.serialize").len() == 1);
-    assert_eq!(process[0].parent, Some(0));
 
     // The gql spans are children of the server's execute span, not of the transport root.
     assert!(captured.spans.iter().any(|span| span.name == "gql.execute"));

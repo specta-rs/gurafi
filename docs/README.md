@@ -80,7 +80,7 @@ data. When a page says **model**, it means the backing model.
 | [`gurafi`](../crates/gurafi) | Rust-first schema builder and type-safe DX |
 | [`gurafi-macros`](../crates/gurafi-macros) | Derives for `Object`, `Args`, `Input`, `Enum`, `Scalar`, `Union`, `ErrorUnion` |
 | [`gurafi-relay`](../crates/gurafi-relay) | Relay global IDs, `Node`, connections and mutation payloads |
-| [`suku`](../crates/suku) | GraphQL over HTTP, batching, SSE subscriptions and error masking |
+| [`suku`](../crates/suku) | GraphQL over HTTP, optional SSE/WebSocket subscriptions, uploads and error masking |
 
 The crates are deliberately independent: `gql` knows nothing about HTTP or Rust models, `gurafi`
 builds only on the public `gql` API, and `suku` only understands `gql::Schema`.

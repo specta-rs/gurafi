@@ -430,7 +430,7 @@ async fn prepared_queries_resolve_by_identifier() {
     harness.send(json!({
         "id": "p1",
         "type": "subscribe",
-        "payload": { "id": "hello" },
+        "payload": { "extensions": { "persistedQuery": { "id": "hello" } } },
     }));
 
     let next = harness.next_json().await;

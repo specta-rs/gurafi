@@ -20,10 +20,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check workspace
-        run: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --all-features
 
       - name: Test workspace
-        run: cargo test --workspace
+        run: cargo test --workspace --all-features
 
       # `cargo test --workspace` runs an unoptimised build, and its larger frames need more than
       # a 2 MiB worker stack at the parser's depth limit (see `crates/gql/tests/support/stack.rs`).

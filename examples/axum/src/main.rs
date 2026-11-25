@@ -44,7 +44,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_complexity(500)
         .max_errors(50)
         .max_body_bytes(1024 * 1024)
-        .max_batch_size(10)
         .batch_concurrency(8)
         .timeout(Duration::from_secs(15));
 

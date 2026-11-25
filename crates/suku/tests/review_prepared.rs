@@ -62,7 +62,7 @@ async fn get_with_only_extension_id_is_rejected_before_resolution() {
 
     let response = get(
         &server,
-        "/graphql?extensions=%7B%22id%22%3A%22hello%22%7D",
+        "/graphql?extensions=%7B%22persistedQuery%22%3A%7B%22id%22%3A%22hello%22%7D%7D",
         &[(header::ACCEPT, "application/json")],
     )
     .await;
@@ -112,7 +112,11 @@ async fn registry_prepared_against_another_schema_runs_against_that_schema() {
 
     // The server's schema has no `secret` field, so the request must not be able to reach it.
     let server = Server::new(support::schema()).prepared_queries(prepared);
-    let response = post(&server, r#"{"id":"secret"}"#).await;
+    let response = post(
+        &server,
+        r#"{"extensions":{"persistedQuery":{"id":"secret"}}}"#,
+    )
+    .await;
 
     let body = body(&response);
     assert!(
@@ -121,57 +125,6 @@ async fn registry_prepared_against_another_schema_runs_against_that_schema() {
             .is_none(),
         "server executed a prepared query against a schema it was not built for: {body}"
     );
-}
-
-#[tokio::test]
-async fn header_id_overrides_extension_id_even_though_body_has_one() {
-    let schema = support::schema();
-    let prepared = PreparedQueries::from_map(
-        &schema,
-        [
-            ("hello", "{ hello }"),
-            ("other", "{ echo(message: \"other\") }"),
-        ],
-    )
-    .expect("manifest");
-    let server = Server::new(schema).prepared_queries(prepared);
-
-    let name = header::HeaderName::from_static("x-persisted-query-id");
-    let response = post_with_headers(
-        &server,
-        r#"{"extensions":{"persistedQuery":{"sha256Hash":"other"}}}"#,
-        &[(name, "hello")],
-    )
-    .await;
-
-    let body = body(&response);
-    assert!(
-        body["data"].get("echo").is_some(),
-        "the header should only fill in a missing id, but it overrode the extension id: {body}"
-    );
-}
-
-async fn post_with_headers(
-    server: &Server,
-    body: &str,
-    headers: &[(header::HeaderName, &str)],
-) -> suku::HttpResponse {
-    let mut all = vec![
-        (header::CONTENT_TYPE, "application/json"),
-        (header::ACCEPT, "application/json"),
-    ];
-    all.extend_from_slice(headers);
-    let parts = support::parts(Method::POST, "/graphql", &all);
-    buffered(
-        handle(
-            server,
-            &HttpConfig::default(),
-            &parts,
-            body.as_bytes(),
-            support::empty_context,
-        )
-        .await,
-    )
 }
 
 #[test]
@@ -204,7 +157,7 @@ async fn persisted_request_operation_name_must_match_the_prepared_operation() {
 
     let response = post(
         &server,
-        r#"{"id":"echo","operationName":"Other","variables":{"message":"hi"}}"#,
+        r#"{"operationName":"Other","variables":{"message":"hi"},"extensions":{"persistedQuery":{"id":"echo"}}}"#,
     )
     .await;
     let first = body(&response);
@@ -219,44 +172,9 @@ async fn persisted_request_operation_name_must_match_the_prepared_operation() {
 
     let response = post(
         &server,
-        r#"{"id":"echo","operationName":"Echo","variables":{"message":"hi"}}"#,
+        r#"{"operationName":"Echo","variables":{"message":"hi"},"extensions":{"persistedQuery":{"id":"echo"}}}"#,
     )
     .await;
     let body = body(&response);
     assert_eq!(body["data"]["echo"], "hi", "{body}");
-}
-
-#[tokio::test]
-async fn header_id_is_a_per_item_fallback_for_batches() {
-    let schema = support::schema();
-    let prepared = PreparedQueries::from_map(
-        &schema,
-        [
-            ("hello", "{ hello }"),
-            ("other", "{ echo(message: \"other\") }"),
-        ],
-    )
-    .expect("manifest");
-    let server = Server::new(schema).prepared_queries(prepared);
-
-    let name = header::HeaderName::from_static("x-persisted-query-id");
-    let response = post_with_headers(
-        &server,
-        r#"[
-            {"extensions":{"persistedQuery":{"sha256Hash":"other"}}},
-            {}
-        ]"#,
-        &[(name, "hello")],
-    )
-    .await;
-
-    let body = body(&response);
-    assert_eq!(
-        body[0]["data"]["echo"], "other",
-        "first item's extension id must win over the header: {body}"
-    );
-    assert_eq!(
-        body[1]["data"]["hello"], "world",
-        "the header must still fill in an item with no identifier: {body}"
-    );
 }

@@ -5,13 +5,12 @@ use gql::{
     ExecutionOptions, Field, InputValue, Object, ObjectType, ScalarType, Schema, TypeRef, Value,
 };
 use serde_json::json;
-use suku::{GraphQLRequest, RequestPayload};
+use suku::GraphQLRequest;
 
 #[test]
 fn request_serializes_operation_name_as_camel_case() {
     let request = GraphQLRequest {
         query: "{ hello }".to_owned(),
-        id: None,
         operation_name: Some("Greeting".to_owned()),
         variables: Some(
             json!({ "name": "Ada" })
@@ -179,37 +178,36 @@ fn http_variables_preserve_64_bit_integers_for_every_input_type() {
 }
 
 #[test]
-fn batch_payloads_are_parsed_and_limited() {
-    let payload =
-        RequestPayload::from_json_slice(br#"[{"query":"{ hello }"},{"query":"{ hello }"}]"#, 4)
-            .expect("batch");
-    assert!(payload.is_batch());
-    assert_eq!(payload.requests().len(), 2);
+fn persisted_identifiers_are_read_from_extensions() {
+    let request = GraphQLRequest::persisted("hello");
+    assert_eq!(request.query, "");
+    assert_eq!(request.prepared_id(), Some("hello"));
 
-    let unlimited = RequestPayload::from_json_slice(br#"[{"query":"{ hello }"}]"#, 0)
-        .expect("zero means unlimited");
-    assert_eq!(unlimited.requests().len(), 1);
-
-    let too_many = RequestPayload::from_json_slice(br#"[{"query":"a"},{"query":"b"}]"#, 1)
-        .expect_err("too many");
-    assert!(too_many.message().contains("at most 1"));
-
-    let empty = RequestPayload::from_json_slice(b"[]", 10).expect_err("empty");
-    assert!(empty.message().contains("at least one"));
+    let apollo: GraphQLRequest = serde_json::from_str(
+        r#"{"extensions":{"persistedQuery":{"version":1,"sha256Hash":"abc"}}}"#,
+    )
+    .expect("valid request");
+    assert_eq!(apollo.prepared_id(), Some("abc"));
 }
 
 #[test]
-fn single_payloads_are_detected() {
-    let payload = RequestPayload::from_json_slice(br#"{"query":"{ hello }"}"#, 10).expect("single");
-    assert!(!payload.is_batch());
-    assert_eq!(payload.requests()[0].query, "{ hello }");
+fn unknown_top_level_members_are_ignored() {
+    let request: GraphQLRequest =
+        serde_json::from_str(r#"{"query":"{ hello }","id":"not-a-spec-member"}"#)
+            .expect("valid request");
+    assert_eq!(request.query, "{ hello }");
+    assert_eq!(request.prepared_id(), None);
 }
 
 #[test]
-fn malformed_payloads_report_an_error() {
-    let error =
-        RequestPayload::from_json_slice(br#"[{"query":"{ hello }"}"#, 10).expect_err("bad json");
-    assert!(error.message().contains("Invalid batch request"));
+fn null_optional_members_are_absent() {
+    let request: GraphQLRequest = serde_json::from_str(
+        r#"{"query":"{ hello }","operationName":null,"variables":null,"extensions":null}"#,
+    )
+    .expect("valid request");
+    assert_eq!(request.operation_name, None);
+    assert_eq!(request.variables, None);
+    assert_eq!(request.extensions, None);
 }
 
 #[test]

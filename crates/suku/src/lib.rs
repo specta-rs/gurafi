@@ -1,9 +1,10 @@
-//! A production GraphQL-over-HTTP server built on [`gql`].
+//! A GraphQL-over-HTTP server built on [`gql`].
 //!
-//! `suku` turns a [`gql::Schema`] into an HTTP endpoint. It implements the GraphQL-over-HTTP
-//! request/response protocol, including content negotiation, batches, GraphiQL,
-//! server-sent-event subscriptions, the `graphql-transport-ws` WebSocket protocol and GraphQL
-//! multipart requests, while keeping the execution engine (`gql`) free of transport concerns.
+//! `suku` turns a [`gql::Schema`] into an HTTP endpoint implementing the
+//! [GraphQL over HTTP specification](https://http-spec.graphql.org) (September 2026 edition):
+//! `GET`/`POST` requests, `Accept` negotiation between `application/graphql-response+json` and
+//! legacy `application/json`, and the specification's status codes (including `294 Partial
+//! Success`). The execution engine (`gql`) stays free of transport concerns.
 //!
 //! # Layers
 //!
@@ -11,29 +12,32 @@
 //!   the optional error formatter that redacts messages before a client sees them.
 //! - [`http`] is a transport-agnostic request handler. Any framework can call it with request
 //!   parts and a body.
-//! - [`axum`] mounts a [`Server`] on an Axum router (enabled by the default `axum` feature).
+//! - [`axum`] mounts a [`Server`] on an Axum router (enabled by the `axum` feature).
 //! - `ws` drives one `graphql-transport-ws` connection over any text-message stream (enabled by
-//!   the default `ws` feature, which implies `axum`).
+//!   the `ws` feature, which implies `axum`).
 //!
 //! # Feature flags
+//!
+//! Only `axum` is enabled by default. Everything beyond the GraphQL over HTTP specification is
+//! opt-in.
 //!
 //! | Feature | Default | Purpose |
 //! | --- | --- | --- |
 //! | `axum` | yes | The [`axum`] router and `ExtractContext` integration. |
-//! | `ws` | yes | `graphql-transport-ws` WebSocket subscriptions. Enables `axum`. |
-//! | `multipart` | yes | GraphQL multipart requests; uses `multer`. |
+//! | `sse` | no | Server-sent-event subscriptions (`text/event-stream`). A transport extension. |
+//! | `ws` | no | `graphql-transport-ws` WebSocket subscriptions. A non-HTTP transport. Enables `axum`. |
+//! | `multipart` | no | GraphQL multipart requests (file uploads). A community specification. Uses `multer`. |
 //! | `vendored-graphiql` | no | Self-contained GraphiQL page with pinned browser assets. |
 //! | `tracing` | no | Request spans, and `gql/tracing`. |
 //!
-//! To build without WebSocket support while keeping Axum:
+//! To serve subscriptions over server-sent events:
 //!
 //! ```toml
-//! suku = { version = "0.1.2", default-features = false, features = ["axum", "multipart"] }
+//! suku = { version = "0.1.2", features = ["sse"] }
 //! ```
 //!
-//! A WebSocket upgrade then receives no special handling and falls through to the normal GET
-//! path. To drop file uploads, omit `multipart`; a `multipart/form-data` POST is then rejected with
-//! `415 Unsupported Media Type` exactly like any other non-JSON body.
+//! Without `sse`, a subscription request receives a `406 Not Acceptable` when only
+//! `text/event-stream` is acceptable, or a clear GraphQL error when JSON is acceptable.
 //!
 //! # Example
 //!
@@ -64,14 +68,20 @@
 //!
 //! # Transports
 //!
-//! * **HTTP** — one request or batch per `GET`/`POST`, JSON responses and GraphiQL.
-//! * **SSE** — `POST` + `Accept: text/event-stream` streams subscription events as
-//!   `event: next`/`data:` frames.
-//! * **WebSocket** — `graphql-transport-ws` over an upgrade at the same path. It multiplexes
-//!   queries, mutations and subscriptions, and supports client cancellation. Authentication runs
-//!   once per connection against the upgrade request; every operation reuses that [`Context`].
-//! * **Multipart** — the GraphQL multipart request shape, with files inserted as
-//!   [`gql::Upload`] values into request variables.
+//! * **HTTP** — one `GET` or `POST` per request, with `application/graphql-response+json`
+//!   responses and GraphiQL. This is the specification's scope.
+//! * **SSE** (feature `sse`) — `POST` + `Accept: text/event-stream` streams subscription events
+//!   as `event: next`/`data:` frames. The specification does not define subscriptions.
+//! * **WebSocket** (feature `ws`) — `graphql-transport-ws` over an upgrade at the same path. It
+//!   multiplexes queries, mutations and subscriptions, and supports client cancellation.
+//!   Authentication runs once per connection against the upgrade request; every operation reuses
+//!   that [`Context`].
+//! * **Multipart** (feature `multipart`) — the GraphQL multipart request shape, with files
+//!   inserted as [`gql::Upload`] values into request variables.
+//!
+//! Request batching is not part of the specification and is not supported over HTTP. Use one
+//! request per operation; [`Server::execute_batch`] remains available for callers that execute
+//! several operations in-process.
 //!
 //! See the module documentation of `ws` and `multipart` for the protocol details, and the
 //! crate README for deployment notes.
@@ -95,9 +105,9 @@
 //! # Observability
 //!
 //! The optional `tracing` feature (which also enables `gql/tracing`) emits a `suku.request` span
-//! with method, path, body size, operation, request id, batch size and status, plus children for
-//! parsing, execution, serialization and subscriptions. Transport and extractor failures are WARN
-//! events with a status and code. Request bodies, headers, tokens and variable values are never
+//! with method, path, body size, operation, request id and status, plus children for parsing,
+//! execution, serialization and subscriptions. Transport and extractor failures are WARN events
+//! with a status and code. Request bodies, headers, tokens and variable values are never
 //! recorded. See the repository's `docs/plugins/tracing.md`.
 
 #![doc(
@@ -125,7 +135,7 @@ pub mod ws;
 
 pub use crate::{
     error::{ErrorContext, ErrorFormatter, ErrorKind, INTERNAL_ERROR_MESSAGE, mask_internal},
-    request::{GraphQLRequest, RequestError, RequestPayload, UploadBinding, json_to_graphql},
+    request::{GraphQLRequest, RequestError, UploadBinding, json_to_graphql},
     response::{
         GraphQLResponse, ResponseExt, error_json_bytes, error_response, to_json, to_json_bytes,
     },
@@ -142,9 +152,7 @@ pub use crate::prepared::{
     persisted_query_not_found_error,
 };
 
-pub use crate::server::{
-    DEFAULT_BATCH_CONCURRENCY, DEFAULT_MAX_BATCH_SIZE, DEFAULT_MAX_BODY_BYTES,
-};
+pub use crate::server::{DEFAULT_BATCH_CONCURRENCY, DEFAULT_MAX_BODY_BYTES};
 
 pub use crate::http::{
     ContextRequest, ExtractContext, HttpConfig, HttpError, HttpResponse, HttpResult, SseResponse,

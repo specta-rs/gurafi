@@ -365,7 +365,7 @@ async fn transport_rejections_are_formatted() {
     assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(
         json_body(&response)["errors"][0]["message"],
-        "Only GET and POST are supported. (formatted)"
+        "Method not allowed. Supported methods: GET, HEAD, POST. (formatted)"
     );
 
     let post = support::parts(
@@ -389,7 +389,7 @@ async fn transport_rejections_are_formatted() {
     assert_eq!(response.status, StatusCode::NOT_ACCEPTABLE);
     assert_eq!(
         json_body(&response)["errors"][0]["message"],
-        "No acceptable response type; use `application/json` or `application/graphql-response+json`. (formatted)"
+        "No acceptable response type; use `application/graphql-response+json` or `application/json`. (formatted)"
     );
 }
 

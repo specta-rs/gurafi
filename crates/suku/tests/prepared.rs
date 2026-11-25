@@ -114,22 +114,16 @@ fn body(response: &suku::HttpResponse) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn relay_style_id_executes_without_query_text() {
+async fn a_persisted_id_executes_without_query_text() {
     let server = plain_server();
-    let response = post(&server, r#"{"id":"hello"}"#).await;
+    let response = post(
+        &server,
+        r#"{"extensions":{"persistedQuery":{"id":"hello"}}}"#,
+    )
+    .await;
     assert_eq!(response.status, StatusCode::OK);
     let body = body(&response);
     assert_eq!(body["data"]["hello"], "world");
-}
-
-#[tokio::test]
-async fn id_aliases_are_accepted() {
-    let server = plain_server();
-    for key in ["doc_id", "documentId", "queryId"] {
-        let response = post(&server, &format!(r#"{{"{key}":"hello"}}"#)).await;
-        assert_eq!(response.status, StatusCode::OK, "{key}");
-        assert_eq!(body(&response)["data"]["hello"], "world", "{key}");
-    }
 }
 
 #[tokio::test]
@@ -156,7 +150,11 @@ async fn apollo_persisted_query_shape_and_variables() {
 #[tokio::test]
 async fn registered_text_wins_over_supplied_query() {
     let server = plain_server();
-    let response = post(&server, r#"{"id":"hello","query":"{ boom }"}"#).await;
+    let response = post(
+        &server,
+        r#"{"query":"{ boom }","extensions":{"persistedQuery":{"id":"hello"}}}"#,
+    )
+    .await;
     assert_eq!(response.status, StatusCode::OK);
     let body = body(&response);
     assert_eq!(body["data"]["hello"], "world");
@@ -183,7 +181,7 @@ async fn unknown_apq_without_query_is_persisted_query_not_found() {
         r#"{"extensions":{"persistedQuery":{"sha256Hash":"missing"}}}"#,
     )
     .await;
-    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    assert_eq!(response.status, StatusCode::UNPROCESSABLE_ENTITY);
     let body = body(&response);
     assert_eq!(body["errors"][0]["message"], "PersistedQueryNotFound");
     assert_eq!(
@@ -201,16 +199,24 @@ async fn allowlist_rejects_query_text_and_unknown_ids() {
     let schema = support::schema();
     let server = prepared_server(schema).require_prepared(true);
 
-    let known = post(&server, r#"{"id":"hello"}"#).await;
+    let known = post(
+        &server,
+        r#"{"extensions":{"persistedQuery":{"id":"hello"}}}"#,
+    )
+    .await;
     assert_eq!(known.status, StatusCode::OK);
 
     for payload in [
         r#"{"query":"{ hello }"}"#,
-        r#"{"id":"missing","query":"{ hello }"}"#,
-        r#"{"id":"missing"}"#,
+        r#"{"query":"{ hello }","extensions":{"persistedQuery":{"id":"missing"}}}"#,
+        r#"{"extensions":{"persistedQuery":{"id":"missing"}}}"#,
     ] {
         let response = post_graphql_response(&server, payload).await;
-        assert_eq!(response.status, StatusCode::BAD_REQUEST, "{payload}");
+        assert_eq!(
+            response.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{payload}"
+        );
         assert_eq!(
             body(&response)["errors"][0]["message"],
             "PersistedQueryNotFound"
@@ -219,53 +225,34 @@ async fn allowlist_rejects_query_text_and_unknown_ids() {
 }
 
 #[tokio::test]
-async fn get_and_batch_support_persisted_ids() {
+async fn get_supports_persisted_ids_in_extensions() {
     let server = plain_server();
+    let query =
+        serde_urlencoded::to_string([("extensions", r#"{"persistedQuery":{"id":"hello"}}"#)])
+            .expect("query string");
     let response = get(
         &server,
-        "/graphql?id=hello",
-        &[(header::ACCEPT, "application/json")],
+        &format!("/graphql?{query}"),
+        &[(header::ACCEPT, "application/graphql-response+json")],
     )
     .await;
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(body(&response)["data"]["hello"], "world");
-
-    let batch = post(&server, r#"[{"id":"hello"},{"doc_id":"hello"}]"#).await;
-    assert_eq!(batch.status, StatusCode::OK);
-    let values = body(&batch);
-    assert_eq!(values[0]["data"]["hello"], "world");
-    assert_eq!(values[1]["data"]["hello"], "world");
 }
 
 #[tokio::test]
-async fn get_rejects_persisted_mutations_and_subscriptions() {
+async fn get_rejects_persisted_subscriptions() {
     let server = plain_server();
+    let query =
+        serde_urlencoded::to_string([("extensions", r#"{"persistedQuery":{"id":"countdown"}}"#)])
+            .expect("query string");
     let response = get(
         &server,
-        "/graphql?id=countdown",
-        &[(header::ACCEPT, "application/json")],
+        &format!("/graphql?{query}"),
+        &[(header::ACCEPT, "application/graphql-response+json")],
     )
     .await;
     assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED);
-}
-
-#[tokio::test]
-async fn persisted_id_header_is_honoured() {
-    let name = header::HeaderName::from_static("x-persisted-query-id");
-    let server = plain_server();
-    let response = post_with_headers(&server, "{}", &[(name.clone(), "hello")]).await;
-    assert_eq!(response.status, StatusCode::OK);
-    assert_eq!(body(&response)["data"]["hello"], "world");
-
-    // GET may omit every query parameter when a header supplies the id.
-    let response = get(
-        &server,
-        "/graphql",
-        &[(name, "hello"), (header::ACCEPT, "application/json")],
-    )
-    .await;
-    assert_eq!(response.status, StatusCode::OK);
-    assert_eq!(body(&response)["data"]["hello"], "world");
 }
 
 #[tokio::test]
@@ -298,6 +285,7 @@ async fn prepared_subscription_streams_events() {
     );
 }
 
+#[cfg(feature = "sse")]
 #[tokio::test]
 async fn prepared_subscription_over_http_emits_sse() {
     let server = plain_server();
@@ -313,7 +301,7 @@ async fn prepared_subscription_over_http_emits_sse() {
         &server,
         &HttpConfig::default(),
         &parts,
-        br#"{"id":"countdown"}"#,
+        br#"{"extensions":{"persistedQuery":{"id":"countdown"}}}"#,
         support::empty_context,
     )
     .await;
@@ -395,8 +383,10 @@ fn manifest_diagnostics_are_clear() {
 }
 
 #[test]
-fn prepared_id_is_extracted_from_request_shapes() {
-    let request: GraphQLRequest = serde_json::from_str(r#"{"id":"a"}"#).expect("relay");
+fn prepared_id_is_extracted_from_extensions() {
+    let request: GraphQLRequest =
+        serde_json::from_str(r#"{"extensions":{"persistedQuery":{"id":"a"}}}"#)
+            .expect("extension id");
     assert_eq!(request.prepared_id(), Some("a"));
 
     let request: GraphQLRequest =
@@ -405,12 +395,8 @@ fn prepared_id_is_extracted_from_request_shapes() {
     assert_eq!(request.prepared_id(), Some("b"));
 
     let request: GraphQLRequest =
-        serde_json::from_str(r#"{"extensions":{"queryId":"c"}}"#).expect("extension id");
-    assert_eq!(request.prepared_id(), Some("c"));
-
-    let request: GraphQLRequest =
-        serde_json::from_str(r#"{"extensions":{"id":"d"}}"#).expect("extension id");
-    assert_eq!(request.prepared_id(), Some("d"));
+        serde_json::from_str(r#"{"id":"ignored","query":"{ hello }"}"#).expect("top-level id");
+    assert_eq!(request.prepared_id(), None);
 
     let request: GraphQLRequest =
         serde_json::from_str(r#"{"query":"{ hello }"}"#).expect("normal request");
